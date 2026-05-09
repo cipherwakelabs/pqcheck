@@ -1,0 +1,40 @@
+{
+  "name": "pqcheck",
+  "version": "0.7.3",
+  "description": "Decryption Blast Radius scanner — find out how much of your data unlocks when quantum decryption arrives.",
+  "keywords": [
+    "post-quantum",
+    "cryptography",
+    "security",
+    "tls",
+    "ssl",
+    "scanner",
+    "harvest-now-decrypt-later",
+    "hndl",
+    "blast-radius",
+    "pqc",
+    "quantum",
+    "crypto-audit",
+    "crypto-inventory"
+  ],
+  "homepage": "https://quantapact.com",
+  "bugs": "https://quantapact.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mzon7/quantapact.git",
+    "directory": "cli"
+  },
+  "license": "MIT",
+  "author": "Quantapact",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "pqcheck": "./bin/pqcheck.js"
+  },
+  "files": [
+    "bin/",
+    "README.md"
+  ]
+}

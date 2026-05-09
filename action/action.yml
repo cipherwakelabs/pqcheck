@@ -1,0 +1,185 @@
+name: 'pqcheck'
+description: 'Quantum-decryption risk gate. Fails the build when the public-surface Decryption Blast Radius score for a domain meets or exceeds a threshold.'
+author: 'Quantapact'
+branding:
+  icon: 'shield'
+  color: 'purple'
+
+inputs:
+  domain:
+    description: 'Domain to scan (e.g. example.com)'
+    required: true
+  threshold:
+    description: 'Fail the step if Decryption Blast Radius score >= this value (0-10).'
+    required: false
+    default: '7'
+  fail-on-unreachable:
+    description: 'Treat unreachable domains as failure.'
+    required: false
+    default: 'true'
+  comment-on-pr:
+    description: 'When true and the workflow runs on a pull_request event, post a comment on the PR with the scan summary. Requires permissions: pull-requests: write in the workflow.'
+    required: false
+    default: 'false'
+  github-token:
+    description: 'Token used to post the PR comment. Defaults to GITHUB_TOKEN. Only used when comment-on-pr=true.'
+    required: false
+    default: ${{ github.token }}
+  generate-sarif:
+    description: 'When true, write a SARIF 2.1.0 report to the path specified in sarif-output-path. Pair with github/codeql-action/upload-sarif@v3 to surface findings as alerts in the GitHub Security tab (Code Scanning).'
+    required: false
+    default: 'false'
+  sarif-output-path:
+    description: 'Path to write the SARIF file when generate-sarif=true. Workflow can then upload it via the codeql-action/upload-sarif step.'
+    required: false
+    default: 'pqcheck-results.sarif'
+  generate-lockfile:
+    description: 'When true, write a quantapact.lock + quantapact-report.md to the workflow checkout directory. Useful for committing crypto-posture as a versioned artifact, or for diffing across PRs (use github/upload-artifact@v4 to retain).'
+    required: false
+    default: 'false'
+
+outputs:
+  score:
+    description: 'Decryption Blast Radius score (0-10)'
+    value: ${{ steps.scan.outputs.score }}
+  grade:
+    description: 'Letter grade A-F'
+    value: ${{ steps.scan.outputs.grade }}
+  report-url:
+    description: 'Shareable report URL on quantapact.com'
+    value: ${{ steps.scan.outputs.report-url }}
+  markdown-summary:
+    description: 'Full markdown summary suitable for embedding in PR comments / issues'
+    value: ${{ steps.scan.outputs.markdown-summary }}
+
+runs:
+  using: 'composite'
+  steps:
+    - id: scan
+      shell: bash
+      env:
+        INPUT_DOMAIN: ${{ inputs.domain }}
+        INPUT_THRESHOLD: ${{ inputs.threshold }}
+        INPUT_FAIL_ON_UNREACHABLE: ${{ inputs.fail-on-unreachable }}
+      run: |
+        set -euo pipefail
+
+        REPORT=$(npx -y pqcheck@latest "$INPUT_DOMAIN" --format json)
+        SCORE=$(jq -r '.score // empty' <<< "$REPORT")
+        GRADE=$(jq -r '.grade // "—"' <<< "$REPORT")
+        LABEL=$(jq -r '.scoreLabel // "—"' <<< "$REPORT")
+        REACHABLE=$(jq -r '.reachable' <<< "$REPORT")
+        REPORT_URL="https://quantapact.com/r/$INPUT_DOMAIN"
+
+        # Build a markdown summary that we'll attach to outputs (for PR comments)
+        # and write to GITHUB_STEP_SUMMARY (for the run page).
+        MD_FILE=$(mktemp)
+        {
+          echo "## 🔐 Quantapact — Decryption Blast Radius scan"
+          echo ""
+          if [ "$REACHABLE" != "true" ]; then
+            echo "**\`$INPUT_DOMAIN\`** — unreachable"
+          else
+            echo "| Domain | Score | Grade | Threshold |"
+            echo "|---|---|---|---|"
+            echo "| \`$INPUT_DOMAIN\` | **$SCORE / 10** ($LABEL) | $GRADE | $INPUT_THRESHOLD |"
+            echo ""
+            echo "**Top findings:**"
+            echo ""
+            jq -r '.findings // [] | .[0:8][] | "- **[\(.severity | ascii_upcase)]** \(.title)\n  \(.detail)"' <<< "$REPORT"
+            echo ""
+            echo "[Full report ↗]($REPORT_URL) · [Methodology ↗](https://quantapact.com/methodology)"
+          fi
+          echo ""
+          echo "<sub>Posted by [pqcheck-action](https://github.com/mzon7/quantapact/tree/main/action) · Public surface only — internal Blast Radius is typically 12-40× this score.</sub>"
+        } > "$MD_FILE"
+
+        # Make the markdown available as a step output (GH Actions multi-line syntax)
+        EOF_DELIM="EOF_$(uuidgen 2>/dev/null || openssl rand -hex 8)"
+        {
+          echo "score=$SCORE"
+          echo "grade=$GRADE"
+          echo "report-url=$REPORT_URL"
+          echo "markdown-summary<<$EOF_DELIM"
+          cat "$MD_FILE"
+          echo "$EOF_DELIM"
+        } >> "$GITHUB_OUTPUT"
+
+        # Mirror to GITHUB_STEP_SUMMARY so the run page also shows it.
+        cat "$MD_FILE" >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$REACHABLE" != "true" ]; then
+          if [ "$INPUT_FAIL_ON_UNREACHABLE" = "true" ]; then
+            echo "::error::Domain $INPUT_DOMAIN unreachable; failing per fail-on-unreachable=true"
+            exit 1
+          fi
+          exit 0
+        fi
+
+        if awk -v s="$SCORE" -v t="$INPUT_THRESHOLD" 'BEGIN { exit !(s+0 >= t+0) }'; then
+          echo "::error::Decryption Blast Radius score $SCORE met or exceeded threshold $INPUT_THRESHOLD for $INPUT_DOMAIN"
+          exit 2
+        fi
+
+    - name: Comment on pull request
+      if: |
+        always() &&
+        inputs.comment-on-pr == 'true' &&
+        github.event_name == 'pull_request' &&
+        steps.scan.outputs.markdown-summary != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        SUMMARY: ${{ steps.scan.outputs.markdown-summary }}
+      run: |
+        set -euo pipefail
+        # Sticky comment: replace any prior pqcheck comment on this PR rather than spam.
+        EXISTING_ID=$(curl -s \
+          -H "Authorization: Bearer $GH_TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" \
+          | jq -r '[.[] | select(.body | test("Quantapact — Decryption Blast Radius scan"))] | .[0].id // empty')
+
+        BODY=$(jq -n --arg b "$SUMMARY" '{body: $b}')
+
+        if [ -n "$EXISTING_ID" ] && [ "$EXISTING_ID" != "null" ]; then
+          curl -s -X PATCH \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/issues/comments/$EXISTING_ID" \
+            -d "$BODY" > /dev/null
+          echo "Updated existing pqcheck PR comment ($EXISTING_ID)."
+        else
+          curl -s -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
+            -d "$BODY" > /dev/null
+          echo "Posted new pqcheck PR comment on PR #$PR_NUMBER."
+        fi
+
+    - name: Generate SARIF report
+      if: inputs.generate-sarif == 'true'
+      shell: bash
+      env:
+        INPUT_DOMAIN: ${{ inputs.domain }}
+        SARIF_PATH: ${{ inputs.sarif-output-path }}
+      run: |
+        set -euo pipefail
+        echo "Generating SARIF for $INPUT_DOMAIN -> $SARIF_PATH"
+        npx -y pqcheck@latest "$INPUT_DOMAIN" --format sarif > "$SARIF_PATH"
+        echo "SARIF written. Pair with: github/codeql-action/upload-sarif@v3"
+        echo "  with sarif_file: $SARIF_PATH"
+
+    - name: Generate quantapact.lock
+      if: inputs.generate-lockfile == 'true'
+      shell: bash
+      env:
+        INPUT_DOMAIN: ${{ inputs.domain }}
+      run: |
+        set -euo pipefail
+        npx -y pqcheck@latest lock "$INPUT_DOMAIN"
+        echo "Wrote quantapact.lock and quantapact-report.md to current directory."
+        echo "Use github/upload-artifact@v4 to retain across runs, or commit them to track posture changes in PR diffs."
