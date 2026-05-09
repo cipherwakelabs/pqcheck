@@ -21,7 +21,7 @@
   "bugs": "https://quantapact.com",
   "repository": {
     "type": "git",
-    "url": "https://github.com/mzon7/quantapact.git",
+    "url": "https://github.com/quantapact/pqcheck.git",
     "directory": "cli"
   },
   "license": "MIT",

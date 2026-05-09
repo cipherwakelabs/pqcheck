@@ -91,7 +91,7 @@ runs:
             echo "[Full report ↗]($REPORT_URL) · [Methodology ↗](https://quantapact.com/methodology)"
           fi
           echo ""
-          echo "<sub>Posted by [pqcheck-action](https://github.com/mzon7/quantapact/tree/main/action) · Public surface only — internal Blast Radius is typically 12-40× this score.</sub>"
+          echo "<sub>Posted by [pqcheck-action](https://github.com/quantapact/pqcheck/tree/main/action) · Public surface only — internal Blast Radius is typically 12-40× this score.</sub>"
         } > "$MD_FILE"
 
         # Make the markdown available as a step output (GH Actions multi-line syntax)

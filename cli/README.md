@@ -165,7 +165,7 @@ This CLI is one of four ways to consume the [Decryption Blast Radius API](https:
 |---|---|
 | **CLI** (this package) | `npx pqcheck` |
 | **Browser extension** | Chrome Web Store / Firefox AMO / Edge — toolbar badge per tab + dependency analysis |
-| **GitHub Action** | [`mzon7/pqcheck/action@main`](https://github.com/mzon7/pqcheck/tree/main/action) — PR comments, SARIF upload, lockfile generation |
+| **GitHub Action** | [`quantapact/pqcheck/action@main`](https://github.com/quantapact/pqcheck/tree/main/action) — PR comments, SARIF upload, lockfile generation |
 | **Slack `/pqcheck`** | [Install on workspace](https://quantapact.com/install-slack) |
 | **Web** | [quantapact.com](https://quantapact.com) — share-friendly URLs at `/r/<domain>` |
 
@@ -209,10 +209,10 @@ The CLI follows the same policy — output formats are stable across minor versi
   run: npx pqcheck@latest mycompany.com --threshold 7
 ```
 
-For richer integration (sticky PR comments, SARIF upload to Code Scanning, lockfile diff on regression), use the [GitHub Action](https://github.com/mzon7/pqcheck/tree/main/action):
+For richer integration (sticky PR comments, SARIF upload to Code Scanning, lockfile diff on regression), use the [GitHub Action](https://github.com/quantapact/pqcheck/tree/main/action):
 
 ```yaml
-- uses: mzon7/pqcheck/action@main
+- uses: quantapact/pqcheck/action@main
   with:
     domain: mycompany.com
     threshold: '7'
@@ -233,6 +233,6 @@ MIT. © 2026 Quantapact.
 
 ---
 
-**Source:** [github.com/mzon7/pqcheck](https://github.com/mzon7/pqcheck) *(public, pending org transfer to `quantapact/pqcheck`)*
+**Source:** [github.com/quantapact/pqcheck](https://github.com/quantapact/pqcheck) *(public, pending org transfer to `quantapact/pqcheck`)*
 
 **Issues / feedback:** [quantapact.com/feedback](https://quantapact.com/feedback) or open an issue on the repo.

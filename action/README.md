@@ -7,7 +7,7 @@ Wraps the [`pqcheck` CLI](https://www.npmjs.com/package/pqcheck) — same scanne
 ## Quick start
 
 ```yaml
-- uses: mzon7/quantapact/action@main
+- uses: quantapact/pqcheck/action@main
   with:
     domain: mycompany.com
     threshold: '7'
@@ -46,7 +46,7 @@ jobs:
   pqcheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: mzon7/quantapact/action@main
+      - uses: quantapact/pqcheck/action@main
         with:
           domain: mycompany.com
           threshold: '7'
@@ -55,7 +55,7 @@ jobs:
 ### Surface findings in GitHub Code Scanning (Security tab)
 
 ```yaml
-- uses: mzon7/quantapact/action@main
+- uses: quantapact/pqcheck/action@main
   with:
     domain: mycompany.com
     generate-sarif: 'true'
@@ -69,7 +69,7 @@ Findings appear in the GitHub Security tab as code-scanning alerts, fully integr
 ### Track crypto posture over time as a committed artifact
 
 ```yaml
-- uses: mzon7/quantapact/action@main
+- uses: quantapact/pqcheck/action@main
   with:
     domain: mycompany.com
     generate-lockfile: 'true'
@@ -86,7 +86,7 @@ Or commit the lockfile to your repo (similar to `package-lock.json`) so PR diffs
 ### Use the score in a follow-up step (e.g. PR comment)
 
 ```yaml
-- uses: mzon7/quantapact/action@main
+- uses: quantapact/pqcheck/action@main
   id: scan
   with:
     domain: mycompany.com
@@ -103,7 +103,7 @@ strategy:
   matrix:
     domain: [api.mycompany.com, app.mycompany.com, www.mycompany.com]
 steps:
-  - uses: mzon7/quantapact/action@main
+  - uses: quantapact/pqcheck/action@main
     with:
       domain: ${{ matrix.domain }}
       threshold: '7'
