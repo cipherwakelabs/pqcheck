@@ -4,6 +4,19 @@ All notable changes to `pqcheck` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.6] — 2026-05-10
+
+### Changed
+- **User-Agent string now includes the subcommand context** on every API call. Was: `pqcheck-cli/0.7.5`. Now: `pqcheck-cli/0.7.6 (scan)`, `(lock)`, `(deps)`, `(history)`, or `(watch)`. The subcommand for `lock`/`deps`/`history` was already tagged in 0.7.5; this release also tags `scan` and `watch` for consistency.
+
+### Why it matters
+The server can now aggregate adoption by subcommand — useful for understanding which CLI features are most used in the wild. The subcommand token rides inside the existing User-Agent header (which has always been logged anonymously); no new data is collected. See [quantapact.com/privacy](https://quantapact.com/privacy) for the full data-handling spec.
+
+### Compatibility
+No breaking changes. Older CLI versions continue to work; the server records `subcommand=null` for their requests.
+
+---
+
 ## [0.7.5] — 2026-05-09
 
 ### Added

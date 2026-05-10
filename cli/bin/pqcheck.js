@@ -7,7 +7,7 @@
 // =============================================================================
 
 const API_BASE = process.env.PQCHECK_API_BASE || "https://quantapact.com";
-const VERSION = "0.7.5";
+const VERSION = "0.7.6";
 
 const ANSI = {
   reset:   "\x1b[0m",
@@ -122,7 +122,7 @@ async function runOneScan({ domain, format, quiet, threshold, webhookUrl, multi 
   try {
     const resp = await fetch(`${API_BASE}/api/scan?domain=${encodeURIComponent(domain)}`, {
       method: "GET",
-      headers: { accept: "application/json", "user-agent": `pqcheck-cli/${VERSION}` },
+      headers: { accept: "application/json", "user-agent": `pqcheck-cli/${VERSION} (scan)` },
     });
     if (!quiet && format === "text") process.stderr.write("\r\x1b[K");
     if (!resp.ok) {
@@ -215,7 +215,7 @@ async function runWatch({ domains, format, quiet, threshold, webhookUrl, interva
       try {
         const resp = await fetch(`${API_BASE}/api/scan?domain=${encodeURIComponent(domain)}`, {
           method: "GET",
-          headers: { accept: "application/json", "user-agent": `pqcheck-cli/${VERSION}` },
+          headers: { accept: "application/json", "user-agent": `pqcheck-cli/${VERSION} (watch)` },
         });
         if (!resp.ok) continue;
         const report = await resp.json();

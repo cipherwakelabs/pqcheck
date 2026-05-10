@@ -12,10 +12,9 @@ The same scanner that powers [quantapact.com](https://quantapact.com), the brows
 
 ---
 
-## What's new in 0.7.5
+## What's new in 0.7.6
 
-Degraded-state warnings when the API falls back to a cached score (3 retries failed).
-Visible in every output mode — text, `--quiet` (stderr), `--watch`, and GitHub Actions annotations — so silent stale data can't slip through a CI gate. See [CHANGELOG.md](./CHANGELOG.md) for the full version history.
+User-Agent now consistently tags the subcommand on every request (`pqcheck-cli/0.7.6 (scan)`, `(lock)`, `(deps)`, `(history)`, `(watch)`). Lets the server aggregate adoption by subcommand. No new data collected — the subcommand token rides inside the User-Agent header that has always been logged anonymously. See [privacy](https://quantapact.com/privacy) and [CHANGELOG.md](./CHANGELOG.md).
 
 ---
 
