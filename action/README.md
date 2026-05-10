@@ -4,6 +4,10 @@
 
 Wraps the [`pqcheck` CLI](https://www.npmjs.com/package/pqcheck) — same scanner that powers [quantapact.com](https://quantapact.com).
 
+Current version: **v2.0.1**. See [CHANGELOG.md](./CHANGELOG.md) for release history.
+
+> **What's new in v2.0.1**: when the underlying API falls back to a cached score (live probes failed three times), the action now emits a `::warning` annotation in the workflow check summary. Surfaces as a yellow warning on the PR check so a CI gate can't silently consume stale data. No `action.yml` changes needed — workflows pinned to `@main` get the behaviour automatically.
+
 ## Quick start
 
 ```yaml

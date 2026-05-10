@@ -12,6 +12,13 @@ The same scanner that powers [quantapact.com](https://quantapact.com), the brows
 
 ---
 
+## What's new in 0.7.5
+
+Degraded-state warnings when the API falls back to a cached score (3 retries failed).
+Visible in every output mode — text, `--quiet` (stderr), `--watch`, and GitHub Actions annotations — so silent stale data can't slip through a CI gate. See [CHANGELOG.md](./CHANGELOG.md) for the full version history.
+
+---
+
 ## What it does
 
 `pqcheck` scans any HTTPS domain and computes its **Decryption Blast Radius score** — the first continuous metric for harvest-now-decrypt-later (HNDL) risk. Every other TLS scanner answers "is post-quantum cryptography enabled?" with yes/no. `pqcheck` answers the question that actually matters: *if an adversary harvests this traffic today and decrypts it in 2035, how much past + future data unlocks?*
@@ -233,6 +240,8 @@ MIT. © 2026 Quantapact.
 
 ---
 
-**Source:** [github.com/quantapact/pqcheck](https://github.com/quantapact/pqcheck) *(public, pending org transfer to `quantapact/pqcheck`)*
+**Source:** [github.com/quantapact/pqcheck](https://github.com/quantapact/pqcheck)
+
+**Changelog:** [CHANGELOG.md](./CHANGELOG.md) for version-by-version release notes.
 
 **Issues / feedback:** [quantapact.com/feedback](https://quantapact.com/feedback) or open an issue on the repo.

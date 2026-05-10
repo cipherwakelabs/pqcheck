@@ -7,7 +7,7 @@
 // =============================================================================
 
 const API_BASE = process.env.PQCHECK_API_BASE || "https://quantapact.com";
-const VERSION = "0.7.3";
+const VERSION = "0.7.5";
 
 const ANSI = {
   reset:   "\x1b[0m",
@@ -147,6 +147,13 @@ async function runOneScan({ domain, format, quiet, threshold, webhookUrl, multi 
     }).catch(() => { /* best-effort — never fail the scan on webhook delivery */ });
   }
 
+  // In --quiet mode the score still goes to stdout (script-pipeable), but a
+  // degraded warning lands on stderr so silent fallback to cached data can't
+  // mislead a CI gate or one-off check.
+  if (quiet && report._meta?.degraded) {
+    console.error(`pqcheck: ⚠ ${domain} — using cached score (live probe failed: ${report._meta.degradedReason || "unknown"}; last verified ${report._meta.lastUpdated || "?"})`);
+  }
+
   // Output dispatch
   if (quiet) {
     if (multi) {
@@ -239,10 +246,11 @@ async function runWatch({ domains, format, quiet, threshold, webhookUrl, interva
           printMarkdown(report, true);
         } else {
           const stamp = new Date().toISOString().slice(11, 19);
+          const degradedTag = report._meta?.degraded ? color("yellow", ` ⚠ cached (${report._meta.degradedReason || "probe failed"})`) : "";
           if (changed) {
-            console.log(color("yellow", `[${stamp}] ${domain}: ${prev} → ${report.score}  (${report.scoreLabel}) ${color("yellow", "★ changed")}`));
+            console.log(color("yellow", `[${stamp}] ${domain}: ${prev} → ${report.score}  (${report.scoreLabel}) ${color("yellow", "★ changed")}${degradedTag}`));
           } else if (!quiet) {
-            console.log(color("dim", `[${stamp}] ${domain}: ${report.score}  (${report.scoreLabel})`));
+            console.log(color("dim", `[${stamp}] ${domain}: ${report.score}  (${report.scoreLabel})${degradedTag}`));
           }
         }
       } catch (err) {
@@ -388,7 +396,21 @@ function printReport(r) {
   console.log("");
   console.log(`  ${color("bold", r.domain)}`);
   console.log(color("dim", "  ─────────────────────────────────────"));
-  console.log(`  ${color("bold", "PUBLIC SURFACE BLAST RADIUS:")} ${color(labelColor, `${r.score} / 10`)} ${color(labelColor, `(${r.scoreLabel})`)}`);
+  // Loud warning when the API fell back to a cached value because three live
+  // probe attempts came up degraded. Devs need to know they may be looking at
+  // stale data — silent fallback would erode trust in the tool.
+  const meta = r._meta || {};
+  if (meta.degraded) {
+    const since = meta.lastUpdated ? new Date(meta.lastUpdated).toUTCString() : "unknown";
+    console.log("");
+    console.log(color("yellow", "  ⚠ WARNING: showing last known-good cached score"));
+    console.log(color("yellow", `    Reason: ${meta.degradedReason || "unknown"}`));
+    console.log(color("yellow", `    Last verified: ${since}`));
+    console.log(color("dim", "    The live probe failed after 3 retries. Re-run shortly to refresh."));
+    console.log("");
+  }
+  const degradedMark = meta.degraded ? color("yellow", " *") : "";
+  console.log(`  ${color("bold", "PUBLIC SURFACE BLAST RADIUS:")} ${color(labelColor, `${r.score} / 10`)}${degradedMark} ${color(labelColor, `(${r.scoreLabel})`)}`);
   console.log("");
   console.log(color("dim", "  Public surface signals:"));
   console.log(`  • TLS:           ${r.publicSurface.tlsVersion ?? "?"} ${r.publicSurface.cipher ? color("dim", `(${r.publicSurface.cipher})`) : ""}`);
@@ -1168,9 +1190,13 @@ function reportToSarif(report) {
         ruleId: `pqcheck-${i + 1}`,
         level: sevMap[f.severity] || "note",
         message: { text: `${f.title || "finding"}${f.detail ? ` — ${f.detail}` : ""}` },
+        // GitHub Code Scanning requires file: scheme (or relative path) for
+        // artifactLocation.uri — https:// URIs are rejected. Use a virtual
+        // relative path so findings show up cleanly in the Security tab.
         locations: [{
           physicalLocation: {
-            artifactLocation: { uri: `https://${report.domain || ""}` },
+            artifactLocation: { uri: `quantapact-scan/${report.domain || "unknown"}.txt` },
+            region: { startLine: 1, startColumn: 1 },
           },
         }],
         properties: {
@@ -1178,6 +1204,7 @@ function reportToSarif(report) {
           score: report.score,
           grade: report.grade,
           severity: f.severity,
+          reportUrl: `https://www.quantapact.com/r/${report.domain || ""}`,
         },
       })),
       properties: {
@@ -1193,6 +1220,13 @@ function printGitHubActionAnnotations(report) {
   // GitHub Actions workflow command syntax: https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions
   const findings = Array.isArray(report.findings) ? report.findings : [];
   const sevMap = { critical: "error", high: "error", medium: "warning", low: "notice" };
+  // Surface degraded-cache state as a workflow warning so it lands in the
+  // PR check summary — devs need to know they may be gating on stale data.
+  if (report._meta?.degraded) {
+    const reason = String(report._meta.degradedReason || "live probe failed").replace(/[\r\n]/g, " ").replace(/::/g, ":");
+    const since = String(report._meta.lastUpdated || "unknown");
+    console.log(`::warning title=Quantapact: cached score (live probe failed)::Showing last known-good score from ${since}. Reason: ${reason}. Re-run shortly for a fresh probe.`);
+  }
   // Top-line score/grade as a notice
   console.log(`::notice title=Quantapact: ${report.domain}::Grade ${report.grade || "?"} · score ${report.score ?? "?"} / 10`);
   for (const f of findings) {
