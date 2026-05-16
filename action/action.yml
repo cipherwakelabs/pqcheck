@@ -1,6 +1,6 @@
 name: 'pqcheck'
 description: 'Quantum-decryption risk gate. Fails the build when the public-surface Decryption Blast Radius score for a domain meets or exceeds a threshold.'
-author: 'Quantapact'
+author: 'Cipherwake'
 branding:
   icon: 'shield'
   color: 'purple'
@@ -34,9 +34,29 @@ inputs:
     required: false
     default: 'pqcheck-results.sarif'
   generate-lockfile:
-    description: 'When true, write a quantapact.lock + quantapact-report.md to the workflow checkout directory. Useful for committing crypto-posture as a versioned artifact, or for diffing across PRs (use github/upload-artifact@v4 to retain).'
+    description: 'When true, write a cipherwake.lock + cipherwake-report.md to the workflow checkout directory. Useful for committing crypto-posture as a versioned artifact, or for diffing across PRs (use github/upload-artifact@v4 to retain). If a legacy quantapact.lock already exists in the checkout, that filename is preserved on overwrite.'
     required: false
     default: 'false'
+  fresh:
+    description: 'When true, bypass the server-side smart-cache and force a fresh scan. Useful for verifying a cert/key change you just deployed in the same workflow run. Subject to a 20/hr per-IP cap server-side; if exceeded, the server silently downgrades to a cached scan and the step still succeeds.'
+    required: false
+    default: 'false'
+  supply-chain-baseline:
+    description: 'Path to a committed third-party baseline JSON (default `.pqcheck-baseline.json`). When set, the action also runs `pqcheck deps <domain> --baseline <path>` and fails the build (exit 4) if any new third-party host appears since baseline. The Polyfill.io-style supply-chain change detector. To accept new additions deliberately, commit an updated baseline (run with `supply-chain-write-baseline: true` once locally to generate it).'
+    required: false
+    default: ''
+  supply-chain-write-baseline:
+    description: 'When true (and supply-chain-baseline is set), overwrite the baseline file with the current scan. Used to capture the initial state OR deliberately accept new third-party hosts. Typically used locally / on an admin workflow, not on every PR.'
+    required: false
+    default: 'false'
+  supply-chain-fail-on-new:
+    description: 'When true (and supply-chain-baseline is set), fail the build if any new third-party host appeared since the baseline. Defaults to true — the whole point of the baseline is to gate PRs that introduce new third-party scripts.'
+    required: false
+    default: 'true'
+  api-key:
+    description: 'Optional Cipherwake API key (qpk_<hex>). When set, the action authenticates with this key and uses your tier-based monthly quota (1K/10K/50K depending on Starter/Growth/Scale) instead of the per-IP rate limit. Recommended for CI workflows that scan on every PR. Pass via secret: `api-key: ${{ secrets.CIPHERWAKE_API_KEY }}` (or the legacy `secrets.QUANTAPACT_API_KEY` if you set it up under the old name — both names work forever).'
+    required: false
+    default: ''
 
 outputs:
   score:
@@ -46,7 +66,7 @@ outputs:
     description: 'Letter grade A-F'
     value: ${{ steps.scan.outputs.grade }}
   report-url:
-    description: 'Shareable report URL on quantapact.com'
+    description: 'Shareable report URL on cipherwake.io'
     value: ${{ steps.scan.outputs.report-url }}
   markdown-summary:
     description: 'Full markdown summary suitable for embedding in PR comments / issues'
@@ -61,21 +81,45 @@ runs:
         INPUT_DOMAIN: ${{ inputs.domain }}
         INPUT_THRESHOLD: ${{ inputs.threshold }}
         INPUT_FAIL_ON_UNREACHABLE: ${{ inputs.fail-on-unreachable }}
+        INPUT_FRESH: ${{ inputs.fresh }}
+        # Pass api-key through to the CLI subprocess as QUANTAPACT_API_KEY.
+        # The CLI reads this env var and sends Authorization: Bearer <key>
+        # on every /api/* call, bypassing per-IP rate limits in favor of
+        # the account's tier-based monthly quota.
+        QUANTAPACT_API_KEY: ${{ inputs.api-key }}
       run: |
         set -euo pipefail
 
-        REPORT=$(npx -y pqcheck@latest "$INPUT_DOMAIN" --format json)
+        # First-run onboarding nudge: when no api-key is configured, surface
+        # a one-line tip so the operator knows there's a higher-limit path.
+        # This is a ::notice:: (info-level) so it never breaks strict workflows
+        # but DOES appear in the run log + summary. Only prints when the
+        # input is empty — silent once they've wired up the secret.
+        if [ -z "${QUANTAPACT_API_KEY:-}" ]; then
+          echo "::notice title=pqcheck — free tier limits apply::Add a Cipherwake API key for higher rate limits + private results. Create one free at https://cipherwake.io/signin then pass via:  api-key: \${{ secrets.CIPHERWAKE_API_KEY }}"
+        fi
+
+        # Pass --fresh through to the CLI when the workflow requested it.
+        # Useful for "deploy then verify" workflows: change cert in step N,
+        # scan in step N+1 with fresh=true to guarantee post-deploy state
+        # instead of pre-deploy cache.
+        FRESH_FLAG=""
+        if [ "$INPUT_FRESH" = "true" ]; then
+          FRESH_FLAG="--fresh"
+        fi
+
+        REPORT=$(npx -y pqcheck@latest "$INPUT_DOMAIN" --format json $FRESH_FLAG)
         SCORE=$(jq -r '.score // empty' <<< "$REPORT")
         GRADE=$(jq -r '.grade // "—"' <<< "$REPORT")
         LABEL=$(jq -r '.scoreLabel // "—"' <<< "$REPORT")
         REACHABLE=$(jq -r '.reachable' <<< "$REPORT")
-        REPORT_URL="https://quantapact.com/r/$INPUT_DOMAIN"
+        REPORT_URL="https://cipherwake.io/r/$INPUT_DOMAIN"
 
         # Build a markdown summary that we'll attach to outputs (for PR comments)
         # and write to GITHUB_STEP_SUMMARY (for the run page).
         MD_FILE=$(mktemp)
         {
-          echo "## 🔐 Quantapact — Decryption Blast Radius scan"
+          echo "## 🔐 Cipherwake — Decryption Blast Radius scan"
           echo ""
           if [ "$REACHABLE" != "true" ]; then
             echo "**\`$INPUT_DOMAIN\`** — unreachable"
@@ -84,14 +128,57 @@ runs:
             echo "|---|---|---|---|"
             echo "| \`$INPUT_DOMAIN\` | **$SCORE / 10** ($LABEL) | $GRADE | $INPUT_THRESHOLD |"
             echo ""
+
+            # Recent attack-surface changes — pulled from the public
+            # /api/changes-summary endpoint. Adds a one-line "N changes since
+            # last scan" signal to the PR comment so dev teams notice when
+            # their public posture drifts between PRs. Fail-soft: if the
+            # endpoint is unreachable, we just skip this section.
+            CHANGES_JSON=$(curl -sS --max-time 8 "https://cipherwake.io/api/changes-summary?domain=$INPUT_DOMAIN" 2>/dev/null || echo '{}')
+            CHANGE_COUNT=$(jq -r '.changes.last14d // 0' <<< "$CHANGES_JSON" 2>/dev/null || echo "0")
+            TRACKED_SINCE=$(jq -r '.trackedSince // empty' <<< "$CHANGES_JSON" 2>/dev/null || echo "")
+            OBSERVATIONS=$(jq -r '.observations // 0' <<< "$CHANGES_JSON" 2>/dev/null || echo "0")
+
+            # Provenance pill — proves this isn't a one-shot probe. Renders
+            # as a small italic footnote under the score table when we
+            # actually have prior observations for the domain.
+            if [ -n "$TRACKED_SINCE" ]; then
+              TRACKED_DATE=$(echo "$TRACKED_SINCE" | cut -c1-10)
+              if [ "$OBSERVATIONS" -gt 0 ] 2>/dev/null; then
+                echo "_Tracked by Cipherwake since \`$TRACKED_DATE\` · $OBSERVATIONS observations._"
+              else
+                echo "_Tracked by Cipherwake since \`$TRACKED_DATE\`._"
+              fi
+              echo ""
+            fi
+
+            if [ -n "$TRACKED_SINCE" ] && [ "$CHANGE_COUNT" -gt 0 ] 2>/dev/null; then
+              NEW_SUBS=$(jq -r '.breakdown.newSubdomains14d // 0' <<< "$CHANGES_JSON")
+              NEW_SCRIPTS=$(jq -r '.breakdown.newScripts14d // 0' <<< "$CHANGES_JSON")
+              BREAKDOWN_PARTS=""
+              [ "$NEW_SUBS" -gt 0 ] 2>/dev/null && BREAKDOWN_PARTS="$BREAKDOWN_PARTS $NEW_SUBS new subdomain(s);"
+              [ "$NEW_SCRIPTS" -gt 0 ] 2>/dev/null && BREAKDOWN_PARTS="$BREAKDOWN_PARTS $NEW_SCRIPTS new third-party script(s);"
+              echo "⚠️ **$CHANGE_COUNT public attack-surface change(s)** detected on \`$INPUT_DOMAIN\` in the last 14 days.${BREAKDOWN_PARTS} [See changelog →](https://cipherwake.io/domain/$INPUT_DOMAIN/security-changelog)"
+              echo ""
+            elif [ -n "$TRACKED_SINCE" ]; then
+              echo "✓ No public attack-surface changes detected on \`$INPUT_DOMAIN\` in the last 14 days. [Changelog →](https://cipherwake.io/domain/$INPUT_DOMAIN/security-changelog)"
+              echo ""
+            fi
+
             echo "**Top findings:**"
             echo ""
             jq -r '.findings // [] | .[0:8][] | "- **[\(.severity | ascii_upcase)]** \(.title)\n  \(.detail)"' <<< "$REPORT"
             echo ""
-            echo "[Full report ↗]($REPORT_URL) · [Methodology ↗](https://quantapact.com/methodology)"
+            echo "[Full report ↗]($REPORT_URL) · [Methodology ↗](https://cipherwake.io/methodology)"
+            echo ""
+            # Conversion CTA per generalbusiness.md principle #15: every
+            # value-delivery moment surfaces the same /watch/<domain> path.
+            # Visible in the PR comment (where developers actually read,
+            # vs the ::notice:: log which most ignore).
+            echo "📌 **Watch \`$INPUT_DOMAIN\` for changes (free):** [cipherwake.io/watch/$INPUT_DOMAIN](https://cipherwake.io/watch/$INPUT_DOMAIN) — weekly email when cert / scripts / TLS posture drift."
           fi
           echo ""
-          echo "<sub>Posted by [pqcheck-action](https://github.com/quantapact/pqcheck/tree/main/action) · Public surface only — internal Blast Radius is typically 12-40× this score.</sub>"
+          echo "<sub>Posted by [pqcheck-action](https://github.com/cipherwake-io/pqcheck/tree/main/action) · Public surface only — internal Blast Radius is typically 12-40× this score.</sub>"
         } > "$MD_FILE"
 
         # Make the markdown available as a step output (GH Actions multi-line syntax)
@@ -140,7 +227,7 @@ runs:
           -H "Authorization: Bearer $GH_TOKEN" \
           -H "Accept: application/vnd.github+json" \
           "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" \
-          | jq -r '[.[] | select(.body | test("Quantapact — Decryption Blast Radius scan"))] | .[0].id // empty')
+          | jq -r '[.[] | select(.body | test("Cipherwake — Decryption Blast Radius scan"))] | .[0].id // empty')
 
         BODY=$(jq -n --arg b "$SUMMARY" '{body: $b}')
 
@@ -166,20 +253,77 @@ runs:
       env:
         INPUT_DOMAIN: ${{ inputs.domain }}
         SARIF_PATH: ${{ inputs.sarif-output-path }}
+        INPUT_FRESH: ${{ inputs.fresh }}
+        QUANTAPACT_API_KEY: ${{ inputs.api-key }}
       run: |
         set -euo pipefail
+        FRESH_FLAG=""
+        if [ "$INPUT_FRESH" = "true" ]; then
+          FRESH_FLAG="--fresh"
+        fi
         echo "Generating SARIF for $INPUT_DOMAIN -> $SARIF_PATH"
-        npx -y pqcheck@latest "$INPUT_DOMAIN" --format sarif > "$SARIF_PATH"
+        npx -y pqcheck@latest "$INPUT_DOMAIN" --format sarif $FRESH_FLAG > "$SARIF_PATH"
         echo "SARIF written. Pair with: github/codeql-action/upload-sarif@v3"
         echo "  with sarif_file: $SARIF_PATH"
 
-    - name: Generate quantapact.lock
+    - name: Generate cipherwake.lock
       if: inputs.generate-lockfile == 'true'
       shell: bash
       env:
         INPUT_DOMAIN: ${{ inputs.domain }}
+        CIPHERWAKE_API_KEY: ${{ inputs.api-key }}
+        QUANTAPACT_API_KEY: ${{ inputs.api-key }}
       run: |
         set -euo pipefail
         npx -y pqcheck@latest lock "$INPUT_DOMAIN"
-        echo "Wrote quantapact.lock and quantapact-report.md to current directory."
+        # CLI auto-detects existing quantapact.lock and preserves that filename;
+        # otherwise writes cipherwake.lock + cipherwake-report.md.
+        if [ -f cipherwake.lock ]; then
+          echo "Wrote cipherwake.lock and cipherwake-report.md to current directory."
+        else
+          echo "Wrote quantapact.lock and quantapact-report.md (legacy filename preserved)."
+        fi
         echo "Use github/upload-artifact@v4 to retain across runs, or commit them to track posture changes in PR diffs."
+
+    - name: Supply-chain change detection
+      if: inputs.supply-chain-baseline != ''
+      shell: bash
+      env:
+        INPUT_DOMAIN: ${{ inputs.domain }}
+        BASELINE: ${{ inputs.supply-chain-baseline }}
+        WRITE_BASELINE: ${{ inputs.supply-chain-write-baseline }}
+        FAIL_ON_NEW: ${{ inputs.supply-chain-fail-on-new }}
+        INPUT_FRESH: ${{ inputs.fresh }}
+        QUANTAPACT_API_KEY: ${{ inputs.api-key }}
+      run: |
+        set -euo pipefail
+        # Polyfill.io-style supply-chain change gate. Runs `pqcheck deps` with a
+        # baseline file: any third-party host that appeared since the committed
+        # baseline triggers a fail (exit 4) so the PR can't merge without an
+        # explicit baseline update — supply-chain additions become a reviewable
+        # event rather than a silent change.
+        FLAGS="--baseline $BASELINE"
+        if [ "$WRITE_BASELINE" = "true" ]; then
+          FLAGS="$FLAGS --write-baseline"
+        fi
+        if [ "$FAIL_ON_NEW" = "true" ]; then
+          FLAGS="$FLAGS --fail-on-new"
+        fi
+        if [ "$INPUT_FRESH" = "true" ]; then
+          FLAGS="$FLAGS --fresh"
+        fi
+        echo "Running: npx -y pqcheck@latest deps $INPUT_DOMAIN $FLAGS"
+        # Capture exit status without letting `set -e` exit immediately so we
+        # can produce a useful annotation on exit 4 (new hosts) vs other errors.
+        set +e
+        npx -y pqcheck@latest deps "$INPUT_DOMAIN" $FLAGS
+        EXIT=$?
+        set -e
+        if [ "$EXIT" = "4" ]; then
+          echo "::error::Supply-chain change detected — new third-party host(s) appeared on $INPUT_DOMAIN since the committed baseline. Audit the additions, then run with supply-chain-write-baseline=true (once) to accept them and re-commit $BASELINE."
+          exit 4
+        fi
+        if [ "$EXIT" != "0" ]; then
+          echo "::warning::pqcheck deps exited with status $EXIT (non-zero, non-baseline). Check the action log."
+          exit "$EXIT"
+        fi

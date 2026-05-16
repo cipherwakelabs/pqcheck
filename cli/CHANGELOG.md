@@ -4,13 +4,127 @@ All notable changes to `pqcheck` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] — 2026-05-15
+
+### Changed — Default lockfile filename is now `cipherwake.lock` (was `quantapact.lock`)
+- `npx pqcheck lock <domain>` in a clean directory now writes `cipherwake.lock`
+  + `cipherwake-report.md` (matches the project's new name after the
+  Quantapact → Cipherwake rebrand).
+- **Backwards-compatible permanently.** If a `quantapact.lock` already exists
+  in the directory, the CLI overwrites it in place rather than silently
+  creating a second file in your repo. No migration required — your existing
+  committed lockfile keeps working forever.
+- Same logic applies to `pqcheck deps --lock`: writes `cipherwake-deps.lock`
+  by default, preserves legacy `quantapact-deps.lock` if already present.
+- SARIF output's artifact-location URI changed from `quantapact-scan/...` to
+  `cipherwake-scan/...` (visible in GitHub Code Scanning UI).
+
+### Changed — Brand-trace cleanup across surfaces
+- `CIPHERWAKE_API_KEY` env var name advertised in CLI help (the older
+  `QUANTAPACT_API_KEY` continues to work as a permanent fallback).
+- Help text + READMEs updated.
+
+## [0.9.0] — 2026-05-13
+
+### Added — Cipherwake account API-key support
+- New env var `QUANTAPACT_API_KEY=qpk_<hex>` authenticates every CLI → API call.
+- With a key set, your CLI usage bills against your account's monthly quota
+  (Starter 1K · Growth 10K · Scale 50K calls/mo) instead of the per-IP rate limit.
+- Anonymous CLI use still works — the env var is optional.
+- Better error messages on 401 (invalid key) and 429 (quota exceeded) — points
+  you at `/account` to rotate or `/pricing` to upgrade.
+- Affects every authenticated endpoint: `scan`, `history`, `deps`, `lock`,
+  `changes-summary`, `watch`. Webhook POSTs to your URL never receive your
+  API key — only cipherwake.io calls do.
+
+## [0.8.2] — 2026-05-12
+
+### Fixed — SARIF rule IDs now stable across runs
+- The `--format sarif` output previously emitted positional rule IDs (`pqcheck-1`, `pqcheck-2`, …). If the same domain produced findings in a different order between scans, GitHub Code Scanning would treat reordered findings as new findings, blowing up the triage queue. Fixed: rule IDs now derive from the finding's stable registry ID (e.g., `pqcheck.tls.rsa_kex_fallback`), so the same finding gets the same rule ID across runs.
+- The SARIF `rules` array is also now deduped — multiple findings tied to the same registry rule (e.g., two key-reuse findings) no longer produce duplicate rule entries.
+
+## [0.8.1] — 2026-05-12
+
+### Added — "Tracked by Cipherwake since X · N observations" provenance pill
+- After every scan, the CLI prints a one-line provenance footer (e.g. `Tracked by Cipherwake since 2026-04-12 · 47 observations`) showing how long Cipherwake has been observing the domain and how many cert observations we've accumulated. Only renders when prior history exists — first-ever scans of a brand-new domain stay quiet.
+- Mirrors the pill on the extension popup, the GitHub Action PR comment, and the Slack `/pqcheck` response footer. Closes the cross-surface parity gap (Rule 8) for provenance.
+- Turns one-shot scan output into a trust signal: this isn't a single probe — it's a row in a historical record.
+
+## [0.8.0] — 2026-05-12
+
+### Added — `pqcheck changes <domain>` subcommand
+- **New subcommand `pqcheck changes <domain>`** — summarises Cipherwake-observed public attack-surface changes for a domain in the last 14 days. Calls `/api/changes-summary` against `cipherwake.io` and prints:
+  - Tracking-since date (when Cipherwake first observed the domain)
+  - Total changes detected in last 14d
+  - Breakdown: new subdomains, new third-party script hosts, new cert SPKI fingerprints
+  - Link to the full `/domain/<host>/security-changelog` page for deeper detail
+- `--json` flag emits raw API JSON for CI / scripting use.
+- Backed by the new observation tables introduced server-side 2026-05-13 (subdomain_observations, script_observations, cert_observations, posture_snapshots, dns_observations, caa_observations, email_security_observations) — every scan now accumulates time-series facts on the backend, and this command exposes the delta view in the terminal.
+
+### Why it matters
+Closes the parity loop for change-detection across surfaces: extension popup shows the "Changed: N" pill, website `/r/<host>` shows the watch card + diff link, GitHub Action's PR comment includes the recent-changes count, and now the CLI surfaces the same data for terminal workflows. Devs can run `pqcheck changes acme.com` in CI to flag when a dependency domain drifts, in PR descriptions to anchor "what changed since last week," or as a daily check on watched vendors.
+
+### Compatibility
+Additive only — no breaking changes. Existing commands (`pqcheck <domain>`, `lock`, `deps`, `diff`, `history`, `cert`) unchanged. Help text updated to list the new command.
+
+## [0.7.9] — 2026-05-12
+
+### Added — CSP-quality verdict + vendor classification on `deps`
+- **CSP-quality verdict** captured from the homepage response. `pqcheck deps <domain>` now prints a one-line site-wide verdict above the table: `✗ No CSP enforcement`, `⚠ CSP is permissive`, or `✓ Strict CSP enforced`. Surfaced in JSON as `csp: { quality, source }`. Mirrors the extension's Supply Chain tab banner — same code path, same verdict.
+- **Vendor classification** per third-party host. A new `VENDOR (CATEGORY)` column shows friendly names like `New Relic (errors)` or `Cloudflare (cdn)` instead of opaque hostnames. JSON adds `thirdParties[].vendor: { name, category }` (or `null` if no match). Catalog covers ~80 of the most common third parties; **unknown hosts fall through to a conservative heuristic** (`cdn.*` / `analytics.*` / `ads.*` / `consent.*` / etc.) so most third parties get at least a category label even without an explicit catalog entry. Heuristic matches return `name: null` so JSON consumers can distinguish them from explicit catalog matches.
+- Schema bumped to **v1.2** to reflect the new fields. v1.0/v1.1 readers ignore the new fields without error.
+
+### Why it matters
+Companion to extension v0.3.14 and site `/r/<domain>` v0.4. The CLI is the CI surface — `pqcheck deps --fail-on-new` already gates new third parties; now the report it prints in PR comments tells reviewers *who* the new vendor is (`New Relic · errors`) and what the site's CSP posture looks like, instead of just listing raw hostnames. Closes the supply-chain story across all four surfaces (extension, CLI, GitHub Action, website).
+
+### Cross-surface parity
+The CSP-quality verdict + vendor classification now ship on all four surfaces (Rule 8 of CLAUDE.md): extension Supply Chain tab, website `/r/<domain>` supply chain section, CLI `pqcheck deps`, and the GitHub Action (inherits CLI behavior).
+
+### Compatibility
+Backwards-compatible. Existing JSON consumers reading v1.1 fields keep working. New `csp` and `vendor` fields are additive.
+
+---
+
+## [0.7.8] — 2026-05-12
+
+### Added — supply-chain change detection in CI
+- **`pqcheck deps <domain> --baseline <file>`** — compare current third-party host list to a stored baseline JSON file. Hosts in the current scan that weren't in the baseline are flagged as NEW. Empty baseline file (file missing) treats everything as the initial baseline.
+- **`--write-baseline`** — overwrite the baseline file with the current scan's hosts. Run this once to capture the initial state, then re-run with just `--baseline` to detect future additions.
+- **`--fail-on-new`** — exit code 4 if any new host appeared since the baseline (and the baseline isn't empty). The Polyfill.io-style supply-chain change detector for CI pipelines. Drop into a GitHub Action workflow with `--baseline .pqcheck-baseline.json --fail-on-new` and every PR that adds a new third-party script fails until the baseline is deliberately updated.
+- **SRI status per script** — `extractThirdPartyRefs` now captures the `integrity` attribute. Each third-party host gets `sri: { allScriptsHaveSri, allHttps }` in the JSON output. Lets vendor-risk teams see which third parties don't enforce subresource integrity (silent supply-chain risk: vendor can swap script contents without anyone knowing).
+
+### Why it matters
+Companion to browser extension v0.3.14's per-site supply-chain detection. The extension catches changes for sites individual users visit; this CLI variant catches changes in CI for sites your team OWNS — your own site, your customer-facing portals, your vendor portfolio. Drop in a workflow YAML, fail PRs that introduce new third-party scripts, audit them deliberately. Brings supply-chain change detection into the dev/PR loop where it can be reviewed and approved before it ships.
+
+### Schema additions
+- `quantapact-deps.lock` schema bumped to v1.1: adds `baseline`, `sri`, `isNew` fields per host. Backward-compatible (older tooling reading v1.0 just ignores the new fields).
+
+---
+
+## [0.7.7] — 2026-05-11
+
+### Added
+- **`--fresh` flag (alias: `--force`)** on the scan subcommand. Bypasses the server-side smart-cache and runs a fresh full scan. Useful when verifying a cert/key change you just deployed — without `--fresh`, scans can return up-to-1h-old data from the SWR cache window. Subject to a 20/hr per-IP cap server-side; if exceeded, the server silently downgrades to a cached scan and the CLI still gets a result.
+- **429 response now surfaces the upsell hint.** When the server returns a `need_more` object (rate limit hit), pqcheck prints the message + feedback-form URL to stderr so users know how to ask for higher limits.
+
+### Changed
+- README documents the actual rate limits (300 scans/hr, 20 force-refresh/hr per IP). Previous "60/minute" claim was stale.
+
+### Why it matters
+The `--fresh` flag closes a real workflow gap: CI/CD pipelines, sysadmins testing cert rotations, and devsecops people who want guaranteed-fresh data instead of cached. The 429 upsell turns rate-limit hits into demand signals routed to /feedback rather than dead ends.
+
+### Compatibility
+Backwards-compatible. No behavioural change without `--fresh`.
+
+---
+
 ## [0.7.6] — 2026-05-10
 
 ### Changed
 - **User-Agent string now includes the subcommand context** on every API call. Was: `pqcheck-cli/0.7.5`. Now: `pqcheck-cli/0.7.6 (scan)`, `(lock)`, `(deps)`, `(history)`, or `(watch)`. The subcommand for `lock`/`deps`/`history` was already tagged in 0.7.5; this release also tags `scan` and `watch` for consistency.
 
 ### Why it matters
-The server can now aggregate adoption by subcommand — useful for understanding which CLI features are most used in the wild. The subcommand token rides inside the existing User-Agent header (which has always been logged anonymously); no new data is collected. See [quantapact.com/privacy](https://quantapact.com/privacy) for the full data-handling spec.
+The server can now aggregate adoption by subcommand — useful for understanding which CLI features are most used in the wild. The subcommand token rides inside the existing User-Agent header (which has always been logged anonymously); no new data is collected. See [cipherwake.io/privacy](https://cipherwake.io/privacy) for the full data-handling spec.
 
 ### Compatibility
 No breaking changes. Older CLI versions continue to work; the server records `subcommand=null` for their requests.
@@ -55,7 +169,7 @@ No breaking changes. JSON output adds `_meta.degraded` (bool) and `_meta.degrade
 
 ### Changed
 - README rewritten with Examples / Exit codes / CI integration sections.
-- npm metadata aligned to the public `quantapact/pqcheck` org repo.
+- npm metadata aligned to the public `cipherwake-io/pqcheck` org repo.
 
 ---
 
@@ -103,7 +217,7 @@ No breaking changes. JSON output adds `_meta.degraded` (bool) and `_meta.degrade
 ## [0.1.x] — 2026-05-03
 
 ### Added
-- Initial release: `npx pqcheck <domain>` runs a Decryption Blast Radius scan via the public Quantapact API.
+- Initial release: `npx pqcheck <domain>` runs a Decryption Blast Radius scan via the public Cipherwake API.
 - Human-readable text output with TLS / cert / subdomain / hybrid-PQC findings.
 
 ---

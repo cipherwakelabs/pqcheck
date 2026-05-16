@@ -8,13 +8,17 @@ npx pqcheck stripe.com
 
 Zero install. Works in any terminal with Node 18+. Free, no signup, no API key.
 
-The same scanner that powers [quantapact.com](https://quantapact.com), the browser extension, and the GitHub Action.
+The same scanner that powers [cipherwake.io](https://cipherwake.io), the browser extension, and the GitHub Action.
 
 ---
 
-## What's new in 0.7.6
+## What's new in 0.7.9
 
-User-Agent now consistently tags the subcommand on every request (`pqcheck-cli/0.7.6 (scan)`, `(lock)`, `(deps)`, `(history)`, `(watch)`). Lets the server aggregate adoption by subcommand. No new data collected — the subcommand token rides inside the User-Agent header that has always been logged anonymously. See [privacy](https://quantapact.com/privacy) and [CHANGELOG.md](./CHANGELOG.md).
+**CSP verdict + vendor labels on `pqcheck deps`.** The supply-chain table now shows a friendly vendor label (`New Relic · errors` / `Cloudflare · cdn` / `Adobe Fonts · fonts`) per host instead of raw `bam.nr-data.net`-style hostnames, plus a one-line site-wide CSP verdict above the table (`✗ No CSP enforcement` / `⚠ CSP is permissive` / `✓ Strict CSP enforced`). Same data shape ships on `/r/<domain>` and in the browser extension — cross-surface parity for the supply-chain story. See [CHANGELOG.md](./CHANGELOG.md).
+
+## What's new in 0.7.8
+
+**Supply-chain change detection in CI** — `pqcheck deps <domain> --baseline file.json` compares the current third-party host list to a stored baseline. New hosts since the last accepted state are flagged `*NEW*` in the pretty table and `"isNew": true` in JSON. Add `--fail-on-new` to exit `4` if anything new appeared — the Polyfill.io-style CI gate that fails PRs introducing third-party scripts until you deliberately accept them with `--write-baseline`. Each row also shows an `SRI` column (on/off/n/a) so you can see which scripts allow silent vendor-side content swaps. See [CHANGELOG.md](./CHANGELOG.md).
 
 ---
 
@@ -38,10 +42,11 @@ Plus a full ASM check suite for credibility:
 
 ```
 npx pqcheck <domain>                          Scan + print human-readable report
-npx pqcheck lock <domain>                     Generate quantapact.lock (QXM) committable manifest
+npx pqcheck lock <domain>                     Generate cipherwake.lock (QXM) committable manifest
 npx pqcheck deps <domain>                     Scan all third-party origins on the page (supply-chain HNDL)
 npx pqcheck diff <old.lock> <new.lock>        Compare two QXM lockfiles; exit 2 on regression
 npx pqcheck history <domain>                  Show 90-day score history (sparkline + samples)
+npx pqcheck changes <domain>                  Summarize public attack-surface changes in last 14 days
 npx pqcheck cert <file.pem>                   Analyze a local PEM/CRT cert file (offline, no network)
 ```
 
@@ -77,10 +82,13 @@ npx pqcheck --file domains.txt                Bulk scan from a newline-separated
 ### Subcommand-specific flags
 
 **`pqcheck deps`:**
-- `--lock` — Also write `quantapact-deps.lock` + `.md`
+- `--lock` — Also write `cipherwake-deps.lock` + `.md`
 - `-o <dir>` — Output directory for `--lock` files
 - `--max=<N>` — Max third parties to scan (default 20)
 - `--allowlist <file>` — Exit **3** if any third-party not in allowlist (CI vendor-risk gate)
+- `--baseline <file>` — Compare current hosts to baseline JSON; flag `*NEW*` and surface `isNew` in JSON output
+- `--write-baseline` — Overwrite `--baseline` file with current scan (use once to capture initial state)
+- `--fail-on-new` — Exit **4** if any new hosts appeared since baseline (CI supply-chain change gate)
 
 **`pqcheck lock`:**
 - `-o <dir>` — Output directory
@@ -98,6 +106,7 @@ npx pqcheck --file domains.txt                Bulk scan from a newline-separated
 | `1` | Usage / network / scan error |
 | `2` | Score met or exceeded `--threshold`, or `diff` detected regression |
 | `3` | Allowlist violation (`pqcheck deps --allowlist`) |
+| `4` | Supply-chain change detected — new host(s) since baseline (`pqcheck deps --fail-on-new`) |
 
 ## Examples
 
@@ -119,6 +128,12 @@ npx pqcheck deps mycompany.com --lock
 
 # Vendor-risk CI gate — fail PR if any third-party not in allowlist
 npx pqcheck deps mycompany.com --allowlist allowed-vendors.txt
+
+# Capture initial supply-chain baseline (run once, commit the JSON file)
+npx pqcheck deps mycompany.com --baseline .pqcheck-baseline.json --write-baseline
+
+# Supply-chain change gate — fail PR if any new third-party script appeared since baseline
+npx pqcheck deps mycompany.com --baseline .pqcheck-baseline.json --fail-on-new
 
 # Score history sparkline
 npx pqcheck history mycompany.com
@@ -146,13 +161,15 @@ Like SBOM, `package-lock.json`, or `cargo audit` outputs — track quantum expos
 ```bash
 npx pqcheck lock yourcompany.com
 # Writes:
-#   quantapact.lock          — stable JSON manifest
-#   quantapact-report.md     — human-readable summary (renders on GitHub)
+#   cipherwake.lock          — stable JSON manifest
+#   cipherwake-report.md     — human-readable summary (renders on GitHub)
 ```
 
 Commit both files. Use `npx pqcheck diff old.lock new.lock` in CI to surface regressions in PR comments.
 
-Schema documented at [quantapact.com/schemas/qxm/v1](https://quantapact.com/methodology/qxm).
+> **Filename history.** This tool was previously named Quantapact and earlier versions wrote `quantapact.lock` + `quantapact-report.md`. Both names work forever — `pqcheck lock` auto-detects an existing legacy lockfile and overwrites it in place rather than silently creating a second file in your repo. New repos get the new `cipherwake.lock` default. No migration required.
+
+Schema documented at [cipherwake.io/schemas/qxm/v1](https://cipherwake.io/methodology/qxm).
 
 ### Supply-chain dependency scanning
 
@@ -161,41 +178,41 @@ npx pqcheck deps stripe.com
 # Output: every third-party origin on stripe.com (analytics, CDN, fonts, etc.) graded for quantum risk
 ```
 
-Add `--lock` to write `quantapact-deps.lock` + `.md` for committing or PR comparison. Add `--allowlist file.txt` to gate CI on vendor approval.
+Add `--lock` to write `cipherwake-deps.lock` + `.md` for committing or PR comparison. Add `--allowlist file.txt` to gate CI on vendor approval.
 
 ## Companion surfaces
 
-This CLI is one of four ways to consume the [Decryption Blast Radius API](https://quantapact.com/api):
+This CLI is one of four ways to consume the [Decryption Blast Radius API](https://cipherwake.io/api):
 
 | Surface | Where |
 |---|---|
 | **CLI** (this package) | `npx pqcheck` |
 | **Browser extension** | Chrome Web Store / Firefox AMO / Edge — toolbar badge per tab + dependency analysis |
-| **GitHub Action** | [`quantapact/pqcheck/action@main`](https://github.com/quantapact/pqcheck/tree/main/action) — PR comments, SARIF upload, lockfile generation |
-| **Slack `/pqcheck`** | [Install on workspace](https://quantapact.com/install-slack) |
-| **Web** | [quantapact.com](https://quantapact.com) — share-friendly URLs at `/r/<domain>` |
+| **GitHub Action** | [`cipherwake-io/pqcheck/action@main`](https://github.com/cipherwake-io/pqcheck/tree/main/action) — PR comments, SARIF upload, lockfile generation |
+| **Slack `/pqcheck`** | [Install on workspace](https://cipherwake.io/install-slack) |
+| **Web** | [cipherwake.io](https://cipherwake.io) — share-friendly URLs at `/r/<domain>` |
 
 ## Public API
 
-`pqcheck` is a wrapper around the public Quantapact API. You can also call the API directly:
+`pqcheck` is a wrapper around the public Cipherwake API. You can also call the API directly:
 
 ```bash
-curl -s "https://www.quantapact.com/api/scan?domain=stripe.com" | jq '.grade, .score'
+curl -s "https://www.cipherwake.io/api/scan?domain=stripe.com" | jq '.grade, .score'
 ```
 
-Full API reference at [quantapact.com/api](https://quantapact.com/api).
+Full API reference at [cipherwake.io/api](https://cipherwake.io/api).
 
-**Rate limit:** ~60 requests/minute per IP. No API key required. Returns HTTP 429 if exceeded — back off and retry.
+**Rate limits:** 300 scans per hour per IP, 20 `--fresh` (force-refresh) scans per hour per IP. No API key required. Returns HTTP 429 if exceeded — back off and retry, or [let us know via the feedback form](https://cipherwake.io/feedback) if you need higher limits (we're prioritizing the API tier based on real demand).
 
 ## Methodology
 
 Decryption Blast Radius scoring methodology is fully open. Component weights, PQC discount math, the "what we DON'T claim" sections, edge cases — all documented:
 
-- [Decryption Blast Radius](https://quantapact.com/methodology/decryption-blast-radius) — core methodology
-- [Score components](https://quantapact.com/methodology/score-components) — the 4-bar weighted breakdown + PQC discount
-- [QXM lockfile schema](https://quantapact.com/methodology/qxm) — committable manifest format
-- [Browser extension methodology](https://quantapact.com/methodology/browser-extension) — supply-chain HNDL detection logic
-- [Methodology library](https://quantapact.com/methodology) — full index
+- [Decryption Blast Radius](https://cipherwake.io/methodology/decryption-blast-radius) — core methodology
+- [Score components](https://cipherwake.io/methodology/score-components) — the 4-bar weighted breakdown + PQC discount
+- [QXM lockfile schema](https://cipherwake.io/methodology/qxm) — committable manifest format
+- [Browser extension methodology](https://cipherwake.io/methodology/browser-extension) — supply-chain HNDL detection logic
+- [Methodology library](https://cipherwake.io/methodology) — full index
 
 ## Versioning + stability
 
@@ -205,20 +222,20 @@ The CLI follows the same policy — output formats are stable across minor versi
 
 ## Privacy
 
-`pqcheck` sends the domain you scan to `quantapact.com/api/scan` (so the TLS handshake can be performed from the public internet). No other data is sent — no email, no client-side identifier. The server logs anonymized analytics: domain, hashed IP (for rate limiting), user-agent. We don't track individual users across scans. See [quantapact.com/privacy](https://quantapact.com/privacy).
+`pqcheck` sends the domain you scan to `cipherwake.io/api/scan` (so the TLS handshake can be performed from the public internet). No other data is sent — no email, no client-side identifier. The server logs anonymized analytics: domain, hashed IP (for rate limiting), user-agent. We don't track individual users across scans. See [cipherwake.io/privacy](https://cipherwake.io/privacy).
 
 ## CI integration
 
 ```yaml
 # .github/workflows/quantum-risk-gate.yml
-- name: Quantapact public-surface gate
+- name: Cipherwake public-surface gate
   run: npx pqcheck@latest mycompany.com --threshold 7
 ```
 
-For richer integration (sticky PR comments, SARIF upload to Code Scanning, lockfile diff on regression), use the [GitHub Action](https://github.com/quantapact/pqcheck/tree/main/action):
+For richer integration (sticky PR comments, SARIF upload to Code Scanning, lockfile diff on regression), use the [GitHub Action](https://github.com/cipherwake-io/pqcheck/tree/main/action):
 
 ```yaml
-- uses: quantapact/pqcheck/action@main
+- uses: cipherwake-io/pqcheck/action@main
   with:
     domain: mycompany.com
     threshold: '7'
@@ -235,12 +252,12 @@ For richer integration (sticky PR comments, SARIF upload to Code Scanning, lockf
 
 ## License
 
-MIT. © 2026 Quantapact.
+MIT. © 2026 Cipherwake.
 
 ---
 
-**Source:** [github.com/quantapact/pqcheck](https://github.com/quantapact/pqcheck)
+**Source:** [github.com/cipherwake-io/pqcheck](https://github.com/cipherwake-io/pqcheck)
 
 **Changelog:** [CHANGELOG.md](./CHANGELOG.md) for version-by-version release notes.
 
-**Issues / feedback:** [quantapact.com/feedback](https://quantapact.com/feedback) or open an issue on the repo.
+**Issues / feedback:** [cipherwake.io/feedback](https://cipherwake.io/feedback) or open an issue on the repo.

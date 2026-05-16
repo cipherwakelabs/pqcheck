@@ -2,7 +2,7 @@
 
 > Quantum-decryption risk gate for GitHub Actions. Fails your build if the public-surface Decryption Blast Radius score for a domain exceeds a threshold.
 
-Wraps the [`pqcheck` CLI](https://www.npmjs.com/package/pqcheck) — same scanner that powers [quantapact.com](https://quantapact.com).
+Wraps the [`pqcheck` CLI](https://www.npmjs.com/package/pqcheck) — same scanner that powers [cipherwake.io](https://cipherwake.io).
 
 Current version: **v2.0.1**. See [CHANGELOG.md](./CHANGELOG.md) for release history.
 
@@ -11,7 +11,7 @@ Current version: **v2.0.1**. See [CHANGELOG.md](./CHANGELOG.md) for release hist
 ## Quick start
 
 ```yaml
-- uses: quantapact/pqcheck/action@main
+- uses: cipherwake-io/pqcheck/action@main
   with:
     domain: mycompany.com
     threshold: '7'
@@ -29,7 +29,11 @@ If the score meets or exceeds `7`, the step exits `2` and the workflow fails.
 | `comment-on-pr`        | no       | `false`                  | Post a sticky PR comment with scan summary (requires `pull-requests: write`) |
 | `generate-sarif`       | no       | `false`                  | Write SARIF 2.1.0 report; pair with `codeql-action/upload-sarif@v3`      |
 | `sarif-output-path`    | no       | `pqcheck-results.sarif`  | Where to write the SARIF file                                            |
-| `generate-lockfile`    | no       | `false`                  | Write `quantapact.lock` + `.md` for committing or artifact upload        |
+| `generate-lockfile`    | no       | `false`                  | Write `cipherwake.lock` + `.md` for committing or artifact upload (preserves legacy `quantapact.lock` filename if already present) |
+| `fresh`                | no       | `false`                  | Bypass server cache and force a fresh scan. Use in "deploy then verify" workflows. Subject to 20/hr per-IP cap server-side |
+| `supply-chain-baseline` | no      | `''` (off)               | Path to a committed third-party baseline JSON (e.g. `.pqcheck-baseline.json`). When set, the action also runs `pqcheck deps --baseline <path>` and fails the build if any new third-party host appears since the baseline — the Polyfill.io-style change gate |
+| `supply-chain-fail-on-new` | no   | `true`                   | When `supply-chain-baseline` is set, fail the build (exit `4`) if any new third-party host appeared since the baseline |
+| `supply-chain-write-baseline` | no | `false`                  | When `supply-chain-baseline` is set, overwrite the baseline file with the current scan. Used to capture the initial state or deliberately accept new hosts — do NOT enable on every PR |
 
 ## Outputs
 
@@ -37,7 +41,7 @@ If the score meets or exceeds `7`, the step exits `2` and the workflow fails.
 |--------------|------------------------------------------|
 | `score`      | Decryption Blast Radius score (0-10)     |
 | `grade`      | Letter grade A-F                         |
-| `report-url` | Shareable report URL on `quantapact.com` |
+| `report-url` | Shareable report URL on `cipherwake.io` |
 
 ## Examples
 
@@ -50,7 +54,7 @@ jobs:
   pqcheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: quantapact/pqcheck/action@main
+      - uses: cipherwake-io/pqcheck/action@main
         with:
           domain: mycompany.com
           threshold: '7'
@@ -59,7 +63,7 @@ jobs:
 ### Surface findings in GitHub Code Scanning (Security tab)
 
 ```yaml
-- uses: quantapact/pqcheck/action@main
+- uses: cipherwake-io/pqcheck/action@main
   with:
     domain: mycompany.com
     generate-sarif: 'true'
@@ -73,16 +77,16 @@ Findings appear in the GitHub Security tab as code-scanning alerts, fully integr
 ### Track crypto posture over time as a committed artifact
 
 ```yaml
-- uses: quantapact/pqcheck/action@main
+- uses: cipherwake-io/pqcheck/action@main
   with:
     domain: mycompany.com
     generate-lockfile: 'true'
 - uses: actions/upload-artifact@v4
   with:
-    name: quantapact-lock
+    name: cipherwake-lock
     path: |
-      quantapact.lock
-      quantapact-report.md
+      cipherwake.lock
+      cipherwake-report.md
 ```
 
 Or commit the lockfile to your repo (similar to `package-lock.json`) so PR diffs surface posture changes.
@@ -90,7 +94,7 @@ Or commit the lockfile to your repo (similar to `package-lock.json`) so PR diffs
 ### Use the score in a follow-up step (e.g. PR comment)
 
 ```yaml
-- uses: quantapact/pqcheck/action@main
+- uses: cipherwake-io/pqcheck/action@main
   id: scan
   with:
     domain: mycompany.com
@@ -107,11 +111,34 @@ strategy:
   matrix:
     domain: [api.mycompany.com, app.mycompany.com, www.mycompany.com]
 steps:
-  - uses: quantapact/pqcheck/action@main
+  - uses: cipherwake-io/pqcheck/action@main
     with:
       domain: ${{ matrix.domain }}
       threshold: '7'
 ```
+
+### Supply-chain change detection (Polyfill.io-style gate)
+
+Commit a baseline once, then every PR fails if a new third-party script appears:
+
+```yaml
+# Step 1 — capture initial baseline (run once locally or via an admin workflow)
+- uses: cipherwake-io/pqcheck/action@v2.2.0
+  with:
+    domain: mycompany.com
+    supply-chain-baseline: '.pqcheck-baseline.json'
+    supply-chain-write-baseline: 'true'
+
+# Step 2 — commit `.pqcheck-baseline.json`, then on every PR:
+- uses: cipherwake-io/pqcheck/action@v2.2.0
+  with:
+    domain: mycompany.com
+    threshold: '7'
+    supply-chain-baseline: '.pqcheck-baseline.json'
+    # supply-chain-fail-on-new defaults to true
+```
+
+A PR that introduces a new third-party host (analytics, CDN, font service, etc.) will fail with exit `4` and an `::error::` annotation explaining what changed. To accept the addition, re-run with `supply-chain-write-baseline: true` once and commit the updated baseline — the change becomes a reviewable diff in the PR rather than a silent supply-chain expansion.
 
 ## Exit codes
 
@@ -120,6 +147,7 @@ steps:
 | 0    | Success — score below threshold                        |
 | 1    | Usage / network / unreachable error                    |
 | 2    | Score met or exceeded threshold                        |
+| 4    | Supply-chain change detected — new third-party host(s) since baseline (`supply-chain-fail-on-new: true`) |
 
 ## Runner requirements
 
@@ -128,4 +156,4 @@ steps:
 
 ## License
 
-MIT. © 2026 Quantapact.
+MIT. © 2026 Cipherwake.
