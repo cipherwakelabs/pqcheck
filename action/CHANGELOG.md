@@ -3,6 +3,60 @@
 All notable changes to the GitHub Action.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v3.1.0] — 2026-05-16
+
+### Added — Sticky PR comment for Trust Diff mode
+
+When `mode: trust-diff` + `comment-on-pr: true` on a `pull_request` event, the Action posts a sticky PR comment with the Trust Diff verdict. Auto-edits on subsequent pushes (no comment spam). Heading `Cipherwake Trust Diff for <domain>` identifies prior comments for the dedup search.
+
+Comment renders:
+- Verdict emoji (🟢 pass / 🟡 warn / 🔴 fail) + plain-language headline
+- "Changed" section with per-delta severity tags
+- "No changes since baseline" branch for clean PRs
+- Approve-vendor / Configure-Trust-Diff CTAs
+- Quota footer (used / monthly limit)
+
+### Quota cost
+
+One extra Trust Diff API call per PR run when `comment-on-pr: true` — the CLI is invoked twice: once for the user-facing format + workflow log annotations, once with `--format json` for the comment markdown. Default behavior (`comment-on-pr: false`) is unchanged.
+
+### Required permissions
+
+Add to the workflow `permissions:` block when enabling commenting:
+
+```yaml
+permissions:
+  contents: read
+  pull-requests: write   # required for the sticky comment
+```
+
+### Mirror to workflow summary
+
+The comment markdown is also written to `$GITHUB_STEP_SUMMARY` so the run page shows the verdict without opening the PR.
+
+## [v3.0.0] — 2026-05-16
+
+### Added — `mode: trust-diff` for CI-time public-trust-posture gating
+- New `mode` input (default `scan`, new value `trust-diff`). In trust-diff mode, the Action calls `/api/trust-diff` via the CLI v0.11.0 `pqcheck trust-diff` subcommand.
+- New inputs: `baseline` (last-week | last-month | last-scan | ISO date · default last-week), `fail-on` (any | low | medium | high | critical · default high), `output-format` (pretty | json | sarif | github · default github).
+- Action exits 0 / 1 / 2 mapping to pass / warn / fail. CI build fails at exit code ≥ 1 unless your workflow tolerates warnings via `continue-on-error`.
+- Requires `api-key` input (`secrets.CIPHERWAKE_API_KEY`). Free tier: 30 calls/month; generate at https://cipherwake.io/account#api-keys.
+- The existing `mode: scan` (default) path is unchanged — workflows that don't set `mode` keep their existing behavior.
+
+### Example
+```yaml
+- uses: cipherwakelabs/pqcheck/action@v3
+  with:
+    mode: trust-diff
+    domain: my-domain.com
+    baseline: last-week
+    fail-on: high
+    api-key: ${{ secrets.CIPHERWAKE_API_KEY }}
+```
+
+### Marketing-funnel copy aligned to the locked tier architecture
+- Help text + step output reference Trust Diff + Vendor Change + HNDL + Key Map per the v3-way validated tier architecture.
+
 ## [v2.4.0] — 2026-05-15
 
 ### Changed — `generate-lockfile` now writes `cipherwake.lock` by default (was `quantapact.lock`)

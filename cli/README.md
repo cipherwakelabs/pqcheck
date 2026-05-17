@@ -12,6 +12,63 @@ The same scanner that powers [cipherwake.io](https://cipherwake.io), the browser
 
 ---
 
+## Get started in 60 seconds
+
+Wire Cipherwake into your CI so every PR gets a Trust Diff comment when your domain's public trust posture changes.
+
+**One command does almost everything:**
+
+```bash
+npx pqcheck onboard cipherwake.io
+```
+
+That runs in sequence: scan your domain → write the GitHub Action workflow → capture a vendor lockfile → generate a release checklist → open your browser to the API-key page. You finish by adding the API key as a repo secret + committing.
+
+**Or step-by-step if you prefer:**
+
+```bash
+# 1. Scaffold a GitHub Actions workflow (interactive prompts)
+npx pqcheck init
+
+# 2. Generate a free API key at https://cipherwake.io/account#api-keys
+#    (Free tier: 30 Trust Diff calls/month)
+
+# 3. Add the key as a repo secret:
+#    GitHub → Settings → Secrets → Actions → New secret
+#    Name: CIPHERWAKE_API_KEY  Value: qpk_...
+
+# 4. Commit + push
+git add .github/workflows/cipherwake.yml
+git commit -m "ci: add Cipherwake Trust Diff gate"
+git push
+```
+
+That's it. Open a PR and Cipherwake comments inline when cert / SPKI / HSTS / CSP / DMARC / vendor scripts drift since your baseline.
+
+**Want more?**
+- Pre-commit hook: `npx pqcheck deploy-check <domain>` before every deploy
+- Release ritual: `npx pqcheck release-checklist <domain>` for your release notes
+- Vendor lockfile: `npx pqcheck vendors export <domain>` to commit `cipherwake.vendors.json` and fail PRs introducing new third-party scripts
+
+---
+
+## What's new in 0.12.0
+
+**Developer habit-loop bundle (locked 2026-05-16).** Five new subcommands that put Cipherwake where developers already work: PRs, CI, release notes, vendor allowlists. Free tier covers all of them within the 30 Trust Diff calls/month quota.
+
+- `pqcheck init` — interactive scaffold for `.github/workflows/cipherwake.yml`. Prompts for domain, fail-on severity, baseline. No copy-paste from docs required.
+- `pqcheck deploy-check <domain>` — pre-deploy Trust Diff gate with deploy-friendly framing. Uses last-scan as default baseline. Same exit semantics as `trust-diff`.
+- `pqcheck release-checklist [domain]` — markdown checklist for release notes. Offline, no API call.
+- `pqcheck vendors export <domain>` — write `cipherwake.vendors.json` from currently observed third-party origins. Like `package-lock.json` for vendor scripts.
+- `pqcheck vendors check <domain>` — CI gate; exits **4** when new origins appear that aren't in the lockfile.
+- `pqcheck vendors sync <domain>` — Starter+ only; pulls your dashboard-managed approved-vendor allowlist into the lockfile.
+
+Plus: the GitHub Action v3.1 now posts a **sticky PR comment** with Trust Diff results when `comment-on-pr: true` is set, and `/r/<domain>` has a "Copy as GitHub issue" button on every finding.
+
+## What's new in 0.11.0
+
+**Trust Diff subcommand** — `npx pqcheck trust-diff <domain>` calls `/api/trust-diff` and gates CI on regression severity vs a configured baseline. SARIF output uploads to GitHub's Code Scanning. Pair with `cipherwakelabs/pqcheck@v3` action `mode: trust-diff` for one-line CI integration.
+
 ## What's new in 0.7.9
 
 **CSP verdict + vendor labels on `pqcheck deps`.** The supply-chain table now shows a friendly vendor label (`New Relic · errors` / `Cloudflare · cdn` / `Adobe Fonts · fonts`) per host instead of raw `bam.nr-data.net`-style hostnames, plus a one-line site-wide CSP verdict above the table (`✗ No CSP enforcement` / `⚠ CSP is permissive` / `✓ Strict CSP enforced`). Same data shape ships on `/r/<domain>` and in the browser extension — cross-surface parity for the supply-chain story. See [CHANGELOG.md](./CHANGELOG.md).
@@ -48,6 +105,15 @@ npx pqcheck diff <old.lock> <new.lock>        Compare two QXM lockfiles; exit 2 
 npx pqcheck history <domain>                  Show 90-day score history (sparkline + samples)
 npx pqcheck changes <domain>                  Summarize public attack-surface changes in last 14 days
 npx pqcheck cert <file.pem>                   Analyze a local PEM/CRT cert file (offline, no network)
+npx pqcheck trust-diff <domain>               Trust Diff vs configured baseline; CI gate (Free: 30/mo)
+npx pqcheck deploy-check <domain>             Pre-deploy gate (Trust Diff alias with last-scan baseline)
+npx pqcheck onboard <domain>                  One-command setup wizard (scan + init + vendors + checklist)
+npx pqcheck init                              Interactive scaffold for .github/workflows/cipherwake.yml
+npx pqcheck release-checklist [domain]        Pre-release trust checklist (markdown, offline)
+npx pqcheck vendors export <domain>           Write cipherwake.vendors.json from observed third-party scripts
+npx pqcheck vendors check <domain>            CI gate; exit 4 on new origins not in lockfile
+npx pqcheck vendors sync <domain>             Pull dashboard allowlist into lockfile (Starter+, needs API key)
+npx pqcheck watch <domain>                    Add domain to your watched list (needs CIPHERWAKE_API_KEY)
 ```
 
 ### Multi-domain

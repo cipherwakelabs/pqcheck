@@ -1,39 +1,93 @@
 # pqcheck-action
 
-> Quantum-decryption risk gate for GitHub Actions. Fails your build if the public-surface Decryption Blast Radius score for a domain exceeds a threshold.
+> Cipherwake CI gate for GitHub Actions. Two modes: **scan** (full Decryption Blast Radius scan + threshold gate) and **trust-diff** (regression vs baseline + sticky PR comment).
 
 Wraps the [`pqcheck` CLI](https://www.npmjs.com/package/pqcheck) — same scanner that powers [cipherwake.io](https://cipherwake.io).
 
-Current version: **v2.0.1**. See [CHANGELOG.md](./CHANGELOG.md) for release history.
+Current version: **v3.1.0**. See [CHANGELOG.md](./CHANGELOG.md) for release history.
 
-> **What's new in v2.0.1**: when the underlying API falls back to a cached score (live probes failed three times), the action now emits a `::warning` annotation in the workflow check summary. Surfaces as a yellow warning on the PR check so a CI gate can't silently consume stale data. No `action.yml` changes needed — workflows pinned to `@main` get the behaviour automatically.
+> **What's new in v3.1**: Trust Diff mode now posts a **sticky PR comment** when `comment-on-pr: true` on `pull_request` events. The comment auto-edits on subsequent pushes (no spam), shows the verdict (🟢 pass / 🟡 warn / 🔴 fail), per-delta breakdown with severity tags, and Approve-vendor / Configure-Trust-Diff links. Quota cost: 1 extra Trust Diff call per PR run when commenting is enabled.
 
-## Quick start
+## Quick start — Trust Diff PR gate (recommended)
+
+The fastest path. Drop this in `.github/workflows/cipherwake.yml`:
 
 ```yaml
-- uses: cipherwake-io/pqcheck/action@main
+name: Cipherwake Trust Diff
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write   # required for the sticky PR comment
+
+jobs:
+  trust-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: cipherwakelabs/pqcheck@v3
+        with:
+          mode: trust-diff
+          domain: mycompany.com
+          baseline: last-week
+          fail-on: high
+          comment-on-pr: 'true'
+          api-key: ${{ secrets.CIPHERWAKE_API_KEY }}
+```
+
+Open a PR → Cipherwake comments inline when cert / SPKI / HSTS / CSP / DMARC / vendor scripts drift since your baseline.
+
+**Don't want to copy-paste?** Run [`npx pqcheck init`](https://www.npmjs.com/package/pqcheck) — interactive scaffold for this exact workflow.
+
+Get a free API key (30 Trust Diff calls/month) at [cipherwake.io/account#api-keys](https://cipherwake.io/account#api-keys).
+
+## Quick start — full scan mode
+
+```yaml
+- uses: cipherwakelabs/pqcheck@v3
   with:
     domain: mycompany.com
     threshold: '7'
 ```
 
-If the score meets or exceeds `7`, the step exits `2` and the workflow fails.
+If the score meets or exceeds `7`, the step exits `2` and the workflow fails. No API key needed for one-shot scans on public domains (per-IP rate limits apply).
 
 ## Inputs
 
-| Input                  | Required | Default                  | Description                                                              |
-|------------------------|----------|--------------------------|--------------------------------------------------------------------------|
-| `domain`               | yes      | —                        | Domain to scan (e.g. `example.com`)                                      |
-| `threshold`            | no       | `7`                      | Fail the step if score ≥ this (0-10)                                     |
-| `fail-on-unreachable`  | no       | `true`                   | Treat unreachable domains as failures                                    |
-| `comment-on-pr`        | no       | `false`                  | Post a sticky PR comment with scan summary (requires `pull-requests: write`) |
-| `generate-sarif`       | no       | `false`                  | Write SARIF 2.1.0 report; pair with `codeql-action/upload-sarif@v3`      |
-| `sarif-output-path`    | no       | `pqcheck-results.sarif`  | Where to write the SARIF file                                            |
-| `generate-lockfile`    | no       | `false`                  | Write `cipherwake.lock` + `.md` for committing or artifact upload (preserves legacy `quantapact.lock` filename if already present) |
-| `fresh`                | no       | `false`                  | Bypass server cache and force a fresh scan. Use in "deploy then verify" workflows. Subject to 20/hr per-IP cap server-side |
-| `supply-chain-baseline` | no      | `''` (off)               | Path to a committed third-party baseline JSON (e.g. `.pqcheck-baseline.json`). When set, the action also runs `pqcheck deps --baseline <path>` and fails the build if any new third-party host appears since the baseline — the Polyfill.io-style change gate |
-| `supply-chain-fail-on-new` | no   | `true`                   | When `supply-chain-baseline` is set, fail the build (exit `4`) if any new third-party host appeared since the baseline |
-| `supply-chain-write-baseline` | no | `false`                  | When `supply-chain-baseline` is set, overwrite the baseline file with the current scan. Used to capture the initial state or deliberately accept new hosts — do NOT enable on every PR |
+### Common (both modes)
+
+| Input | Required | Default | Description |
+|---|---|---|---|
+| `mode` | no | `scan` | `scan` (full Decryption Blast Radius + threshold gate) or `trust-diff` (regression vs baseline + sticky PR comment) |
+| `domain` | yes | — | Domain to scan (e.g. `example.com`) |
+| `api-key` | no | `''` | Cipherwake API key (`qpk_...`). Free: 30 Trust Diff calls/month. Required for `mode=trust-diff`. Recommended for `mode=scan` to bypass per-IP rate limits. Pass via secret: `${{ secrets.CIPHERWAKE_API_KEY }}` |
+| `comment-on-pr` | no | `false` | Post a sticky PR comment on `pull_request` events. Requires `permissions: pull-requests: write` |
+| `github-token` | no | `${{ github.token }}` | Token used to post/edit the PR comment |
+
+### Trust Diff mode (`mode: trust-diff`)
+
+| Input | Required | Default | Description |
+|---|---|---|---|
+| `baseline` | no | `last-week` | One of `last-week` / `last-month` / `last-scan` / ISO 8601 timestamp |
+| `fail-on` | no | `high` | Severity threshold — `any` / `low` / `medium` / `high` / `critical`. CI exits non-zero when any delta meets or exceeds this severity |
+| `output-format` | no | `github` | `pretty` / `json` / `sarif` / `github` (workflow commands) |
+
+### Scan mode (`mode: scan`, the default)
+
+| Input | Required | Default | Description |
+|---|---|---|---|
+| `threshold` | no | `7` | Fail the step if score ≥ this (0-10) |
+| `fail-on-unreachable` | no | `true` | Treat unreachable domains as failures |
+| `generate-sarif` | no | `false` | Write SARIF 2.1.0 report; pair with `codeql-action/upload-sarif@v3` |
+| `sarif-output-path` | no | `pqcheck-results.sarif` | Where to write the SARIF file |
+| `generate-lockfile` | no | `false` | Write `cipherwake.lock` + `.md` for committing or artifact upload (preserves legacy `quantapact.lock` filename if already present) |
+| `fresh` | no | `false` | Bypass server cache and force a fresh scan. Use in "deploy then verify" workflows. Subject to 20/hr per-IP cap server-side |
+| `supply-chain-baseline` | no | `''` (off) | Path to a committed third-party baseline JSON (e.g. `.pqcheck-baseline.json`). When set, also runs `pqcheck deps --baseline <path>` and fails the build if any new third-party host appears since the baseline — the Polyfill.io-style change gate |
+| `supply-chain-fail-on-new` | no | `true` | When `supply-chain-baseline` is set, fail the build (exit `4`) if any new third-party host appeared since the baseline |
+| `supply-chain-write-baseline` | no | `false` | When `supply-chain-baseline` is set, overwrite the baseline file with the current scan. Used to capture the initial state or deliberately accept new hosts — do NOT enable on every PR |
 
 ## Outputs
 
@@ -142,12 +196,12 @@ A PR that introduces a new third-party host (analytics, CDN, font service, etc.)
 
 ## Exit codes
 
-| Code | Meaning                                                |
-|------|--------------------------------------------------------|
-| 0    | Success — score below threshold                        |
-| 1    | Usage / network / unreachable error                    |
-| 2    | Score met or exceeded threshold                        |
-| 4    | Supply-chain change detected — new third-party host(s) since baseline (`supply-chain-fail-on-new: true`) |
+| Code | Meaning |
+|---|---|
+| 0 | Pass — score below threshold (scan mode) or no regression (trust-diff mode) |
+| 1 | Usage / network / unreachable error. **Note:** Trust Diff "warn" (changes observed below `fail-on` threshold) is translated to exit `0` so CI is not blocked — a `::warning::` annotation is emitted instead |
+| 2 | Scan: score met or exceeded threshold. Trust Diff: regression detected at or above `fail-on` |
+| 4 | Supply-chain change detected — new third-party host(s) since baseline (`supply-chain-fail-on-new: true`) |
 
 ## Runner requirements
 

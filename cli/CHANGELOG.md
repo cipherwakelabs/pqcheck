@@ -4,6 +4,49 @@ All notable changes to `pqcheck` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] — 2026-05-16
+
+### Added — Developer habit-loop bundle (6 new subcommands)
+
+Six new subcommands that put Cipherwake where developers already work: PRs, CI, release notes, vendor allowlists. Free tier covers all of them within the existing 30 Trust Diff calls/month quota.
+
+- **`pqcheck onboard <domain>`** — one-command setup wizard. Runs in sequence: (1) public scan to show your current grade, (2) `init` to scaffold the workflow, (3) `vendors export` to capture the lockfile, (4) writes `CIPHERWAKE_CHECKLIST.md` for release notes, (5) opens your browser to the API-key page, (6) prints next-steps. Flags: `--skip-scan`, `--skip-vendors`, `--skip-checklist`, `--no-open`. Honors `CI=true` and `CIPHERWAKE_NO_BROWSER=1` env vars to suppress the browser launch.
+- **`pqcheck init`** — interactive scaffold for `.github/workflows/cipherwake.yml`. Prompts for domain, fail-on severity, baseline. Flags: `--yes` / `-y` (use defaults; requires `--domain`), `--force` (overwrite existing workflow), `--stdout` (print to stdout instead of writing), `--domain`, `--fail-on`, `--baseline`.
+- **`pqcheck deploy-check <domain>`** — pre-deploy Trust Diff gate with deploy-friendly framing. Uses `last-scan` as default baseline + `high` as default fail-on. Same exit semantics as `trust-diff` (0 pass / 1 warn / 2 fail / 3 error).
+- **`pqcheck release-checklist [domain]`** — pure-offline markdown checklist for release notes. No API call.
+- **`pqcheck vendors export <domain>`** — write `cipherwake.vendors.json` from currently observed third-party origins (schema v1). Like `package-lock.json` for vendor scripts.
+- **`pqcheck vendors check <domain>`** — CI gate; exits **4** when new origins appear that aren't in the lockfile (matches `deps --fail-on-new`). Exit 0 when only removals.
+- **`pqcheck vendors sync <domain>`** — Starter+ only (requires `CIPHERWAKE_API_KEY`); merges your `/api/vendor-allowlist` approvals into the lockfile.
+
+### Docs
+
+- README — new "Get started in 60 seconds" section (`init → secret → push → PR comment`).
+- New methodology page `/methodology/vendor-lockfile` per Rule 1 (Cipherwake project rules).
+
+### Quota notes
+
+- All habit-loop subcommands are Free-tier-eligible. `vendors *` calls `/api/deps` which has its own per-IP rate limit (not metered against the Trust Diff 30/mo quota).
+- `vendors sync` requires a Starter+ API key because the underlying `/api/vendor-allowlist` endpoint is Starter+ gated server-side.
+
+### Paired releases
+
+- **GitHub Action v3.1** — `mode: trust-diff` + `comment-on-pr: true` now posts a sticky PR comment with Trust Diff results. Extra `--format json` CLI call when commenting is enabled (1 additional Trust Diff quota call per PR run).
+- **Browser extension v0.6.1** — popup shows a "🛡 Add CI gate" CTA after every scan; deep-links to `/account?install-action=<domain>` which auto-opens the Trust Diff config section.
+
+## [0.11.0] — 2026-05-16
+
+### Added — `pqcheck trust-diff <domain>` subcommand
+- New subcommand calls `/api/trust-diff` to compare current public trust posture vs a configured baseline.
+- Inputs: `--baseline last-week|last-month|last-scan|<ISO>` (default last-week), `--fail-on any|low|medium|high|critical` (default high), `--format pretty|json|sarif|github` (default pretty).
+- Exit codes: `0` pass · `1` warn (changes below threshold) · `2` fail (changes at/above threshold) · `3` error (auth/quota/network).
+- Free tier: 30 calls/month at `CIPHERWAKE_API_KEY` (generate at https://cipherwake.io/account#api-keys).
+- SARIF output (`--format sarif`) is upload-ready for `github/codeql-action/upload-sarif@v3` — surfaces deltas in the GitHub Security tab.
+- GitHub Actions output (`--format github`) writes `::error::` / `::warning::` / `::notice::` workflow commands directly.
+- Pairs with the new `cipherwakelabs/pqcheck/action` `mode: trust-diff` for one-line CI integration.
+
+### Marketing-funnel copy aligned to the locked free-monitoring policy
+- Help text + tail messages reference Trust Diff + Vendor Change + HNDL + Key Map per the v3-way validated tier architecture (Free=1 monitored, 30 API/mo, fail-mode CI; Starter $29=5 + allowlist; Growth $79=50 + Slack/webhook + team; Scale $199=500 + direct API + CSV).
+
 ## [0.10.0] — 2026-05-15
 
 ### Changed — Default lockfile filename is now `cipherwake.lock` (was `quantapact.lock`)

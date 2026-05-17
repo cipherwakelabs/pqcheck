@@ -6,6 +6,22 @@ branding:
   color: 'purple'
 
 inputs:
+  mode:
+    description: 'Action mode. "scan" (default) — runs full Decryption Blast Radius scan and gates on threshold. "trust-diff" — calls /api/trust-diff and gates on regression severity vs a baseline (CLI v0.11.0+).'
+    required: false
+    default: 'scan'
+  baseline:
+    description: 'Trust Diff baseline (mode=trust-diff only). One of: last-week | last-month | last-scan | ISO 8601 timestamp. Default: last-week.'
+    required: false
+    default: 'last-week'
+  fail-on:
+    description: 'Trust Diff fail-on severity (mode=trust-diff only). One of: any | low | medium | high | critical. CI exits non-zero when any delta meets or exceeds this severity. Default: high.'
+    required: false
+    default: 'high'
+  output-format:
+    description: 'Trust Diff output format (mode=trust-diff only). One of: pretty | json | sarif | github (writes GitHub Actions workflow commands). Default: github.'
+    required: false
+    default: 'github'
   domain:
     description: 'Domain to scan (e.g. example.com)'
     required: true
@@ -75,7 +91,224 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    # CLI v0.11.0 (locked 2026-05-16): Trust Diff mode. Calls /api/trust-diff
+    # with the configured baseline + fail-on threshold. Exits 2 on fail, 1 on
+    # warn, 0 on pass. Skipped entirely when mode != "trust-diff".
+    #
+    # Habit-loop #9 (locked 2026-05-16): when comment-on-pr=true and the run
+    # is a pull_request event, this step also emits a `trust-diff-markdown`
+    # output that the "Comment on pull request — Trust Diff" step uses to post
+    # a sticky PR comment. Quota cost: one extra Trust Diff API call per PR
+    # run when commenting is enabled.
+    - name: Trust Diff
+      id: trust-diff
+      if: inputs.mode == 'trust-diff'
+      shell: bash
+      env:
+        INPUT_DOMAIN: ${{ inputs.domain }}
+        INPUT_BASELINE: ${{ inputs.baseline }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_OUTPUT_FORMAT: ${{ inputs.output-format }}
+        INPUT_COMMENT_ON_PR: ${{ inputs.comment-on-pr }}
+        INPUT_EVENT_NAME: ${{ github.event_name }}
+        CIPHERWAKE_API_KEY: ${{ inputs.api-key }}
+        QUANTAPACT_API_KEY: ${{ inputs.api-key }}
+      run: |
+        set -euo pipefail
+        if [ -z "${CIPHERWAKE_API_KEY}" ]; then
+          echo "::error::Trust Diff mode requires an api-key input. Generate one (Free: 30 calls/mo) at https://cipherwake.io/account#api-keys and pass it via secrets: with: api-key: \${{ secrets.CIPHERWAKE_API_KEY }}"
+          exit 1
+        fi
+        echo "Cipherwake Trust Diff: domain=$INPUT_DOMAIN baseline=$INPUT_BASELINE fail-on=$INPUT_FAIL_ON"
+        # CLI handles the actual /api/trust-diff call, output formatting, and
+        # exit code (0 pass, 1 warn, 2 fail). The Action exits with the CLI's
+        # exit code automatically since `set -e` is on.
+        set +e
+        npx -y pqcheck@latest trust-diff "$INPUT_DOMAIN" \
+          --baseline "$INPUT_BASELINE" \
+          --fail-on "$INPUT_FAIL_ON" \
+          --format "$INPUT_OUTPUT_FORMAT"
+        EXIT=$?
+        set -e
+
+        # Habit-loop #9 — when commenting on PRs is enabled and we're in a
+        # pull_request event, run a second time with --format json so we can
+        # build the comment markdown from the structured payload. We skip
+        # this extra call when not needed to save quota.
+        #
+        # R40 fix (Q1.4): print a visible note so users know commenting
+        # consumes an extra quota call. Previously this lived only in docs.
+        if [ "${INPUT_COMMENT_ON_PR}" = "true" ] && [ "${INPUT_EVENT_NAME}" = "pull_request" ]; then
+          echo "::notice::Trust Diff comment-on-pr=true consumes one ADDITIONAL Trust Diff API call per PR run (one for log annotations + one for the comment markdown)."
+          set +e
+          JSON=$(npx -y pqcheck@latest trust-diff "$INPUT_DOMAIN" \
+            --baseline "$INPUT_BASELINE" \
+            --fail-on "$INPUT_FAIL_ON" \
+            --format json 2>/dev/null)
+          JSON_EXIT=$?
+          set -e
+          # R40 fix (Q1.3): require EXIT == 0 AND jq-valid JSON before
+          # parsing. The previous `-ge 0` was always true; an exit code of
+          # 1/2/3 with partial stdout could cause downstream jq calls to
+          # fail under `set -e` and kill the Action before the exit-code
+          # translation block ran.
+          if [ "$JSON_EXIT" = "0" ] && [ -n "${JSON:-}" ] && jq -e . >/dev/null 2>&1 <<< "$JSON"; then
+            VERDICT=$(jq -r '.verdict // "pass"' <<< "$JSON")
+            DELTA_COUNT=$(jq -r '.deltas | length' <<< "$JSON")
+            QUOTA_USED=$(jq -r '.quota.used_this_month // 0' <<< "$JSON")
+            QUOTA_LIMIT=$(jq -r '.quota.monthly_limit // 0' <<< "$JSON")
+            VERDICT_EMOJI=$( [ "$VERDICT" = "fail" ] && echo "🔴" || ([ "$VERDICT" = "warn" ] && echo "🟡" || echo "🟢") )
+            VERDICT_TEXT=$( [ "$VERDICT" = "fail" ] && echo "Trust regression detected" || ([ "$VERDICT" = "warn" ] && echo "Changes observed below fail-on threshold" || echo "No trust-posture regressions"))
+
+            MD_FILE=$(mktemp)
+            {
+              # R40 fix (Q1.5): hidden HTML comment marker carries our
+              # identity + domain. Sticky-comment search below uses this
+              # marker (not the visible heading text) so a user pasting
+              # the same heading text into a comment can't cause the
+              # Action to PATCH the wrong comment.
+              echo "<!-- cipherwake-trust-diff-comment:v1 domain=$INPUT_DOMAIN -->"
+              echo "## $VERDICT_EMOJI Cipherwake Trust Diff for \`$INPUT_DOMAIN\`"
+              echo ""
+              echo "**$VERDICT_TEXT** vs baseline \`$INPUT_BASELINE\` (fail-on \`$INPUT_FAIL_ON\`)."
+              echo ""
+              if [ "$DELTA_COUNT" -gt 0 ]; then
+                echo "### Changed"
+                echo ""
+                # One bullet per delta; severity prefix, then title.
+                jq -r '.deltas[] | "- **[\(.severity | ascii_upcase)]** \(.title // .type)" + (if .what_changed then "\n  " + .what_changed else "" end)' <<< "$JSON"
+                echo ""
+                echo "[Approve vendor / view scan ↗](https://cipherwake.io/r/$INPUT_DOMAIN) · [Configure Trust Diff ↗](https://cipherwake.io/account)"
+              else
+                echo "### No changes since baseline"
+                echo ""
+                echo "Certificate, SPKI, HSTS, CSP, DMARC, and vendor scripts all match \`$INPUT_BASELINE\`."
+              fi
+              echo ""
+              echo "<sub>Quota: $QUOTA_USED / $QUOTA_LIMIT Trust Diff calls used this month. Posted by [cipherwakelabs/pqcheck@v3](https://github.com/cipherwakelabs/pqcheck/tree/main/action) · [Methodology ↗](https://cipherwake.io/methodology)</sub>"
+            } > "$MD_FILE"
+
+            # R40 fix (Q1.8): harden delimiter generation. Previously
+            # `uuidgen || openssl rand -hex 8` could degrade to bare "EOF_"
+            # on minimal runners. Node crypto is always available (we're
+            # invoking npx anyway) — use it as the last-resort fallback.
+            EOF_DELIM="EOF_$(uuidgen 2>/dev/null || openssl rand -hex 8 2>/dev/null || node -e 'process.stdout.write(require("crypto").randomBytes(16).toString("hex"))' 2>/dev/null || echo "${RANDOM}_${RANDOM}_$(date +%s)_$$")"
+            {
+              echo "trust-diff-markdown<<$EOF_DELIM"
+              cat "$MD_FILE"
+              echo "$EOF_DELIM"
+            } >> "$GITHUB_OUTPUT"
+
+            # Mirror to GITHUB_STEP_SUMMARY so the workflow summary page also shows it.
+            cat "$MD_FILE" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::Trust Diff PR comment skipped: JSON output unavailable or invalid (json_exit=$JSON_EXIT)."
+          fi
+        fi
+
+        # R37 FIX 4/5 (2026-05-16): translate CLI exit codes to Action exit
+        # codes. CLI uses 0=pass / 1=warn / 2=fail / 3=error. CI failure
+        # semantics: warn must NOT fail the build (the CLI message says "CI
+        # not blocked"), only fail and error should. Without this translation
+        # the bash `exit $EXIT` would block CI on warn — bug in v3.0.0 draft.
+        if [ "$EXIT" = "2" ]; then
+          echo "::error::Trust Diff: regression detected at or above fail-on=$INPUT_FAIL_ON. CI blocked."
+          exit 2
+        elif [ "$EXIT" = "1" ]; then
+          echo "::warning::Trust Diff: changes observed below fail-on threshold. CI not blocked."
+          exit 0
+        fi
+        exit "$EXIT"
+
+    # Habit-loop #9 — sticky PR comment for Trust Diff mode.
+    - name: Comment on pull request (Trust Diff)
+      if: |
+        always() &&
+        inputs.mode == 'trust-diff' &&
+        inputs.comment-on-pr == 'true' &&
+        github.event_name == 'pull_request' &&
+        steps.trust-diff.outputs.trust-diff-markdown != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        INPUT_DOMAIN: ${{ inputs.domain }}
+        SUMMARY: ${{ steps.trust-diff.outputs.trust-diff-markdown }}
+      run: |
+        set -euo pipefail
+        # R40 fix (Q1.5): sticky-comment dedup uses a hidden HTML marker
+        # bound to (action+version+domain), NOT the visible heading text.
+        # A user pasting "Cipherwake Trust Diff for ..." into a comment
+        # can no longer trick the Action into PATCHing their comment.
+        MARKER="cipherwake-trust-diff-comment:v1 domain=$INPUT_DOMAIN"
+
+        # List PR comments; find first with our marker in the body.
+        # R40 fix (Q1.6): switch from `curl -s ... > /dev/null` to
+        # explicit HTTP code capture so GitHub-side failures
+        # (403/404/422/5xx) surface as ::warning:: instead of silent
+        # success. We use warning (not error) so a comment-post failure
+        # does NOT mask the underlying Trust Diff verdict — scan result
+        # is the source of truth; the comment is best-effort UX.
+        LIST_BODY=$(mktemp)
+        LIST_CODE=$(curl -sS -w "%{http_code}" -o "$LIST_BODY" \
+          -H "Authorization: Bearer $GH_TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments?per_page=100")
+        if [ "$LIST_CODE" -lt 200 ] || [ "$LIST_CODE" -ge 300 ]; then
+          echo "::warning::Cipherwake PR comment list failed with HTTP $LIST_CODE. Check workflow permissions: pull-requests: write."
+          head -c 500 "$LIST_BODY"; echo ""
+          exit 0
+        fi
+        EXISTING_ID=$(jq -r --arg m "$MARKER" '[.[] | select(.body | contains($m))] | .[0].id // empty' < "$LIST_BODY")
+
+        # R40 fix (Q1.2): defense-in-depth — strip raw HTML tags and image
+        # markdown from the comment body before posting. GitHub sanitizes
+        # rendered output, but a compromised server template could try to
+        # plant beaconing img tags or rendered links.
+        #
+        # The hidden marker `<!-- cipherwake-... -->` lives on line 1 by
+        # construction (see Trust Diff step). We preserve line 1 verbatim
+        # so the dedup token survives, then strip HTML/image syntax from
+        # the body content (line 2+).
+        SUMMARY_HEAD=$(printf '%s' "$SUMMARY" | head -n 1)
+        SUMMARY_REST=$(printf '%s' "$SUMMARY" | tail -n +2 \
+          | sed -E 's/!\[[^]]*\]\([^)]*\)//g' \
+          | sed -E 's/<[^>]+>//g')
+        SAFE_SUMMARY="${SUMMARY_HEAD}"$'\n'"${SUMMARY_REST}"
+        BODY=$(jq -n --arg b "$SAFE_SUMMARY" '{body: $b}')
+        WRITE_BODY=$(mktemp)
+
+        if [ -n "$EXISTING_ID" ] && [ "$EXISTING_ID" != "null" ]; then
+          HTTP_CODE=$(curl -sS -w "%{http_code}" -o "$WRITE_BODY" \
+            -X PATCH \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/issues/comments/$EXISTING_ID" \
+            -d "$BODY")
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "Updated existing Cipherwake Trust Diff PR comment ($EXISTING_ID)."
+          else
+            echo "::warning::Cipherwake PR comment PATCH failed with HTTP $HTTP_CODE on comment $EXISTING_ID."
+            head -c 500 "$WRITE_BODY"; echo ""
+          fi
+        else
+          HTTP_CODE=$(curl -sS -w "%{http_code}" -o "$WRITE_BODY" \
+            -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
+            -d "$BODY")
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "Posted new Cipherwake Trust Diff PR comment on PR #$PR_NUMBER."
+          else
+            echo "::warning::Cipherwake PR comment POST failed with HTTP $HTTP_CODE. Check workflow permissions: pull-requests: write."
+            head -c 500 "$WRITE_BODY"; echo ""
+          fi
+        fi
+
     - id: scan
+      if: inputs.mode != 'trust-diff'
       shell: bash
       env:
         INPUT_DOMAIN: ${{ inputs.domain }}
@@ -248,7 +481,7 @@ runs:
         fi
 
     - name: Generate SARIF report
-      if: inputs.generate-sarif == 'true'
+      if: inputs.mode != 'trust-diff' && inputs.generate-sarif == 'true'
       shell: bash
       env:
         INPUT_DOMAIN: ${{ inputs.domain }}
@@ -267,7 +500,7 @@ runs:
         echo "  with sarif_file: $SARIF_PATH"
 
     - name: Generate cipherwake.lock
-      if: inputs.generate-lockfile == 'true'
+      if: inputs.mode != 'trust-diff' && inputs.generate-lockfile == 'true'
       shell: bash
       env:
         INPUT_DOMAIN: ${{ inputs.domain }}
@@ -286,7 +519,7 @@ runs:
         echo "Use github/upload-artifact@v4 to retain across runs, or commit them to track posture changes in PR diffs."
 
     - name: Supply-chain change detection
-      if: inputs.supply-chain-baseline != ''
+      if: inputs.mode != 'trust-diff' && inputs.supply-chain-baseline != ''
       shell: bash
       env:
         INPUT_DOMAIN: ${{ inputs.domain }}

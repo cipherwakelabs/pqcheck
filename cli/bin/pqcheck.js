@@ -7,7 +7,7 @@
 // =============================================================================
 
 const API_BASE = process.env.PQCHECK_API_BASE || "https://cipherwake.io";
-const VERSION = "0.10.0";
+const VERSION = "0.12.0";
 
 // API-key support — paid tiers (Starter $29 / Growth $79 / Scale $199) get
 // per-account monthly quotas instead of the per-IP rate limit. Set via:
@@ -88,6 +88,12 @@ async function main() {
   if (args[0] === "diff") {
     return runDiffCommand(args.slice(1));
   }
+  if (args[0] === "trust-diff") {
+    // CLI v0.11.0 (locked 2026-05-16): new subcommand that calls /api/trust-diff
+    // and outputs verdict in selected format. Designed for CI use via the
+    // cipherwakelabs/pqcheck Action mode: trust-diff.
+    return runTrustDiffCommand(args.slice(1));
+  }
   if (args[0] === "history") {
     return runHistoryCommand(args.slice(1));
   }
@@ -99,6 +105,21 @@ async function main() {
   }
   if (args[0] === "watch") {
     return runWatchCommand(args.slice(1));
+  }
+  if (args[0] === "release-checklist") {
+    return runReleaseChecklistCommand(args.slice(1));
+  }
+  if (args[0] === "init") {
+    return runInitCommand(args.slice(1));
+  }
+  if (args[0] === "deploy-check") {
+    return runDeployCheckCommand(args.slice(1));
+  }
+  if (args[0] === "vendors") {
+    return runVendorsCommand(args.slice(1));
+  }
+  if (args[0] === "onboard") {
+    return runOnboardCommand(args.slice(1));
   }
 
   // Multi-domain support: positional args are domains.
@@ -653,6 +674,13 @@ ${color("bold", "Commands:")}
   npx pqcheck changes <domain>                  Summarize public attack-surface changes in last 14 days
   npx pqcheck cert <file.pem>                   Analyze a local PEM/CRT cert file (offline, no network)
   npx pqcheck watch <domain>                    Add a domain to your watched-domain list (requires CIPHERWAKE_API_KEY)
+  npx pqcheck onboard <domain>                  One-command setup wizard (scan + init + vendors + checklist + open browser)
+  npx pqcheck init                              Interactive scaffold for .github/workflows/cipherwake.yml
+  npx pqcheck deploy-check <domain>             Pre-deploy trust gate (Trust Diff vs last scan; deploy-friendly framing)
+  npx pqcheck release-checklist [domain]        Print a pre-release trust checklist (markdown, offline)
+  npx pqcheck vendors export <domain>           Write cipherwake.vendors.json from observed third-party scripts
+  npx pqcheck vendors check <domain>            Compare current scan to lockfile; exit 4 on new origins (Free CI gate)
+  npx pqcheck vendors sync <domain>             Pull approved-vendor list from your account (Starter+)
 
 ${color("bold", "Multi-domain:")}
   npx pqcheck a.com b.com c.com                 Multi-domain scan (positional)
@@ -701,6 +729,7 @@ ${color("bold", "Exit codes:")}
 ${color("bold", "Examples:")}
   npx pqcheck chase.com
   npx pqcheck mybank.com --threshold 7      ${color("dim", "# fail CI if score ≥ 7")}
+  npx pqcheck mybank.com --watch 600        ${color("dim", "# poll locally every 10 min, log on change (no API key required)")}
   npx pqcheck deps stripe.com --lock
   npx pqcheck deps acme.com --allowlist allowed-vendors.txt   ${color("dim", "# CI vendor-risk gate")}
   npx pqcheck deps acme.com --baseline .pqcheck-baseline.json --write-baseline   ${color("dim", "# capture initial state")}
@@ -1971,6 +2000,175 @@ async function runChangesCommand(args) {
 // `pqcheck diff` — diff two QXM lockfiles
 // =============================================================================
 
+/**
+ * `pqcheck trust-diff <domain>` — compare current public trust posture vs a
+ * baseline via /api/trust-diff. Phase 2 launch feature (CLI v0.11.0).
+ *
+ * Inputs:
+ *   --baseline    last-week | last-month | last-scan | <ISO date>  (default: last-week)
+ *   --fail-on     any | low | medium | high | critical              (default: high)
+ *   --format      pretty | json | sarif | github                    (default: pretty)
+ *
+ * Exit codes:
+ *   0 = pass     — no deltas at or above fail-on severity
+ *   1 = warn     — deltas observed but below fail-on threshold
+ *   2 = fail     — deltas observed at or above fail-on threshold
+ *   3 = error    — auth/quota/network failure
+ *
+ * Requires CIPHERWAKE_API_KEY env var (Free tier: 30 calls/mo at /account#api-keys).
+ */
+async function runTrustDiffCommand(args) {
+  const positional = args.filter((a) => !a.startsWith("-") && !isFlagValue(args, a));
+  if (positional.length === 0) {
+    console.error(color("red", "error: pqcheck trust-diff requires a domain"));
+    console.error(color("dim", "Usage: npx pqcheck trust-diff <domain> [--baseline last-week] [--fail-on high] [--format pretty|json|sarif|github]"));
+    process.exit(3);
+  }
+  const domain = normalizeDomain(positional[0]);
+  if (!domain) {
+    console.error(color("red", `error: invalid domain "${positional[0]}"`));
+    process.exit(3);
+  }
+  if (!QP_API_KEY) {
+    console.error(color("red", "error: pqcheck trust-diff requires CIPHERWAKE_API_KEY"));
+    console.error(color("dim", "Generate a free key (30 calls/mo) at https://cipherwake.io/account#api-keys"));
+    console.error(color("dim", "Then: export CIPHERWAKE_API_KEY=qpk_<32-hex>"));
+    process.exit(3);
+  }
+
+  const baseline = parseFlag(args, "--baseline") || "last-week";
+  const failOn = parseFlag(args, "--fail-on") || "high";
+  const format = parseFlag(args, "--format") || "pretty";
+
+  let resp;
+  try {
+    resp = await fetch(`${API_BASE}/api/trust-diff`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${QP_API_KEY}`,
+        "User-Agent": `pqcheck-cli/${VERSION}`,
+      },
+      body: JSON.stringify({ domain, baseline, fail_on: failOn }),
+    });
+  } catch (err) {
+    console.error(color("red", `error: network failure calling /api/trust-diff: ${err.message}`));
+    process.exit(3);
+  }
+
+  if (resp.status === 401 || resp.status === 403) {
+    await handleAuthError(resp);
+    process.exit(3);
+  }
+  if (resp.status === 429) {
+    const body = await safeJSON(resp);
+    console.error(color("red", "error: Trust Diff API quota exceeded for this month"));
+    if (body?.message) console.error(color("dim", body.message));
+    process.exit(3);
+  }
+  if (!resp.ok) {
+    const body = await safeJSON(resp);
+    console.error(color("red", `error: /api/trust-diff returned ${resp.status}`));
+    if (body?.message) console.error(color("dim", body.message));
+    process.exit(3);
+  }
+
+  const result = await resp.json();
+  const verdict = result.verdict || "pass";
+  const deltas = Array.isArray(result.deltas) ? result.deltas : [];
+
+  // Format output
+  if (format === "json") {
+    console.log(JSON.stringify(result, null, 2));
+  } else if (format === "sarif") {
+    console.log(JSON.stringify(trustDiffToSarif(result), null, 2));
+  } else if (format === "github") {
+    // GitHub Actions workflow command output
+    for (const d of deltas) {
+      const sev = d.severity === "critical" || d.severity === "high" ? "error" : d.severity === "medium" ? "warning" : "notice";
+      const msg = `${d.title || d.type}: ${d.what_changed || ""}`.replace(/\n/g, "%0A").replace(/\r/g, "");
+      console.log(`::${sev}::${msg}`);
+    }
+    console.log(`\nTrust Diff verdict: ${verdict.toUpperCase()} — ${deltas.length} delta${deltas.length === 1 ? "" : "s"} observed.`);
+    console.log(`Quota: ${result.quota?.used_this_month || 0}/${result.quota?.monthly_limit || 0} used.`);
+  } else {
+    // pretty (default)
+    console.log("");
+    console.log(`  ${color("bold", "Cipherwake Trust Diff")}`);
+    console.log(`  ${color("dim", `${domain} · baseline=${baseline} · fail-on=${failOn}`)}`);
+    console.log("");
+    if (deltas.length === 0) {
+      console.log(`  ${color("green", "✓ No deltas observed")}`);
+    } else {
+      const colorByLevel = (sev) => sev === "critical" ? "red" : sev === "high" ? "red" : sev === "medium" ? "yellow" : "dim";
+      for (const d of deltas) {
+        const sevTag = d.severity ? `[${d.severity.toUpperCase()}]` : "";
+        console.log(`  ${color(colorByLevel(d.severity), sevTag)} ${d.title || d.type}`);
+        if (d.what_changed) console.log(`    ${color("dim", d.what_changed)}`);
+      }
+    }
+    console.log("");
+    const verdictColor = verdict === "fail" ? "red" : verdict === "warn" ? "yellow" : "green";
+    console.log(`  Verdict: ${color(verdictColor, verdict.toUpperCase())}`);
+    console.log(`  Quota: ${result.quota?.used_this_month || 0}/${result.quota?.monthly_limit || 0} used this month`);
+    if (result.upgrade_hint) {
+      console.log("");
+      console.log(`  ${color("dim", "💡 " + result.upgrade_hint)}`);
+    }
+  }
+
+  // Exit code based on verdict
+  if (verdict === "fail") process.exit(2);
+  if (verdict === "warn") process.exit(1);
+  process.exit(0);
+}
+
+/**
+ * Convert /api/trust-diff response to SARIF 2.1.0 for upload via
+ * github/codeql-action/upload-sarif@v3. Each delta becomes a result with
+ * level = error|warning|note based on severity.
+ */
+function trustDiffToSarif(result) {
+  const deltas = Array.isArray(result.deltas) ? result.deltas : [];
+  const rules = [...new Set(deltas.map((d) => d.type))].map((type) => ({
+    id: type,
+    name: type,
+    shortDescription: { text: type.replace(/_/g, " ").toLowerCase() },
+    helpUri: `https://cipherwake.io/methodology/change-briefs#${type.toLowerCase()}`,
+  }));
+  const results = deltas.map((d) => ({
+    ruleId: d.type,
+    level: d.severity === "critical" || d.severity === "high" ? "error" : d.severity === "medium" ? "warning" : "note",
+    message: { text: `${d.title || d.type}: ${d.what_changed || ""}` },
+    locations: [{
+      physicalLocation: {
+        artifactLocation: { uri: `cipherwake://${result.domain || "domain"}` },
+      },
+    }],
+  }));
+  return {
+    $schema: "https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0-rtm.5.json",
+    version: "2.1.0",
+    runs: [{
+      tool: {
+        driver: {
+          name: "Cipherwake Trust Diff",
+          version: VERSION,
+          informationUri: "https://cipherwake.io",
+          rules,
+        },
+      },
+      results,
+    }],
+  };
+}
+
+function parseFlag(args, name) {
+  const idx = args.indexOf(name);
+  if (idx === -1 || idx === args.length - 1) return null;
+  return args[idx + 1];
+}
+
 async function runDiffCommand(args) {
   const fs = await import("node:fs/promises");
   const json = args.includes("--json");
@@ -2098,6 +2296,10 @@ async function runWatchCommand(args) {
     console.error(color("dim", `       ${API_BASE}/signin`));
     console.error(color("dim", `       ${API_BASE}/account  (rotate key)`));
     console.error(color("dim", `       export CIPHERWAKE_API_KEY=qpk_...`));
+    console.error("");
+    console.error(color("dim", `Just want to poll locally without an account? Use --watch instead:`));
+    console.error(color("dim", `  npx pqcheck ${looksLikeDomain ? rawDomain : "<your-domain>"} --watch 600`));
+    console.error(color("dim", `  (No API key required. Polls every N seconds, logs on score change.)`));
     process.exit(1);
   }
 
@@ -2258,6 +2460,940 @@ async function runCertCommand(args) {
   console.log("");
   console.log(`  ${color("yellow", "Quantum exposure:")} ${quantumNote}`);
   console.log("");
+}
+
+// =============================================================================
+// `pqcheck release-checklist [domain]` — pre-release trust checklist generator
+// =============================================================================
+// Outputs a markdown checklist for teams to paste into release notes or run
+// as a pre-deploy gate. Pure offline (no API call). Domain is optional —
+// when present, the checklist is interpolated; when absent, a `<your-domain>`
+// placeholder is left for the user to fill.
+//
+// Habit-loop feature locked 2026-05-16: turns Cipherwake into part of the
+// release ritual without heavy integrations. See [[cipherwake-launch-plan-2026-05]].
+// Free tier — no API quota consumed.
+// =============================================================================
+
+async function runReleaseChecklistCommand(args) {
+  const positional = args.filter((a) => !a.startsWith("-"));
+  const raw = positional[0];
+  let target = "<your-domain>";
+  if (raw) {
+    const normalized = normalizeDomain(raw);
+    if (!isValidDomain(normalized)) {
+      console.error(color("red", `error: '${raw}' is not a valid domain`));
+      process.exit(1);
+    }
+    target = normalized;
+  }
+  const out = renderReleaseChecklist(target, { generator: "release-checklist" });
+  console.log(out);
+  process.exit(0);
+}
+
+// R41 fix #3 (locked 2026-05-16): shared release-checklist helper used by
+// both `pqcheck release-checklist` (prints to stdout) and `pqcheck onboard`
+// (writes to CIPHERWAKE_CHECKLIST.md). Single source of truth for the 9
+// checklist items + verification commands + "where to look" links.
+//
+// generator: "release-checklist" or "onboard" — controls the intro paragraph
+// so the file written by `onboard` says "Generated by `pqcheck onboard`"
+// while the standalone `release-checklist` command emits the user-facing
+// "Run these in CI or paste..." intro. All other content is identical.
+function renderReleaseChecklist(domain, opts = {}) {
+  const generator = opts.generator === "onboard" ? "onboard" : "release-checklist";
+  const intro = generator === "onboard"
+    ? `Generated by \`pqcheck onboard\` — re-run \`pqcheck release-checklist ${domain}\` anytime.`
+    : `Run these in CI or paste into your release-notes template. Each item maps to a Cipherwake check; recommended commands are below. Free tier covers all of these on 1 monitored domain.`;
+  return [
+    `## Pre-release trust checklist for ${domain}`,
+    ``,
+    intro,
+    ``,
+    `- [ ] Trust Diff passes vs last successful deploy`,
+    `- [ ] No new unapproved vendor scripts observed since last release`,
+    `- [ ] HSTS still present and unchanged`,
+    `- [ ] CSP still present and unchanged`,
+    `- [ ] DMARC policy unchanged`,
+    `- [ ] Certificate issuer expected (no surprise CA rotation)`,
+    `- [ ] SPKI / key rotation matches your deploy pipeline`,
+    `- [ ] HNDL Decryption Blast Radius score within target range`,
+    `- [ ] Cipherwake monitoring still active (last scan within 24h)`,
+    ``,
+    `### How to verify`,
+    ``,
+    `\`\`\`bash`,
+    `# Trust posture vs last successful deploy (Free: 30 calls/mo)`,
+    `npx pqcheck trust-diff ${domain} --baseline last-week --fail-on high`,
+    ``,
+    `# Third-party origins on the page (vendor scripts)`,
+    `npx pqcheck vendors check ${domain}`,
+    ``,
+    `# Live grade + score components`,
+    `npx pqcheck ${domain}`,
+    `\`\`\``,
+    ``,
+    `### Where to look`,
+    ``,
+    `- Full dashboard: https://cipherwake.io/r/${encodeURIComponent(domain)}`,
+    `- Methodology + what each check means: https://cipherwake.io/methodology/`,
+    `- 30-day Trust Timeline + Change Briefs: https://cipherwake.io/account`,
+    ``,
+  ].join("\n");
+}
+
+// =============================================================================
+// `pqcheck init` — interactive workflow scaffold (habit-loop #4, locked 2026-05-16)
+// =============================================================================
+// Writes a ready-to-commit .github/workflows/cipherwake.yml that calls
+// cipherwakelabs/pqcheck@v3 in trust-diff mode. Zero copy-paste docs friction.
+//
+// Flags:
+//   --domain <d>       Skip the domain prompt
+//   --fail-on <level>  Skip the severity prompt (any|low|medium|high|critical)
+//   --baseline <ref>   Skip the baseline prompt (last-week|last-month|last-scan|<ISO>)
+//   --yes / -y         Use defaults for everything not explicitly passed
+//   --force            Overwrite an existing workflow file without prompting
+//   --stdout           Print the workflow to stdout instead of writing files
+//
+// Free tier: no API call made by init itself. The generated workflow runs
+// against the user's CIPHERWAKE_API_KEY secret (30 free Trust Diff calls/mo).
+// =============================================================================
+
+const VALID_FAIL_ON = ["any", "low", "medium", "high", "critical"];
+const VALID_BASELINES = ["last-week", "last-month", "last-scan"];
+
+async function runInitCommand(args) {
+  const fs = await import("node:fs/promises");
+  const path = await import("node:path");
+  const useDefaults = args.includes("--yes") || args.includes("-y");
+  const stdout = args.includes("--stdout");
+  const force = args.includes("--force");
+
+  const flagDomain = readFlagValue(args, "--domain");
+  const flagFailOn = readFlagValue(args, "--fail-on");
+  const flagBaseline = readFlagValue(args, "--baseline");
+
+  console.log("");
+  console.log(`  ${color("bold", "pqcheck init")} ${color("dim", "— scaffold a Cipherwake GitHub Action workflow")}`);
+  console.log("");
+
+  let domain = flagDomain ? normalizeDomain(flagDomain) : null;
+  if (!domain) {
+    if (useDefaults) {
+      console.error(color("red", "error: --yes requires --domain (no interactive prompt to fill from)"));
+      process.exit(1);
+    }
+    const answer = await prompt(`  Domain to monitor (e.g. cipherwake.io): `);
+    domain = normalizeDomain((answer || "").trim());
+  }
+  if (!isValidDomain(domain)) {
+    console.error(color("red", `  error: '${domain}' is not a valid hostname`));
+    process.exit(1);
+  }
+
+  let failOn = flagFailOn || "high";
+  if (!flagFailOn && !useDefaults) {
+    const answer = await prompt(`  Fail CI on severity ${color("dim", "[any|low|medium|high(default)|critical]")}: `);
+    if (answer && answer.trim()) failOn = answer.trim().toLowerCase();
+  }
+  if (!VALID_FAIL_ON.includes(failOn)) {
+    console.error(color("red", `  error: --fail-on must be one of ${VALID_FAIL_ON.join("|")}`));
+    process.exit(1);
+  }
+
+  let baseline = flagBaseline || "last-week";
+  if (!flagBaseline && !useDefaults) {
+    const answer = await prompt(`  Baseline ${color("dim", "[last-week(default)|last-month|last-scan|<ISO date>]")}: `);
+    if (answer && answer.trim()) baseline = answer.trim();
+  }
+  if (!isValidBaseline(baseline)) {
+    console.error(color("red", `  error: --baseline must be last-week|last-month|last-scan or an ISO date (YYYY-MM-DD)`));
+    process.exit(1);
+  }
+
+  const workflow = renderTrustDiffWorkflow({ domain, failOn, baseline });
+
+  if (stdout) {
+    console.log(workflow);
+    process.exit(0);
+  }
+
+  // Resolve target path: ./.github/workflows/cipherwake.yml in cwd
+  const cwd = process.cwd();
+  const workflowDir = path.join(cwd, ".github", "workflows");
+  const workflowPath = path.join(workflowDir, "cipherwake.yml");
+
+  try {
+    await fs.mkdir(workflowDir, { recursive: true });
+  } catch (err) {
+    console.error(color("red", `  error creating ${workflowDir}: ${err.message}`));
+    process.exit(1);
+  }
+
+  // Check existing file
+  let exists = false;
+  try {
+    await fs.access(workflowPath);
+    exists = true;
+  } catch { /* doesn't exist */ }
+
+  if (exists && !force) {
+    if (useDefaults) {
+      console.error(color("red", `  error: ${workflowPath} already exists (re-run with --force to overwrite)`));
+      process.exit(1);
+    }
+    const answer = await prompt(`  ${color("yellow", workflowPath + " already exists — overwrite?")} ${color("dim", "[y/N]")}: `);
+    if (!/^y(es)?$/i.test((answer || "").trim())) {
+      console.error(color("dim", "  cancelled — workflow not written"));
+      process.exit(1);
+    }
+  }
+
+  try {
+    await fs.writeFile(workflowPath, workflow, "utf8");
+  } catch (err) {
+    console.error(color("red", `  error writing ${workflowPath}: ${err.message}`));
+    process.exit(1);
+  }
+
+  const relPath = path.relative(cwd, workflowPath);
+  console.log("");
+  console.log(color("green", `  ✓ Wrote ${relPath}`));
+  console.log("");
+  console.log(`  ${color("bold", "Next steps:")}`);
+  console.log("");
+  console.log(`  ${color("dim", "1.")} Generate a Cipherwake API key at ${color("violet", "https://cipherwake.io/account#api-keys")}`);
+  console.log(`     ${color("dim", "Free tier: 30 Trust Diff calls/month")}`);
+  console.log("");
+  console.log(`  ${color("dim", "2.")} Add it as a repo secret:`);
+  console.log(`     ${color("dim", "Settings → Secrets and variables → Actions → New repository secret")}`);
+  console.log(`     ${color("dim", "Name: CIPHERWAKE_API_KEY")}`);
+  console.log("");
+  console.log(`  ${color("dim", "3.")} Commit + push:`);
+  console.log(`     ${color("dim", "$")} git add ${relPath}`);
+  console.log(`     ${color("dim", "$")} git commit -m "ci: add Cipherwake Trust Diff gate"`);
+  console.log(`     ${color("dim", "$")} git push`);
+  console.log("");
+  console.log(`  Open a PR to see the gate run.`);
+  console.log("");
+  process.exit(0);
+}
+
+function readFlagValue(args, name) {
+  const idx = args.indexOf(name);
+  if (idx === -1) return null;
+  const v = args[idx + 1];
+  return v && !v.startsWith("-") ? v : null;
+}
+
+function isValidBaseline(value) {
+  if (VALID_BASELINES.includes(value)) return true;
+  // ISO date YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ
+  return /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?(\.\d+)?Z?)?$/.test(value);
+}
+
+function renderTrustDiffWorkflow({ domain, failOn, baseline }) {
+  return `# Cipherwake — Trust Diff gate
+# Generated by \`pqcheck init\` (v${VERSION}).
+# Runs on every PR and pushes to main: fails the build if your public trust
+# posture regresses vs the baseline (cert / SPKI / vendor scripts / HSTS / CSP /
+# DMARC / HNDL).
+#
+# Free tier: 30 Trust Diff calls/month per CIPHERWAKE_API_KEY.
+# Methodology: https://cipherwake.io/methodology/
+# Action source: https://github.com/cipherwakelabs/pqcheck
+
+name: Cipherwake Trust Diff
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write   # required for SARIF upload to Code Scanning
+  pull-requests: write     # required for sticky PR comment (Action v3.1+)
+
+jobs:
+  trust-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run Cipherwake Trust Diff
+        uses: cipherwakelabs/pqcheck@v3
+        with:
+          mode: trust-diff
+          domain: ${domain}
+          baseline: ${baseline}
+          fail-on: ${failOn}
+        env:
+          CIPHERWAKE_API_KEY: \${{ secrets.CIPHERWAKE_API_KEY }}
+`;
+}
+
+// Tiny readline wrapper. We avoid pulling a CLI prompt library — this is the
+// only interactive path in pqcheck and Node's built-in readline is enough.
+async function prompt(question) {
+  const readline = await import("node:readline/promises");
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await rl.question(question);
+    return answer;
+  } finally {
+    rl.close();
+  }
+}
+
+// =============================================================================
+// `pqcheck deploy-check <domain>` — pre-deploy trust gate (habit-loop #5)
+// =============================================================================
+// Thin alias for `pqcheck trust-diff` with deploy-friendly framing:
+//   - Default baseline: last-scan (compares vs your most recent scan, which
+//     usually correlates with the previous deploy)
+//   - Default fail-on: high
+//   - Cleaner output for shell-script use in deploy pipelines (Vercel
+//     pre-build, Netlify build commands, custom CD scripts)
+//
+// Exit codes match trust-diff: 0 pass · 1 warn · 2 fail · 3 error.
+// Consumes the same Free 30 Trust Diff calls/month quota.
+// =============================================================================
+
+async function runDeployCheckCommand(args) {
+  const positional = args.filter((a) => !a.startsWith("-"));
+  if (positional.length === 0) {
+    console.error(color("red", "error: pqcheck deploy-check requires a domain"));
+    console.error(color("dim", "Usage: npx pqcheck deploy-check <domain> [--baseline last-scan|last-week|<ISO>] [--fail-on high|medium|low|any]"));
+    process.exit(1);
+  }
+
+  // Forward to trust-diff with deploy-tuned defaults if the user didn't specify.
+  const forwarded = [...args];
+  if (!args.includes("--baseline")) forwarded.push("--baseline", "last-scan");
+  if (!args.includes("--fail-on")) forwarded.push("--fail-on", "high");
+
+  // Pre-print a deploy-context header (only in text mode — JSON/SARIF users
+  // are scripting and don't want our preamble polluting their pipe).
+  const format = parseFormat(forwarded);
+  if (format === "text") {
+    console.log("");
+    console.log(`  ${color("bold", "🚀 Deploy gate")} ${color("dim", "— checking public trust posture vs last scan")}`);
+    console.log("");
+  }
+
+  return runTrustDiffCommand(forwarded);
+}
+
+// =============================================================================
+// `pqcheck vendors <subcommand>` — vendor lockfile management (habit-loop #10)
+// =============================================================================
+// Free tier (Option A, locked 2026-05-16):
+//   pqcheck vendors export <domain>   — write cipherwake.vendors.json from
+//                                       the current observed vendor scripts
+//                                       (read-only snapshot, no CI enforce)
+//   pqcheck vendors check <domain>    — compare current scan to the lockfile,
+//                                       exit 4 if new origins appeared
+//                                       (free CI gate via the deps endpoint)
+//
+// Starter+ tier:
+//   pqcheck vendors sync <domain>     — pull approved-vendor list from
+//                                       /api/vendor-allowlist and merge into
+//                                       the lockfile (bidirectional)
+//
+// The lockfile is a developer artifact: commit it to the repo to track
+// vendor-surface drift in PR diffs. Like package-lock.json for third-party
+// scripts.
+//
+// Per [[quantapact-pricing-discipline]]: Free generates the lockfile and uses
+// it in CI; Starter+ adds the dashboard-sync layer + approved-vendor
+// enforcement. The dashboard CRUD UI is the Starter wall, not the lockfile.
+// =============================================================================
+
+const VENDOR_LOCKFILE_NAME = "cipherwake.vendors.json";
+
+async function runVendorsCommand(args) {
+  const sub = args[0];
+  if (!sub || sub === "--help" || sub === "-h") {
+    console.log(`
+${color("bold", "pqcheck vendors")} ${color("dim", `v${VERSION}`)}
+
+Vendor lockfile management — track third-party scripts on your domain.
+
+${color("bold", "Subcommands:")}
+  pqcheck vendors export <domain>   Write ${VENDOR_LOCKFILE_NAME} from current observed vendors (Free)
+  pqcheck vendors check <domain>    Compare current scan to the lockfile; exit 4 on new origins (Free CI gate)
+  pqcheck vendors sync <domain>     Pull approved-vendor list from your account (Starter+, requires CIPHERWAKE_API_KEY)
+
+${color("bold", "Flags:")}
+  -o <path>                  Output / input path (default: ./${VENDOR_LOCKFILE_NAME})
+
+${color("bold", "Examples:")}
+  npx pqcheck vendors export cipherwake.io                       ${color("dim", "# capture initial state")}
+  npx pqcheck vendors check cipherwake.io                        ${color("dim", "# CI gate — fails on new origins")}
+  CIPHERWAKE_API_KEY=qpk_... npx pqcheck vendors sync cipherwake.io   ${color("dim", "# Starter+ dashboard sync")}
+
+Methodology: ${color("violet", "https://cipherwake.io/methodology/vendor-lockfile")}
+`);
+    process.exit(0);
+  }
+
+  const rest = args.slice(1);
+  const positional = rest.filter((a) => !a.startsWith("-"));
+  const raw = positional[0];
+  if (!raw) {
+    console.error(color("red", `error: pqcheck vendors ${sub} requires a domain`));
+    process.exit(1);
+  }
+  const domain = normalizeDomain(raw);
+  if (!isValidDomain(domain)) {
+    console.error(color("red", `error: '${raw}' is not a valid domain`));
+    process.exit(1);
+  }
+
+  const outIdx = rest.indexOf("-o");
+  const outPath = (outIdx >= 0 && rest[outIdx + 1] && !rest[outIdx + 1].startsWith("-"))
+    ? rest[outIdx + 1]
+    : VENDOR_LOCKFILE_NAME;
+
+  if (sub === "export") {
+    return runVendorsExport(domain, outPath);
+  }
+  if (sub === "check") {
+    return runVendorsCheck(domain, outPath);
+  }
+  if (sub === "sync") {
+    return runVendorsSync(domain, outPath);
+  }
+  console.error(color("red", `error: unknown subcommand 'vendors ${sub}'. Try: export | check | sync`));
+  process.exit(1);
+}
+
+async function fetchVendorOrigins(domain) {
+  // Calls /api/deps which returns the observed third-party origin list for
+  // a domain. Same endpoint that powers `pqcheck deps <domain>`.
+  //
+  // R40 fix (Q2.6): add a 15-second timeout via AbortController. Previously
+  // a hung /api/deps would block the CLI indefinitely — CI runs would
+  // consume their full 6-hour budget waiting for a response that never
+  // comes. 15s is generous enough for the slow tail but bounds the worst
+  // case.
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 15_000);
+  let resp;
+  try {
+    resp = await fetch(`${API_BASE}/api/deps?domain=${encodeURIComponent(domain)}`, {
+      method: "GET",
+      headers: apiHeaders({ "user-agent": `pqcheck-cli/${VERSION} (vendors)` }),
+      signal: ac.signal,
+    });
+  } catch (err) {
+    if (err?.name === "AbortError") throw new Error("/api/deps timed out after 15s");
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!resp.ok) {
+    const body = await safeJSON(resp);
+    throw new Error(`/api/deps returned ${resp.status} ${body?.error || resp.statusText}`);
+  }
+  const data = await resp.json();
+  const thirds = Array.isArray(data.thirdParties) ? data.thirdParties : [];
+  // R40 fix (Q2.7): preserve the observed protocol. Previously we
+  // force-converted http://vendor.com into https://vendor.com which
+  // mis-represented what we actually observed. Now: keep http:// when
+  // the API gives an explicit http:// origin; default to https:// only
+  // when the host comes without a protocol prefix.
+  const origins = new Set();
+  for (const t of thirds) {
+    const host = typeof t === "string" ? t : (t.host ?? t.origin ?? "");
+    if (!host) continue;
+    const o = normalizeObservedOrigin(host);
+    if (o) origins.add(o);
+  }
+  return Array.from(origins).sort();
+}
+
+// R40 fix (Q2.7): preserve observed protocol. URL parser handles host
+// validation + canonicalization (lowercase, default-port stripping).
+function normalizeObservedOrigin(value) {
+  const s = String(value).trim().toLowerCase();
+  if (!s) return null;
+  try {
+    const u = s.startsWith("http://") || s.startsWith("https://")
+      ? new URL(s)
+      : new URL("https://" + s);
+    return u.origin;
+  } catch {
+    return null;
+  }
+}
+
+function buildVendorLockfile(domain, origins) {
+  return {
+    schema_version: 1,
+    generator: `pqcheck-cli/${VERSION}`,
+    domain,
+    generated_at: new Date().toISOString(),
+    approved_script_origins: origins,
+    // Soft tier marker — read by sync to know if the lockfile carries
+    // dashboard-managed entries. Free-only lockfiles set this to null.
+    synced_from_account: null,
+  };
+}
+
+async function runVendorsExport(domain, outPath) {
+  const fs = await import("node:fs/promises");
+  console.log("");
+  console.log(`  ${color("bold", "Exporting vendor lockfile")} ${color("dim", `— ${domain}`)}`);
+  console.log("");
+  let origins;
+  try {
+    origins = await fetchVendorOrigins(domain);
+  } catch (err) {
+    console.error(color("red", `  error fetching vendor origins: ${err.message}`));
+    process.exit(1);
+  }
+  const lockfile = buildVendorLockfile(domain, origins);
+  try {
+    await fs.writeFile(outPath, JSON.stringify(lockfile, null, 2) + "\n", "utf8");
+  } catch (err) {
+    console.error(color("red", `  error writing ${outPath}: ${err.message}`));
+    process.exit(1);
+  }
+  console.log(color("green", `  ✓ Wrote ${outPath} with ${origins.length} approved script origin${origins.length === 1 ? "" : "s"}.`));
+  console.log("");
+  console.log(`  ${color("dim", "Commit this file to your repo to track vendor-surface drift in PR diffs.")}`);
+  // R40 fix (Q2.12): nested template literal — the outer backticks are the
+  // template literal; the inner string passed to color() must ALSO be a
+  // template literal so ${domain} interpolates. Previously this printed
+  // the literal text "${domain}" because color()'s arg was a plain string.
+  console.log(`  ${color("dim", `Run \`pqcheck vendors check ${domain}\` in CI to fail PRs that introduce new origins.`)}`);
+  console.log("");
+  process.exit(0);
+}
+
+async function runVendorsCheck(domain, lockPath) {
+  const fs = await import("node:fs/promises");
+  let lockfile;
+  try {
+    const raw = await fs.readFile(lockPath, "utf8");
+    lockfile = JSON.parse(raw);
+  } catch (err) {
+    console.error(color("red", `  error reading ${lockPath}: ${err.message}`));
+    console.error(color("dim", `  Run: npx pqcheck vendors export ${domain}   to generate one.`));
+    process.exit(1);
+  }
+  if (lockfile.schema_version !== 1) {
+    console.error(color("red", `  error: ${lockPath} schema_version=${lockfile.schema_version}, expected 1`));
+    process.exit(1);
+  }
+  if (lockfile.domain && lockfile.domain !== domain) {
+    console.error(color("yellow", `  warning: lockfile is for ${lockfile.domain} but checking against ${domain}`));
+  }
+  const baseline = new Set(Array.isArray(lockfile.approved_script_origins) ? lockfile.approved_script_origins : []);
+  let observed;
+  try {
+    observed = new Set(await fetchVendorOrigins(domain));
+  } catch (err) {
+    console.error(color("red", `  error fetching current vendors: ${err.message}`));
+    process.exit(1);
+  }
+  const newOrigins = [...observed].filter((o) => !baseline.has(o));
+  const removed = [...baseline].filter((o) => !observed.has(o));
+
+  console.log("");
+  console.log(`  ${color("bold", "Vendor lockfile check")} ${color("dim", `— ${domain}`)}`);
+  console.log("");
+  if (newOrigins.length === 0 && removed.length === 0) {
+    console.log(color("green", `  ✓ Vendor surface matches lockfile (${baseline.size} origins).`));
+    console.log("");
+    process.exit(0);
+  }
+  if (newOrigins.length > 0) {
+    console.log(color("red", `  ⚠ ${newOrigins.length} new origin${newOrigins.length === 1 ? "" : "s"} observed (not in lockfile):`));
+    for (const o of newOrigins) console.log(`    + ${o}`);
+    console.log("");
+  }
+  if (removed.length > 0) {
+    console.log(color("dim", `  - ${removed.length} origin${removed.length === 1 ? "" : "s"} no longer observed:`));
+    for (const o of removed) console.log(`    - ${o}`);
+    console.log("");
+  }
+  if (newOrigins.length > 0) {
+    console.log(color("dim", `  To accept the additions, re-run: npx pqcheck vendors export ${domain}`));
+    console.log(color("dim", `  Then commit the updated ${lockPath} to your repo.`));
+    console.log("");
+    process.exit(4); // New origin(s) detected — same exit code as `deps --fail-on-new`
+  }
+  // Only removals (cleanup), no failure
+  process.exit(0);
+}
+
+async function runVendorsSync(domain, outPath) {
+  const fs = await import("node:fs/promises");
+  if (!QP_API_KEY) {
+    console.error(color("red", "  error: `vendors sync` requires CIPHERWAKE_API_KEY (Starter+ feature)"));
+    console.error("");
+    console.error(color("dim", "  Free tier: use `vendors export` to generate a read-only lockfile."));
+    console.error(color("dim", "  Sign up + manage approved vendors at: " + API_BASE + "/account"));
+    console.error(color("dim", "  Pricing: " + API_BASE + "/pricing"));
+    process.exit(1);
+  }
+  console.log("");
+  console.log(`  ${color("bold", "Syncing vendor lockfile with your account")} ${color("dim", `— ${domain}`)}`);
+  console.log("");
+  let resp;
+  try {
+    resp = await fetch(`${API_BASE}/api/vendor-allowlist?domain=${encodeURIComponent(domain)}`, {
+      method: "GET",
+      headers: {
+        "user-agent": `pqcheck-cli/${VERSION} (vendors-sync)`,
+        "authorization": "Bearer " + QP_API_KEY,
+      },
+    });
+  } catch (err) {
+    console.error(color("red", `  network error: ${err.message ?? err}`));
+    process.exit(1);
+  }
+  if (resp.status === 401 || resp.status === 403) {
+    const body = await safeJSON(resp);
+    console.error(color("red", `  authentication failed (HTTP ${resp.status})`));
+    if (body?.error === "starter_required") {
+      console.error(color("dim", `  Approved-vendor allowlist starts at Starter ($29/mo). ${body.message ?? ""}`));
+      console.error(color("dim", `  ${API_BASE}/pricing?utm_source=cli_vendors_sync`));
+    }
+    process.exit(1);
+  }
+  if (!resp.ok) {
+    console.error(color("red", `  /api/vendor-allowlist returned ${resp.status}`));
+    process.exit(1);
+  }
+  const data = await resp.json();
+  const allowlist = Array.isArray(data.allowlist) ? data.allowlist : [];
+  // Filter to entries for this domain + extract vendor_origin
+  const dashboardOrigins = new Set();
+  for (const item of allowlist) {
+    if (item && item.domain === domain && typeof item.vendor_origin === "string") {
+      dashboardOrigins.add(item.vendor_origin);
+    }
+  }
+
+  // Merge with currently observed (so the lockfile covers everything we see + everything the user approved)
+  let observed = new Set();
+  try {
+    observed = new Set(await fetchVendorOrigins(domain));
+  } catch (err) {
+    console.error(color("yellow", `  warning: could not fetch currently observed origins (${err.message}); using dashboard-only list`));
+  }
+
+  const merged = new Set([...observed, ...dashboardOrigins]);
+  const origins = Array.from(merged).sort();
+  const lockfile = buildVendorLockfile(domain, origins);
+  lockfile.synced_from_account = new Date().toISOString();
+
+  try {
+    await fs.writeFile(outPath, JSON.stringify(lockfile, null, 2) + "\n", "utf8");
+  } catch (err) {
+    console.error(color("red", `  error writing ${outPath}: ${err.message}`));
+    process.exit(1);
+  }
+  console.log(color("green", `  ✓ Synced ${outPath} — ${dashboardOrigins.size} dashboard-approved, ${observed.size} currently observed, ${origins.length} total.`));
+  console.log("");
+  console.log(`  ${color("dim", "Commit the updated lockfile to your repo. `pqcheck vendors check` in CI will fail PRs that")}`);
+  console.log(`  ${color("dim", "introduce origins outside the merged set.")}`);
+  console.log("");
+  process.exit(0);
+}
+
+// =============================================================================
+// `pqcheck onboard <domain>` — one-command setup wizard (locked 2026-05-16)
+// =============================================================================
+// Composes existing CLI subcommands into one happy-path flow:
+//   1. Quick public scan → show current grade so the user sees value first
+//   2. Scaffold the GitHub Action workflow (via runInitCommand)
+//   3. Generate a vendor lockfile snapshot (via runVendorsExport)
+//   4. Generate a release-checklist markdown
+//   5. Open the user's browser to /account#api-keys for API-key generation
+//   6. Print next-steps (secret name + commit commands + PR open)
+//
+// Design notes:
+//   - Pure composition of already-reviewed subcommands; no new server endpoints.
+//   - Browser-open uses platform default (`open`/`xdg-open`/`start`). When
+//     headless or sandboxed, the URL is still printed so the user can copy.
+//   - Each step is best-effort: a failed step prints a warning and continues
+//     so a partial setup is still useful. Hard errors only stop early steps
+//     where the rest can't proceed (invalid domain).
+//   - --skip-scan / --skip-vendors / --skip-checklist let power users opt out.
+//   - --no-open suppresses the browser launch (CI / SSH / headless friendly).
+// =============================================================================
+
+async function runOnboardCommand(args) {
+  const positional = args.filter((a) => !a.startsWith("-"));
+  const raw = positional[0];
+  if (!raw) {
+    console.error(color("red", "error: pqcheck onboard requires a domain"));
+    console.error(color("dim", "Usage: npx pqcheck onboard <domain> [--skip-scan] [--skip-vendors] [--skip-checklist] [--no-open] [--force] [--strict]"));
+    process.exit(1);
+  }
+  const domain = normalizeDomain(raw);
+  if (!isValidDomain(domain)) {
+    console.error(color("red", `error: '${raw}' is not a valid domain`));
+    process.exit(1);
+  }
+  const skipScan = args.includes("--skip-scan");
+  const skipVendors = args.includes("--skip-vendors");
+  const skipChecklist = args.includes("--skip-checklist");
+  const noOpen = args.includes("--no-open");
+  // R41 fix #1: --force lets users intentionally overwrite an existing
+  // setup (idempotent re-runs). Without it, we abort if any of the
+  // 3 output files already exists, so a user re-running onboard by
+  // mistake doesn't lose hand-edited CIPHERWAKE_CHECKLIST.md / vendors
+  // lockfile / workflow YAML.
+  const force = args.includes("--force");
+  // R41 fix #4: --strict makes onboard exit non-zero if any step fails.
+  // For human-driven first-time setup, exit 0 (best-effort) is the right
+  // default — printed warnings tell the user what to retry. For CI
+  // automation around the wizard itself, --strict lets a build fail on
+  // step errors. (Recommended usage in CI is still the individual
+  // subcommands, not onboard.)
+  const strict = args.includes("--strict");
+
+  // R41 fix #1: pre-flight overwrite check. We probe the 3 output paths
+  // BEFORE running any step so an aborted run doesn't half-modify the
+  // user's project. We use sync stat checks because we're not in a hot
+  // path and the readability win is worth the tiny perf cost.
+  if (!force) {
+    const fsSync = await import("node:fs");
+    const existing = [];
+    try { fsSync.statSync(".github/workflows/cipherwake.yml"); existing.push(".github/workflows/cipherwake.yml"); } catch {}
+    if (!skipVendors) {
+      try { fsSync.statSync("cipherwake.vendors.json"); existing.push("cipherwake.vendors.json"); } catch {}
+    }
+    if (!skipChecklist) {
+      try { fsSync.statSync("CIPHERWAKE_CHECKLIST.md"); existing.push("CIPHERWAKE_CHECKLIST.md"); } catch {}
+    }
+    if (existing.length > 0) {
+      console.error("");
+      console.error(color("red", `  error: refusing to overwrite existing files:`));
+      for (const f of existing) console.error(color("dim", `    ${f}`));
+      console.error("");
+      console.error(color("dim", `  Re-run with --force to overwrite, or delete the files manually.`));
+      console.error(color("dim", `  (--skip-vendors / --skip-checklist also bypass individual file checks.)`));
+      process.exit(1);
+    }
+  }
+
+  // R41 fix #4: track step failures for --strict mode
+  let anyStepFailed = false;
+
+  console.log("");
+  console.log(`  ${color("bold", "🚀 Cipherwake onboarding")} ${color("dim", `— ${domain}`)}`);
+  console.log("");
+  console.log(`  ${color("dim", "This will write ~3 files to your project and open your browser to grab an API key.")}`);
+  console.log(`  ${color("dim", "All steps are best-effort; you can re-run any individual subcommand later.")}`);
+  console.log("");
+
+  // -------------------------------------------------------------------------
+  // STEP 1 — quick scan (value-first; user sees their grade before any setup)
+  // -------------------------------------------------------------------------
+  if (!skipScan) {
+    console.log(color("violet", `  ▸ Step 1 / 4 — scanning ${domain}…`));
+    try {
+      const resp = await fetch(`${API_BASE}/api/scan?domain=${encodeURIComponent(domain)}&source=onboard`, {
+        method: "GET",
+        headers: apiHeaders({ "user-agent": `pqcheck-cli/${VERSION} (onboard)` }),
+      });
+      if (resp.ok) {
+        const report = await resp.json();
+        const score = typeof report.score === "number" ? report.score.toFixed(1) : "?";
+        const grade = report.grade || "?";
+        const label = report.scoreLabel || "—";
+        console.log(`    ${color("bold", "Current grade:")} ${color("violet", grade)} (${score}/10 · ${label})`);
+        console.log(`    ${color("dim", `Full report: ${API_BASE}/r/${encodeURIComponent(domain)}`)}`);
+      } else {
+        console.log(color("yellow", `    skipped (scan returned HTTP ${resp.status})`));
+        anyStepFailed = true;
+      }
+    } catch (err) {
+      console.log(color("yellow", `    skipped (${err?.message ?? "scan failed"})`));
+      anyStepFailed = true;
+    }
+    console.log("");
+  }
+
+  // -------------------------------------------------------------------------
+  // STEP 2 — workflow scaffold
+  // -------------------------------------------------------------------------
+  console.log(color("violet", `  ▸ Step 2 / 4 — scaffolding GitHub Action workflow…`));
+  try {
+    // Call runInitCommand non-interactively. The function process.exit()'s on
+    // its own; to compose it here we'd have to refactor. Pragmatic approach:
+    // spawn a child node invoking ourselves with `init --yes --domain ...`.
+    // That keeps each step idempotent and isolated.
+    const { spawn } = await import("node:child_process");
+    const result = await new Promise((resolve) => {
+      const p = spawn(process.execPath, [
+        process.argv[1],
+        "init",
+        "--yes",
+        "--domain", domain,
+        "--force",
+      ], { stdio: "inherit" });
+      p.on("exit", (code) => resolve(code ?? 0));
+      p.on("error", () => resolve(1));
+    });
+    if (result !== 0) {
+      console.log(color("yellow", `    init exited ${result} — you can re-run \`pqcheck init\` later`));
+      anyStepFailed = true;
+    }
+  } catch (err) {
+    console.log(color("yellow", `    skipped init (${err?.message ?? "subprocess failed"})`));
+    anyStepFailed = true;
+  }
+  console.log("");
+
+  // -------------------------------------------------------------------------
+  // STEP 3 — vendor lockfile (skipped if --skip-vendors)
+  // -------------------------------------------------------------------------
+  if (!skipVendors) {
+    console.log(color("violet", `  ▸ Step 3 / 4 — capturing vendor lockfile…`));
+    try {
+      const { spawn } = await import("node:child_process");
+      const result = await new Promise((resolve) => {
+        const p = spawn(process.execPath, [
+          process.argv[1],
+          "vendors",
+          "export",
+          domain,
+        ], { stdio: "inherit" });
+        p.on("exit", (code) => resolve(code ?? 0));
+        p.on("error", () => resolve(1));
+      });
+      if (result !== 0) {
+        console.log(color("yellow", `    vendors export exited ${result} — you can re-run \`pqcheck vendors export ${domain}\` later`));
+        anyStepFailed = true;
+      }
+    } catch (err) {
+      console.log(color("yellow", `    skipped vendors export (${err?.message ?? "subprocess failed"})`));
+      anyStepFailed = true;
+    }
+    console.log("");
+  }
+
+  // -------------------------------------------------------------------------
+  // STEP 4 — release checklist (skipped if --skip-checklist)
+  // -------------------------------------------------------------------------
+  if (!skipChecklist) {
+    console.log(color("violet", `  ▸ Step 4 / 4 — writing release checklist…`));
+    try {
+      const fs = await import("node:fs/promises");
+      const checklist = buildReleaseChecklistMarkdown(domain);
+      await fs.writeFile("CIPHERWAKE_CHECKLIST.md", checklist, "utf8");
+      console.log(`    ${color("green", "✓ Wrote CIPHERWAKE_CHECKLIST.md")}`);
+    } catch (err) {
+      console.log(color("yellow", `    skipped checklist (${err?.message ?? "write failed"})`));
+      anyStepFailed = true;
+    }
+    console.log("");
+  }
+
+  // -------------------------------------------------------------------------
+  // Browser open + final next-steps
+  // -------------------------------------------------------------------------
+  // Query MUST come before fragment per RFC 3986. The previous order
+  // `#api-keys?utm_source=onboard` made utm_source part of the fragment
+  // (which never reaches the server), so attribution analytics never fired.
+  const apiKeyUrl = `${API_BASE}/account?utm_source=onboard#api-keys`;
+  console.log(color("bold", "  ✓ Setup files written. Three steps remain:"));
+  console.log("");
+  console.log(`  ${color("dim", "1.")} ${color("bold", "Get a free API key")} (30 Trust Diff calls/month)`);
+  console.log(`     ${color("violet", apiKeyUrl)}`);
+  if (!noOpen) {
+    const opened = await tryOpenBrowser(apiKeyUrl);
+    if (opened) {
+      console.log(`     ${color("dim", "(opened in your browser — sign in / sign up there)")}`);
+    } else {
+      console.log(`     ${color("dim", "(copy the URL above; --no-open suppresses this hint)")}`);
+    }
+  }
+  console.log("");
+  console.log(`  ${color("dim", "2.")} ${color("bold", "Add the key as a GitHub repo secret")}`);
+  console.log(`     ${color("dim", "GitHub → Settings → Secrets and variables → Actions → New repository secret")}`);
+  console.log(`     ${color("dim", "Name: CIPHERWAKE_API_KEY   Value: qpk_... (from step 1)")}`);
+  console.log("");
+  console.log(`  ${color("dim", "3.")} ${color("bold", "Commit + push")}`);
+  // R41 Q1.15 (locked 2026-05-16): build the git-add file list as an array
+  // and join, so we don't print trailing-space args when --skip flags are
+  // used. Harmless bash semantics either way; cleaner output.
+  const filesToAdd = [".github/workflows/cipherwake.yml"];
+  if (!skipVendors) filesToAdd.push("cipherwake.vendors.json");
+  if (!skipChecklist) filesToAdd.push("CIPHERWAKE_CHECKLIST.md");
+  console.log(`     ${color("dim", "$")} git add ${filesToAdd.join(" ")}`);
+  console.log(`     ${color("dim", "$")} git commit -m "ci: add Cipherwake Trust Diff gate"`);
+  console.log(`     ${color("dim", "$")} git push`);
+  console.log("");
+  console.log(`  ${color("dim", "Open a PR after pushing and Cipherwake will comment inline within ~60s of the workflow firing.")}`);
+  console.log("");
+  // R41 fix #4: --strict makes onboard exit non-zero if any step failed.
+  // Default (best-effort) exit 0 keeps the wizard friendly for first-time
+  // human setup — the visible yellow warnings tell them what to retry.
+  if (strict && anyStepFailed) {
+    console.log(color("dim", "  (--strict: one or more steps failed; exiting non-zero)"));
+    process.exit(1);
+  }
+  process.exit(0);
+}
+
+// R41 fix #3: buildReleaseChecklistMarkdown is now a thin alias to the shared
+// renderReleaseChecklist() helper defined alongside runReleaseChecklistCommand.
+// Single source of truth — when either subcommand's content changes, both
+// callers update automatically.
+function buildReleaseChecklistMarkdown(domain) {
+  return renderReleaseChecklist(domain, { generator: "onboard" });
+}
+
+// Cross-platform browser launcher. Returns true if a launcher binary
+// dispatched successfully; false if no launcher is available (e.g. headless
+// server, sandboxed CI, broken xdg-open config).
+//
+// R41 fix #2 (locked 2026-05-16): use exit-event detection + longer timeout
+// so we don't falsely claim "(opened in your browser)" when xdg-open is
+// installed but the launcher exits non-zero (no graphical session, no
+// MIME handler). Previously a flat 200ms timeout resolved true even when
+// the launcher exited 3 because no display was available.
+async function tryOpenBrowser(url) {
+  if (process.env.CI || process.env.CIPHERWAKE_NO_BROWSER) return false;
+  const { spawn } = await import("node:child_process");
+  const platform = process.platform;
+  let cmd, cmdArgs;
+  if (platform === "darwin") {
+    cmd = "open"; cmdArgs = [url];
+  } else if (platform === "win32") {
+    cmd = "cmd"; cmdArgs = ["/c", "start", "", url];
+  } else {
+    cmd = "xdg-open"; cmdArgs = [url];
+  }
+  return await new Promise((resolve) => {
+    let settled = false;
+    let p;
+    try {
+      p = spawn(cmd, cmdArgs, { stdio: "ignore", detached: true });
+    } catch {
+      resolve(false);
+      return;
+    }
+    p.on("error", () => { if (!settled) { settled = true; resolve(false); } });
+    p.on("exit", (code) => { if (!settled) { settled = true; resolve(code === 0); } });
+    p.unref();
+    // Belt-and-suspenders: if the launcher takes >1s to exit AND no error
+    // event has fired, assume it dispatched and went detached (open on
+    // macOS does this — returns after AppleScript-asking Finder/Safari).
+    setTimeout(() => {
+      if (!settled) { settled = true; resolve(true); }
+    }, 1000);
+  });
 }
 
 main().catch((err) => {

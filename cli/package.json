@@ -1,6 +1,6 @@
 {
   "name": "pqcheck",
-  "version": "0.10.0",
+  "version": "0.12.0",
   "description": "Decryption Blast Radius scanner — find out how much of your data unlocks when quantum decryption arrives.",
   "keywords": [
     "post-quantum",
