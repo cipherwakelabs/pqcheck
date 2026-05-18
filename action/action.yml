@@ -131,7 +131,7 @@ runs:
         if [ -z "${CIPHERWAKE_API_KEY}" ]; then
           if [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
             if ! command -v jq >/dev/null 2>&1; then
-              echo "::error::jq is required to parse the GitHub OIDC token response. github-hosted ubuntu-latest runners ship jq by default; self-hosted runners may not. Install jq on this runner OR provide an explicit api-key input via 'with: api-key: \${{ secrets.CIPHERWAKE_API_KEY }}'."
+              echo "::error::jq is required to parse the GitHub OIDC token response. github-hosted ubuntu-latest runners ship jq by default; self-hosted runners may not. Install jq on this runner OR provide an explicit api-key input via the 'with: api-key:' input + a secret named CIPHERWAKE_API_KEY."
               exit 1
             fi
             echo "::notice::No api-key provided. Fetching GitHub OIDC token for per-repo metering (Free: 30 calls/repo/mo)."
@@ -374,7 +374,7 @@ runs:
         # but DOES appear in the run log + summary. Only prints when the
         # input is empty — silent once they've wired up the secret.
         if [ -z "${QUANTAPACT_API_KEY:-}" ]; then
-          echo "::notice title=pqcheck — free tier limits apply::Add a Cipherwake API key for higher rate limits + private results. Create one free at https://cipherwake.io/signin then pass via:  api-key: \${{ secrets.CIPHERWAKE_API_KEY }}"
+          echo "::notice title=pqcheck — free tier limits apply::Add a Cipherwake API key for higher rate limits + private results. Create one free at https://cipherwake.io/signin then pass via the 'api-key' input bound to a secret named CIPHERWAKE_API_KEY in your workflow."
         fi
 
         # Pass --fresh through to the CLI when the workflow requested it.
