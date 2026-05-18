@@ -202,6 +202,13 @@ runs:
             DELTA_COUNT=$(jq -r '.deltas | length' <<< "$JSON")
             QUOTA_USED=$(jq -r '.quota.used_this_month // 0' <<< "$JSON")
             QUOTA_LIMIT=$(jq -r '.quota.monthly_limit // 0' <<< "$JSON")
+            # First-run detection (post-R49 ship 2026-05-18): server returns
+            # baseline.source = "no_data" when there's no prior scan to diff
+            # against. Treat as "baseline captured" rather than as a misleading
+            # "no changes" success, which would lie to the user on their first
+            # Action invocation. GPT idea #10 — first run should feel valuable.
+            BASELINE_SOURCE=$(jq -r '.baseline.source // ""' <<< "$JSON")
+            IS_FIRST_RUN=$( [ "$BASELINE_SOURCE" = "no_data" ] && echo "true" || echo "false" )
             VERDICT_EMOJI=$( [ "$VERDICT" = "fail" ] && echo "🔴" || ([ "$VERDICT" = "warn" ] && echo "🟡" || echo "🟢") )
             VERDICT_TEXT=$( [ "$VERDICT" = "fail" ] && echo "Trust regression detected" || ([ "$VERDICT" = "warn" ] && echo "Changes observed below fail-on threshold" || echo "No trust-posture regressions"))
 
@@ -213,21 +220,48 @@ runs:
               # the same heading text into a comment can't cause the
               # Action to PATCH the wrong comment.
               echo "<!-- cipherwake-trust-diff-comment:v1 domain=$INPUT_DOMAIN -->"
-              echo "## $VERDICT_EMOJI Cipherwake Trust Diff for \`$INPUT_DOMAIN\`"
-              echo ""
-              echo "**$VERDICT_TEXT** vs baseline \`$INPUT_BASELINE\` (fail-on \`$INPUT_FAIL_ON\`)."
-              echo ""
-              if [ "$DELTA_COUNT" -gt 0 ]; then
-                echo "### Changed"
+              if [ "$IS_FIRST_RUN" = "true" ]; then
+                echo "## 🟢 Cipherwake Trust Diff for \`$INPUT_DOMAIN\` — first run"
                 echo ""
-                # One bullet per delta; severity prefix, then title.
-                jq -r '.deltas[] | "- **[\(.severity | ascii_upcase)]** \(.title // .type)" + (if .what_changed then "\n  " + .what_changed else "" end)' <<< "$JSON"
+                echo "**First baseline captured.** Cipherwake recorded the current cert chain, SPKI, security headers, and observed third-party scripts for \`$INPUT_DOMAIN\`. Future PRs and pushes will diff against this snapshot and flag any regressions."
                 echo ""
-                echo "[Approve vendor / view scan ↗](https://cipherwake.io/r/$INPUT_DOMAIN) · [Configure Trust Diff ↗](https://cipherwake.io/account)"
+                echo "### What happens next"
+                echo ""
+                echo "- The next Action run on this repo compares its scan to today's snapshot."
+                echo "- If anything regresses (cert change, new vendor script, header removed), this comment will update with the diff."
+                echo "- If nothing changes, you'll get a brief \"all clear\" comment with the shareable badge below."
+                echo ""
+                echo "[View today's snapshot ↗](https://cipherwake.io/r/$INPUT_DOMAIN) · [Configure Trust Diff ↗](https://cipherwake.io/account)"
               else
-                echo "### No changes since baseline"
+                echo "## $VERDICT_EMOJI Cipherwake Trust Diff for \`$INPUT_DOMAIN\`"
                 echo ""
-                echo "Certificate, SPKI, HSTS, CSP, DMARC, and vendor scripts all match \`$INPUT_BASELINE\`."
+                echo "**$VERDICT_TEXT** vs baseline \`$INPUT_BASELINE\` (fail-on \`$INPUT_FAIL_ON\`)."
+                echo ""
+                if [ "$DELTA_COUNT" -gt 0 ]; then
+                  echo "### Changed"
+                  echo ""
+                  # One bullet per delta; severity prefix, then title.
+                  jq -r '.deltas[] | "- **[\(.severity | ascii_upcase)]** \(.title // .type)" + (if .what_changed then "\n  " + .what_changed else "" end)' <<< "$JSON"
+                  echo ""
+                  echo "[Approve vendor / view scan ↗](https://cipherwake.io/r/$INPUT_DOMAIN) · [Configure Trust Diff ↗](https://cipherwake.io/account)"
+                else
+                  echo "### No changes since baseline"
+                  echo ""
+                  echo "Certificate, SPKI, HSTS, CSP, DMARC, and vendor scripts all match \`$INPUT_BASELINE\`."
+                fi
+                # Shareable badge on clean passes (GPT idea #14). Renders the
+                # live grade badge for the domain via the public /badge endpoint
+                # so teams can paste it into release notes or status pages.
+                if [ "$VERDICT" = "pass" ] && [ "$DELTA_COUNT" = "0" ]; then
+                  echo ""
+                  echo "### Share"
+                  echo ""
+                  echo "Paste into release notes or your status page:"
+                  echo ""
+                  echo "\`\`\`markdown"
+                  echo "[![Cipherwake Trust Diff](https://cipherwake.io/badge/$INPUT_DOMAIN.svg)](https://cipherwake.io/r/$INPUT_DOMAIN)"
+                  echo "\`\`\`"
+                fi
               fi
               echo ""
               echo "<sub>Quota: $QUOTA_USED / $QUOTA_LIMIT Trust Diff calls used this month. Posted by [cipherwakelabs/pqcheck@v3](https://github.com/cipherwakelabs/pqcheck/tree/main/action) · [Methodology ↗](https://cipherwake.io/methodology)</sub>"
