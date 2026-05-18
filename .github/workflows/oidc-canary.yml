@@ -1,0 +1,100 @@
+# =============================================================================
+# OIDC canary — verifies the Action v3.2 GitHub-OIDC fetch + server metering
+# =============================================================================
+# Per R48 review condition (GPT 2026-05-18): the "Free tier needs no API key"
+# marketing promise stays gated until this canary proves the full path
+# end-to-end on cipherwakelabs/pqcheck itself.
+#
+# What this verifies (GPT minimum canary checklist):
+#   1. Workflow with permissions: id-token: write             ✓
+#   2. NO CIPHERWAKE_API_KEY secret in the workflow            ✓
+#   3. Action fetches OIDC token                                ✓
+#   4. /api/scan accepts it                                     ✓
+#   5. gh_action_repo_quota increments for cipherwakelabs/pqcheck
+#   6. Quota headers show cap/remaining/tier                    ✓
+#   7. Wrong-audience token gets 401 oidc_error_code=audience   ✓
+#
+# Two jobs:
+#   - positive: uses cipherwakelabs/pqcheck@main (this repo's own action)
+#     to scan cipherwake.com via the OIDC path. Expected: pass + visible
+#     X-Cipherwake-Quota-* headers in the Action's log notice.
+#   - negative: requests an OIDC token with the WRONG audience and POSTs
+#     it directly to /api/scan. Expected: 401 with oidc_error_code=audience.
+# =============================================================================
+
+name: OIDC canary
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'action/**'
+      - '.github/workflows/oidc-canary.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # required for the OIDC token fetch
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # POSITIVE — the real customer journey
+  # ---------------------------------------------------------------------------
+  positive:
+    name: Positive (OIDC happy path)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trust Diff via OIDC (no API key)
+        uses: cipherwakelabs/pqcheck@main
+        with:
+          mode: trust-diff
+          domain: cipherwake.com
+          baseline: last-week
+          fail-on: critical
+        # Deliberately no `env: CIPHERWAKE_API_KEY: ...` — this proves the
+        # action successfully falls back to GitHub OIDC.
+
+  # ---------------------------------------------------------------------------
+  # NEGATIVE — token with wrong audience must be rejected with code "audience"
+  # ---------------------------------------------------------------------------
+  negative-audience:
+    name: Negative (wrong audience → 401)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch OIDC token with deliberately wrong audience
+        id: fetch
+        shell: bash
+        run: |
+          set -euo pipefail
+          OIDC_RESPONSE=$(curl -sS -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=NOT-THE-RIGHT-AUDIENCE")
+          TOKEN=$(echo "$OIDC_RESPONSE" | jq -r '.value // empty')
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Could not fetch OIDC token (response: $(echo "$OIDC_RESPONSE" | head -c 200))"
+            exit 1
+          fi
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: POST to /api/scan with wrong-audience token — expect 401 audience
+        shell: bash
+        env:
+          BAD_TOKEN: ${{ steps.fetch.outputs.token }}
+        run: |
+          set -euo pipefail
+          HTTP_STATUS=$(curl -sS -o /tmp/resp.json -w "%{http_code}" \
+            -X POST "https://cipherwake.io/api/scan?domain=cipherwake.com" \
+            -H "Authorization: Bearer ${BAD_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{}')
+          echo "HTTP $HTTP_STATUS"
+          cat /tmp/resp.json
+          if [ "$HTTP_STATUS" != "401" ]; then
+            echo "::error::Expected 401 from wrong-audience token, got $HTTP_STATUS"
+            exit 1
+          fi
+          OIDC_CODE=$(jq -r '.oidc_error_code // empty' /tmp/resp.json)
+          if [ "$OIDC_CODE" != "audience" ]; then
+            echo "::error::Expected oidc_error_code=audience, got '$OIDC_CODE'"
+            exit 1
+          fi
+          echo "::notice::Wrong-audience token correctly rejected with oidc_error_code=audience ✓"

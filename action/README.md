@@ -108,7 +108,7 @@ jobs:
   pqcheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: cipherwake-io/pqcheck/action@main
+      - uses: cipherwakelabs/pqcheck/action@main
         with:
           domain: mycompany.com
           threshold: '7'
@@ -117,7 +117,7 @@ jobs:
 ### Surface findings in GitHub Code Scanning (Security tab)
 
 ```yaml
-- uses: cipherwake-io/pqcheck/action@main
+- uses: cipherwakelabs/pqcheck/action@main
   with:
     domain: mycompany.com
     generate-sarif: 'true'
@@ -131,7 +131,7 @@ Findings appear in the GitHub Security tab as code-scanning alerts, fully integr
 ### Track crypto posture over time as a committed artifact
 
 ```yaml
-- uses: cipherwake-io/pqcheck/action@main
+- uses: cipherwakelabs/pqcheck/action@main
   with:
     domain: mycompany.com
     generate-lockfile: 'true'
@@ -148,7 +148,7 @@ Or commit the lockfile to your repo (similar to `package-lock.json`) so PR diffs
 ### Use the score in a follow-up step (e.g. PR comment)
 
 ```yaml
-- uses: cipherwake-io/pqcheck/action@main
+- uses: cipherwakelabs/pqcheck/action@main
   id: scan
   with:
     domain: mycompany.com
@@ -165,7 +165,7 @@ strategy:
   matrix:
     domain: [api.mycompany.com, app.mycompany.com, www.mycompany.com]
 steps:
-  - uses: cipherwake-io/pqcheck/action@main
+  - uses: cipherwakelabs/pqcheck/action@main
     with:
       domain: ${{ matrix.domain }}
       threshold: '7'
@@ -177,14 +177,14 @@ Commit a baseline once, then every PR fails if a new third-party script appears:
 
 ```yaml
 # Step 1 — capture initial baseline (run once locally or via an admin workflow)
-- uses: cipherwake-io/pqcheck/action@v2.2.0
+- uses: cipherwakelabs/pqcheck/action@v2.2.0
   with:
     domain: mycompany.com
     supply-chain-baseline: '.pqcheck-baseline.json'
     supply-chain-write-baseline: 'true'
 
 # Step 2 — commit `.pqcheck-baseline.json`, then on every PR:
-- uses: cipherwake-io/pqcheck/action@v2.2.0
+- uses: cipherwakelabs/pqcheck/action@v2.2.0
   with:
     domain: mycompany.com
     threshold: '7'

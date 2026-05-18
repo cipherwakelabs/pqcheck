@@ -1,7 +1,7 @@
 {
   "name": "pqcheck",
-  "version": "0.12.0",
-  "description": "Decryption Blast Radius scanner — find out how much of your data unlocks when quantum decryption arrives.",
+  "version": "0.12.1",
+  "description": "HTTPS posture scanner with Trust Diff for CI, vendor lockfile + drift alerts, cross-tenant key map, and HNDL/quantum-decryption risk scoring. Free, no signup.",
   "keywords": [
     "post-quantum",
     "cryptography",
@@ -21,7 +21,7 @@
   "bugs": "https://cipherwake.io",
   "repository": {
     "type": "git",
-    "url": "https://github.com/cipherwake-io/pqcheck.git",
+    "url": "https://github.com/cipherwakelabs/pqcheck.git",
     "directory": "cli"
   },
   "license": "MIT",

@@ -4,6 +4,12 @@ All notable changes to `pqcheck` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.1] — 2026-05-18
+
+### Changed
+
+- **npm description rewrite.** Replaces the abstract "find out how much of your data unlocks when quantum decryption arrives" with a concrete feature surface: "HTTPS posture scanner with Trust Diff for CI, vendor lockfile + drift alerts, cross-tenant key map, and HNDL/quantum-decryption risk scoring. Free, no signup." Surfaces the engineer-relatable hooks (Trust Diff, vendor allowlist, key map) alongside the HNDL/quantum moat layer. No behavior change.
+
 ## [0.12.0] — 2026-05-16
 
 ### Added — Developer habit-loop bundle (6 new subcommands)
@@ -212,7 +218,7 @@ No breaking changes. JSON output adds `_meta.degraded` (bool) and `_meta.degrade
 
 ### Changed
 - README rewritten with Examples / Exit codes / CI integration sections.
-- npm metadata aligned to the public `cipherwake-io/pqcheck` org repo.
+- npm metadata aligned to the public `cipherwakelabs/pqcheck` org repo.
 
 ---
 

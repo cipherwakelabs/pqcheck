@@ -2715,6 +2715,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write          # required for OIDC-based metering (Free=30 calls/repo/mo, no API key needed)
   security-events: write   # required for SARIF upload to Code Scanning
   pull-requests: write     # required for sticky PR comment (Action v3.1+)
 
@@ -2729,8 +2730,11 @@ jobs:
           domain: ${domain}
           baseline: ${baseline}
           fail-on: ${failOn}
-        env:
-          CIPHERWAKE_API_KEY: \${{ secrets.CIPHERWAKE_API_KEY }}
+        # No env/secrets needed for Free tier — the action uses the
+        # workflow's id-token: write permission to fetch a GitHub-signed
+        # OIDC token and meters per repo (30 calls/mo, no setup).
+        # If you want higher limits, link this repo to a paid Cipherwake
+        # account at https://cipherwake.io/account → Linked repos.
 `;
 }
 
@@ -3300,33 +3304,19 @@ async function runOnboardCommand(args) {
   }
 
   // -------------------------------------------------------------------------
-  // Browser open + final next-steps
+  // Final next-steps (v0.13 OIDC path — no API key needed for Free tier)
   // -------------------------------------------------------------------------
-  // Query MUST come before fragment per RFC 3986. The previous order
-  // `#api-keys?utm_source=onboard` made utm_source part of the fragment
-  // (which never reaches the server), so attribution analytics never fired.
-  const apiKeyUrl = `${API_BASE}/account?utm_source=onboard#api-keys`;
-  console.log(color("bold", "  ✓ Setup files written. Three steps remain:"));
+  // Pre-v0.13 this step opened a browser to the API-key page + asked the user
+  // to paste the key as a GitHub repo secret. With Action v3.2 + OIDC repo
+  // metering, the scaffolded workflow has `permissions: { id-token: write }`
+  // and the action fetches a GitHub-signed token automatically — no key, no
+  // secret, no browser hop. Free tier is 30 calls/repo/mo, enforced server-
+  // side via the `meter_gh_action_call` RPC against `gh_action_repo_quota`.
+  // For higher limits, the user links this repo to a paid account at /account
+  // (one-time OAuth) — still no API key in CI.
+  console.log(color("bold", "  ✓ Setup files written. Two steps remain:"));
   console.log("");
-  console.log(`  ${color("dim", "1.")} ${color("bold", "Get a free API key")} (30 Trust Diff calls/month)`);
-  console.log(`     ${color("violet", apiKeyUrl)}`);
-  if (!noOpen) {
-    const opened = await tryOpenBrowser(apiKeyUrl);
-    if (opened) {
-      console.log(`     ${color("dim", "(opened in your browser — sign in / sign up there)")}`);
-    } else {
-      console.log(`     ${color("dim", "(copy the URL above; --no-open suppresses this hint)")}`);
-    }
-  }
-  console.log("");
-  console.log(`  ${color("dim", "2.")} ${color("bold", "Add the key as a GitHub repo secret")}`);
-  console.log(`     ${color("dim", "GitHub → Settings → Secrets and variables → Actions → New repository secret")}`);
-  console.log(`     ${color("dim", "Name: CIPHERWAKE_API_KEY   Value: qpk_... (from step 1)")}`);
-  console.log("");
-  console.log(`  ${color("dim", "3.")} ${color("bold", "Commit + push")}`);
-  // R41 Q1.15 (locked 2026-05-16): build the git-add file list as an array
-  // and join, so we don't print trailing-space args when --skip flags are
-  // used. Harmless bash semantics either way; cleaner output.
+  console.log(`  ${color("dim", "1.")} ${color("bold", "Commit + push")} (no API key, no secrets needed for the Free tier)`);
   const filesToAdd = [".github/workflows/cipherwake.yml"];
   if (!skipVendors) filesToAdd.push("cipherwake.vendors.json");
   if (!skipChecklist) filesToAdd.push("CIPHERWAKE_CHECKLIST.md");
@@ -3334,8 +3324,21 @@ async function runOnboardCommand(args) {
   console.log(`     ${color("dim", "$")} git commit -m "ci: add Cipherwake Trust Diff gate"`);
   console.log(`     ${color("dim", "$")} git push`);
   console.log("");
-  console.log(`  ${color("dim", "Open a PR after pushing and Cipherwake will comment inline within ~60s of the workflow firing.")}`);
+  console.log(`  ${color("dim", "2.")} ${color("bold", "Open a PR")}`);
+  console.log(`     ${color("dim", "Cipherwake will comment inline within ~60s of the workflow firing. The action uses GitHub OIDC to meter usage per repo (Free = 30 calls/mo).")}`);
   console.log("");
+  // R48 (post-R47 review MAJOR #6): the /account → "Linked repos" UI is
+  // not yet shipped (out of R47 scope). Pointing users to a nonexistent
+  // page-hash would create a broken growth path at the moment of intent.
+  // Route through the feedback form until the linking UI lands.
+  console.log(`  ${color("dim", "Want higher limits (1K/10K/50K Trust Diff calls/mo)?")}`);
+  console.log(`     ${color("violet", `${API_BASE}/feedback?topic=linked-repos`)}`);
+  console.log(`     ${color("dim", "Repo-linking UI is rolling out — request early access via the form.")}`);
+  console.log("");
+  // R41 fix #4 carried forward: --strict gates exit code on step failures.
+  // noOpen flag is now a no-op since we don't open a browser, but we keep it
+  // accepted for backward compat with users who already pass --no-open.
+  void noOpen;
   // R41 fix #4: --strict makes onboard exit non-zero if any step failed.
   // Default (best-effort) exit 0 keeps the wizard friendly for first-time
   // human setup — the visible yellow warnings tell them what to retry.

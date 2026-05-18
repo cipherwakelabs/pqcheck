@@ -254,7 +254,7 @@ This CLI is one of four ways to consume the [Decryption Blast Radius API](https:
 |---|---|
 | **CLI** (this package) | `npx pqcheck` |
 | **Browser extension** | Chrome Web Store / Firefox AMO / Edge — toolbar badge per tab + dependency analysis |
-| **GitHub Action** | [`cipherwake-io/pqcheck/action@main`](https://github.com/cipherwake-io/pqcheck/tree/main/action) — PR comments, SARIF upload, lockfile generation |
+| **GitHub Action** | [`cipherwakelabs/pqcheck/action@main`](https://github.com/cipherwakelabs/pqcheck/tree/main/action) — PR comments, SARIF upload, lockfile generation |
 | **Slack `/pqcheck`** | [Install on workspace](https://cipherwake.io/install-slack) |
 | **Web** | [cipherwake.io](https://cipherwake.io) — share-friendly URLs at `/r/<domain>` |
 
@@ -298,10 +298,10 @@ The CLI follows the same policy — output formats are stable across minor versi
   run: npx pqcheck@latest mycompany.com --threshold 7
 ```
 
-For richer integration (sticky PR comments, SARIF upload to Code Scanning, lockfile diff on regression), use the [GitHub Action](https://github.com/cipherwake-io/pqcheck/tree/main/action):
+For richer integration (sticky PR comments, SARIF upload to Code Scanning, lockfile diff on regression), use the [GitHub Action](https://github.com/cipherwakelabs/pqcheck/tree/main/action):
 
 ```yaml
-- uses: cipherwake-io/pqcheck/action@main
+- uses: cipherwakelabs/pqcheck/action@main
   with:
     domain: mycompany.com
     threshold: '7'
@@ -322,7 +322,7 @@ MIT. © 2026 Cipherwake.
 
 ---
 
-**Source:** [github.com/cipherwake-io/pqcheck](https://github.com/cipherwake-io/pqcheck)
+**Source:** [github.com/cipherwakelabs/pqcheck](https://github.com/cipherwakelabs/pqcheck)
 
 **Changelog:** [CHANGELOG.md](./CHANGELOG.md) for version-by-version release notes.
 

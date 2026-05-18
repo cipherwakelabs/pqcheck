@@ -70,7 +70,7 @@ inputs:
     required: false
     default: 'true'
   api-key:
-    description: 'Optional Cipherwake API key (qpk_<hex>). When set, the action authenticates with this key and uses your tier-based monthly quota (1K/10K/50K depending on Starter/Growth/Scale) instead of the per-IP rate limit. Recommended for CI workflows that scan on every PR. Pass via secret: `api-key: ${{ secrets.CIPHERWAKE_API_KEY }}` (or the legacy `secrets.QUANTAPACT_API_KEY` if you set it up under the old name — both names work forever).'
+    description: 'Optional Cipherwake API key (qpk_<hex>). When set, the action authenticates with this key and uses your tier-based monthly quota (1K/10K/50K depending on Starter/Growth/Scale) instead of the per-IP rate limit. NEW in v3.2: API key is now OPTIONAL — if your workflow declares `permissions: { id-token: write }`, the action fetches a signed GitHub OIDC token and uses it for per-repo metering (Free=30 calls/repo/mo, paid tiers same as api-key after linking the repo at cipherwake.io/account). Pass via secret: `api-key: ${{ secrets.CIPHERWAKE_API_KEY }}` (or the legacy `secrets.QUANTAPACT_API_KEY` if you set it up under the old name — both names work forever).'
     required: false
     default: ''
 
@@ -115,9 +115,54 @@ runs:
         QUANTAPACT_API_KEY: ${{ inputs.api-key }}
       run: |
         set -euo pipefail
+        # v3.2 OIDC fallback. If no api-key was provided AND the workflow
+        # declared `permissions: { id-token: write }`, fetch a GitHub-signed
+        # OIDC token and use that as the Bearer. The server distinguishes a
+        # JWT (OIDC) from an API key (qpk_) by shape and meters per-repo
+        # vs per-account accordingly.
+        #
+        # ACTIONS_ID_TOKEN_REQUEST_URL + ACTIONS_ID_TOKEN_REQUEST_TOKEN are
+        # set by GitHub Actions runtime when id-token: write is granted.
+        # Audience `cipherwake-action-v1` MUST match lib/githubOidc.ts's
+        # ACCEPTED_AUDIENCES — roll both together when bumping.
+        # R48 (post-R47 review MAJOR #5): jq presence check + JWT-shape
+        # validation + secret unset. Hardens the OIDC fetch against
+        # self-hosted-runner edge cases and reduces token exposure.
         if [ -z "${CIPHERWAKE_API_KEY}" ]; then
-          echo "::error::Trust Diff mode requires an api-key input. Generate one (Free: 30 calls/mo) at https://cipherwake.io/account#api-keys and pass it via secrets: with: api-key: \${{ secrets.CIPHERWAKE_API_KEY }}"
-          exit 1
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            if ! command -v jq >/dev/null 2>&1; then
+              echo "::error::jq is required to parse the GitHub OIDC token response. github-hosted ubuntu-latest runners ship jq by default; self-hosted runners may not. Install jq on this runner OR provide an explicit api-key input via 'with: api-key: \${{ secrets.CIPHERWAKE_API_KEY }}'."
+              exit 1
+            fi
+            echo "::notice::No api-key provided. Fetching GitHub OIDC token for per-repo metering (Free: 30 calls/repo/mo)."
+            OIDC_RESPONSE=$(curl -sS -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=cipherwake-action-v1")
+            # Reduce exposure of the request token after consumption. GitHub
+            # masks secrets in logs, but defense-in-depth — a misbehaving
+            # tool later in the workflow can't leak what isn't there.
+            unset ACTIONS_ID_TOKEN_REQUEST_TOKEN
+            CIPHERWAKE_API_KEY=$(echo "$OIDC_RESPONSE" | jq -r '.value // empty')
+            if [ -z "${CIPHERWAKE_API_KEY}" ]; then
+              echo "::error::OIDC token fetch failed. Response: $(echo "$OIDC_RESPONSE" | head -c 200)"
+              exit 1
+            fi
+            # Sanity-check the fetched value is JWT-shaped (three dot-
+            # separated segments). If GitHub returned an HTML error page
+            # or unexpected JSON shape, we'd otherwise pass garbage to
+            # the CLI and get an opaque 401 from the server. Fail loudly
+            # here with the actual content instead.
+            case "$CIPHERWAKE_API_KEY" in
+              *.*.*) ;;
+              *)
+                echo "::error::GitHub OIDC response did not contain a JWT. Got: $(echo "$CIPHERWAKE_API_KEY" | head -c 200)"
+                exit 1
+                ;;
+            esac
+            export CIPHERWAKE_API_KEY
+          else
+            echo "::error::Trust Diff needs auth. Either provide api-key (https://cipherwake.io/account#api-keys, Free=30/mo) OR add 'permissions: { id-token: write }' to your workflow so the action can use GitHub OIDC (Free=30/repo/mo, zero setup)."
+            exit 1
+          fi
         fi
         echo "Cipherwake Trust Diff: domain=$INPUT_DOMAIN baseline=$INPUT_BASELINE fail-on=$INPUT_FAIL_ON"
         # CLI handles the actual /api/trust-diff call, output formatting, and
@@ -411,7 +456,7 @@ runs:
             echo "📌 **Watch \`$INPUT_DOMAIN\` for changes (free):** [cipherwake.io/watch/$INPUT_DOMAIN](https://cipherwake.io/watch/$INPUT_DOMAIN) — weekly email when cert / scripts / TLS posture drift."
           fi
           echo ""
-          echo "<sub>Posted by [pqcheck-action](https://github.com/cipherwake-io/pqcheck/tree/main/action) · Public surface only — internal Blast Radius is typically 12-40× this score.</sub>"
+          echo "<sub>Posted by [pqcheck-action](https://github.com/cipherwakelabs/pqcheck/tree/main/action) · Public surface only — internal Blast Radius is typically 12-40× this score.</sub>"
         } > "$MD_FILE"
 
         # Make the markdown available as a step output (GH Actions multi-line syntax)
