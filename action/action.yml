@@ -70,7 +70,7 @@ inputs:
     required: false
     default: 'true'
   api-key:
-    description: 'Optional Cipherwake API key (qpk_<hex>). When set, the action authenticates with this key and uses your tier-based monthly quota (1K/10K/50K depending on Starter/Growth/Scale) instead of the per-IP rate limit. NEW in v3.2: API key is now OPTIONAL — if your workflow declares `permissions: { id-token: write }`, the action fetches a signed GitHub OIDC token and uses it for per-repo metering (Free=30 calls/repo/mo, paid tiers same as api-key after linking the repo at cipherwake.io/account). Pass via secret: `api-key: ${{ secrets.CIPHERWAKE_API_KEY }}` (or the legacy `secrets.QUANTAPACT_API_KEY` if you set it up under the old name — both names work forever).'
+    description: 'Optional Cipherwake API key (qpk_<hex>). When set, the action authenticates with this key and uses your tier-based monthly quota (1K/10K/50K depending on Starter/Growth/Scale) instead of the per-IP rate limit. NEW in v3.2: API key is now OPTIONAL — if your workflow declares `permissions: id-token write`, the action fetches a signed GitHub OIDC token and uses it for per-repo metering (Free=30 calls/repo/mo, paid tiers same as api-key after linking the repo at cipherwake.io/account). Pass via secret: api-key set to `secrets.CIPHERWAKE_API_KEY` (or the legacy `secrets.QUANTAPACT_API_KEY` if you set it up under the old name — both names work forever).'
     required: false
     default: ''
 
