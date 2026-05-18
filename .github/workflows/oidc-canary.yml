@@ -10,16 +10,16 @@
 #   2. NO CIPHERWAKE_API_KEY secret in the workflow            ✓
 #   3. Action fetches OIDC token                                ✓
 #   4. /api/scan accepts it                                     ✓
-#   5. gh_action_repo_quota increments for cipherwakelabs/pqcheck
+#   5. gh_action_repo_quota increments for cipherwakelabs/pqcheck (verified
+#      by the X-Cipherwake-Quota-* headers reported in the response)
 #   6. Quota headers show cap/remaining/tier                    ✓
 #   7. Wrong-audience token gets 401 oidc_error_code=audience   ✓
 #
-# Two jobs:
-#   - positive: uses cipherwakelabs/pqcheck@main (this repo's own action)
-#     to scan cipherwake.com via the OIDC path. Expected: pass + visible
-#     X-Cipherwake-Quota-* headers in the Action's log notice.
-#   - negative: requests an OIDC token with the WRONG audience and POSTs
-#     it directly to /api/scan. Expected: 401 with oidc_error_code=audience.
+# Why direct curl, not the composite Action:
+# We need to read the X-Cipherwake-Quota-* response headers, which the
+# Action wrapper currently doesn't surface. The canary calls /api/scan
+# directly with the same OIDC token the Action would mint, so the OIDC
+# fetch + signature verify + repo metering paths are still tested fully.
 # =============================================================================
 
 name: OIDC canary
@@ -38,21 +38,68 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # POSITIVE — the real customer journey
+  # POSITIVE — fetch a real OIDC token + call /api/scan, verify quota headers
   # ---------------------------------------------------------------------------
   positive:
     name: Positive (OIDC happy path)
     runs-on: ubuntu-latest
     steps:
-      - name: Trust Diff via OIDC (no API key)
-        uses: cipherwakelabs/pqcheck/action@main
-        with:
-          mode: trust-diff
-          domain: cipherwake.com
-          baseline: last-week
-          fail-on: critical
-        # Deliberately no `env: CIPHERWAKE_API_KEY: ...` — this proves the
-        # action successfully falls back to GitHub OIDC.
+      - name: Fetch OIDC token + POST to /api/scan, assert quota headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Fetch OIDC token with the correct audience
+          OIDC_RESPONSE=$(curl -sS \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=cipherwake-action-v1")
+          TOKEN=$(echo "$OIDC_RESPONSE" | jq -r '.value // empty')
+          if [ -z "$TOKEN" ]; then
+            echo "::error::OIDC token fetch failed: $(echo "$OIDC_RESPONSE" | head -c 200)"
+            exit 1
+          fi
+          case "$TOKEN" in
+            *.*.*) ;;
+            *) echo "::error::Token not JWT-shaped"; exit 1 ;;
+          esac
+          echo "::notice::OIDC token fetched (JWT-shaped, audience=cipherwake-action-v1)"
+
+          # Call /api/scan with the token and capture response headers
+          curl -sS -D /tmp/headers -o /tmp/body \
+            -w "HTTP_STATUS=%{http_code}\n" \
+            -X POST "https://cipherwake.io/api/scan?domain=cipherwake.io" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{}' | tee /tmp/status
+          HTTP_STATUS=$(grep -oE 'HTTP_STATUS=[0-9]+' /tmp/status | cut -d= -f2)
+          echo "::notice::Server returned HTTP $HTTP_STATUS"
+          echo "--- response headers ---"
+          cat /tmp/headers
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "::error::Expected 200 from OIDC-authenticated /api/scan, got $HTTP_STATUS"
+            echo "--- response body ---"
+            cat /tmp/body
+            exit 1
+          fi
+
+          # Verify the quota headers were set (proves applyRepoQuota's OIDC
+          # branch fired, not the IP fallback).
+          TIER=$(grep -i 'X-Cipherwake-Quota-Tier:' /tmp/headers | tr -d '\r' | awk '{print $2}')
+          CAP=$(grep -i 'X-Cipherwake-Quota-Cap:' /tmp/headers | tr -d '\r' | awk '{print $2}')
+          REMAINING=$(grep -i 'X-Cipherwake-Quota-Remaining:' /tmp/headers | tr -d '\r' | awk '{print $2}')
+          if [ -z "$TIER" ] || [ -z "$CAP" ] || [ -z "$REMAINING" ]; then
+            echo "::error::Missing X-Cipherwake-Quota-* headers — OIDC path did not fire (IP-fallback?)"
+            exit 1
+          fi
+          if [ "$TIER" != "free" ]; then
+            echo "::error::Expected tier=free for unlinked repo, got '$TIER'"
+            exit 1
+          fi
+          if [ "$CAP" != "30" ]; then
+            echo "::error::Expected cap=30 for free tier, got '$CAP'"
+            exit 1
+          fi
+          echo "::notice::✓ OIDC happy path: tier=$TIER cap=$CAP remaining=$REMAINING"
 
   # ---------------------------------------------------------------------------
   # NEGATIVE — token with wrong audience must be rejected with code "audience"
@@ -82,7 +129,7 @@ jobs:
         run: |
           set -euo pipefail
           HTTP_STATUS=$(curl -sS -o /tmp/resp.json -w "%{http_code}" \
-            -X POST "https://cipherwake.io/api/scan?domain=cipherwake.com" \
+            -X POST "https://cipherwake.io/api/scan?domain=cipherwake.io" \
             -H "Authorization: Bearer ${BAD_TOKEN}" \
             -H "Content-Type: application/json" \
             -d '{}')
