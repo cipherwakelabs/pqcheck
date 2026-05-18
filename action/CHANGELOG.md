@@ -3,31 +3,6 @@
 All notable changes to the GitHub Action.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [v3.2.0] — 2026-05-18
-
-### Added — GitHub OIDC fallback for keyless Free-tier metering
-
-When `mode: trust-diff` is invoked WITHOUT an `api-key` input, the Action now falls back to fetching a GitHub-signed OIDC token (via the workflow's `ACTIONS_ID_TOKEN_REQUEST_*` env vars) and sends it as the `Authorization: Bearer <jwt>` to the Cipherwake API. The server verifies the JWT against GitHub's JWKS and meters per repository (Free = 30 calls/repo/month).
-
-To opt in, the workflow must declare:
-
-```yaml
-permissions:
-  id-token: write
-```
-
-The `pqcheck init` scaffold (CLI v0.12+) writes this permission line automatically. Existing workflows that already pass an explicit `api-key` are unaffected.
-
-### Hardened against self-hosted-runner edge cases
-
-- Pre-flight `command -v jq` check with a helpful error message when missing
-- JWT-shape sanity check on the fetched token before passing to the CLI
-- `unset ACTIONS_ID_TOKEN_REQUEST_TOKEN` after consumption to reduce exposure
-
-### Breaking change?
-
-No. `api-key` remains a valid input; users who already supply one keep their existing per-account quota path. The OIDC path is strictly additive for users who add `id-token: write` to their workflow permissions.
-
 ## [v3.1.0] — 2026-05-16
 
 ### Added — Sticky PR comment for Trust Diff mode

@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Trust Diff via OIDC (no API key)
-        uses: cipherwakelabs/pqcheck@main
+        uses: cipherwakelabs/pqcheck/action@main
         with:
           mode: trust-diff
           domain: cipherwake.com
