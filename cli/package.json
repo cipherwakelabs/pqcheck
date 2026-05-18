@@ -1,6 +1,6 @@
 {
   "name": "pqcheck",
-  "version": "0.13.0",
+  "version": "0.13.2",
   "description": "HTTPS posture scanner with Trust Diff for CI, vendor lockfile + drift alerts, cross-tenant key map, and HNDL/quantum-decryption risk scoring. Free, no signup.",
   "keywords": [
     "post-quantum",

@@ -42,7 +42,7 @@ Open a PR → Cipherwake comments inline when cert / SPKI / HSTS / CSP / DMARC /
 
 **Don't want to copy-paste?** Run [`npx pqcheck init`](https://www.npmjs.com/package/pqcheck) — interactive scaffold for this exact workflow.
 
-Get a free API key (30 Trust Diff calls/month) at [cipherwake.io/account#api-keys](https://cipherwake.io/account#api-keys).
+Free tier: 100 Trust Diff calls/month per repo via GitHub Actions OIDC — no API key, no repo secret required. For higher limits or off-Actions usage, generate an API key at [cipherwake.io/account#api-keys](https://cipherwake.io/account#api-keys).
 
 ## Quick start — full scan mode
 
@@ -63,7 +63,7 @@ If the score meets or exceeds `7`, the step exits `2` and the workflow fails. No
 |---|---|---|---|
 | `mode` | no | `scan` | `scan` (full Decryption Blast Radius + threshold gate) or `trust-diff` (regression vs baseline + sticky PR comment) |
 | `domain` | yes | — | Domain to scan (e.g. `example.com`) |
-| `api-key` | no | `''` | Cipherwake API key (`qpk_...`). Free: 30 Trust Diff calls/month. Required for `mode=trust-diff`. Recommended for `mode=scan` to bypass per-IP rate limits. Pass via secret: `${{ secrets.CIPHERWAKE_API_KEY }}` |
+| `api-key` | no | `''` | Cipherwake API key (`qpk_...`). **Optional** for `mode=trust-diff` — if your workflow declares `permissions: id-token: write`, the action falls back to OIDC (Free=100 calls/repo/mo). Required only when running outside Actions, or to bypass per-IP rate limits on `mode=scan`. Pass via secret: `${{ secrets.CIPHERWAKE_API_KEY }}` |
 | `comment-on-pr` | no | `false` | Post a sticky PR comment on `pull_request` events. Requires `permissions: pull-requests: write` |
 | `github-token` | no | `${{ github.token }}` | Token used to post/edit the PR comment |
 

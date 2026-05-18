@@ -22,7 +22,7 @@ Wire Cipherwake into your CI so every PR gets a Trust Diff comment when your dom
 npx pqcheck onboard cipherwake.io
 ```
 
-That runs in sequence: scan your domain → write the GitHub Action workflow → capture a vendor lockfile → generate a release checklist → open your browser to the API-key page. You finish by adding the API key as a repo secret + committing.
+That runs in sequence: scan your domain → write the GitHub Action workflow → capture a vendor lockfile → generate a release checklist → commit + push. **No API key, no repo secret.** The scaffolded workflow uses GitHub Actions OIDC (`id-token: write`) to authenticate to Cipherwake — Free includes 100 Trust Diff calls/month per repo, no setup required.
 
 **Or step-by-step if you prefer:**
 
@@ -30,20 +30,15 @@ That runs in sequence: scan your domain → write the GitHub Action workflow →
 # 1. Scaffold a GitHub Actions workflow (interactive prompts)
 npx pqcheck init
 
-# 2. Generate a free API key at https://cipherwake.io/account#api-keys
-#    (Free tier: 30 Trust Diff calls/month)
-
-# 3. Add the key as a repo secret:
-#    GitHub → Settings → Secrets → Actions → New secret
-#    Name: CIPHERWAKE_API_KEY  Value: qpk_...
-
-# 4. Commit + push
+# 2. Commit + push
 git add .github/workflows/cipherwake.yml
 git commit -m "ci: add Cipherwake Trust Diff gate"
 git push
 ```
 
-That's it. Open a PR and Cipherwake comments inline when cert / SPKI / HSTS / CSP / DMARC / vendor scripts drift since your baseline.
+That's it. The scaffolded workflow includes `permissions: id-token: write`, so the runner mints a signed OIDC token on each run and Cipherwake meters per repo — no secret to manage. Open a PR and Cipherwake comments inline when cert / SPKI / HSTS / CSP / DMARC / vendor scripts drift since your baseline.
+
+**Need higher limits?** Paid tiers (Starter $29/mo · Growth $79/mo · Scale $199/mo) lift the per-repo quota to 1,000 / 10,000 / 50,000 calls/month. Generate an API key at [/account#api-keys](https://cipherwake.io/account#api-keys), then add it as the repo secret `CIPHERWAKE_API_KEY`. The Action uses the secret when present and falls back to OIDC when not — no code change needed to upgrade.
 
 **Want more?**
 - Pre-commit hook: `npx pqcheck deploy-check <domain>` before every deploy
@@ -54,7 +49,7 @@ That's it. Open a PR and Cipherwake comments inline when cert / SPKI / HSTS / CS
 
 ## What's new in 0.12.0
 
-**Developer habit-loop bundle (locked 2026-05-16).** Five new subcommands that put Cipherwake where developers already work: PRs, CI, release notes, vendor allowlists. Free tier covers all of them within the 30 Trust Diff calls/month quota.
+**Developer habit-loop bundle (locked 2026-05-16).** Five new subcommands that put Cipherwake where developers already work: PRs, CI, release notes, vendor allowlists. Free tier covers all of them within the 100 Trust Diff calls/month per repo quota.
 
 - `pqcheck init` — interactive scaffold for `.github/workflows/cipherwake.yml`. Prompts for domain, fail-on severity, baseline. No copy-paste from docs required.
 - `pqcheck deploy-check <domain>` — pre-deploy Trust Diff gate with deploy-friendly framing. Uses last-scan as default baseline. Same exit semantics as `trust-diff`.

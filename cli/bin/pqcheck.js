@@ -2665,7 +2665,7 @@ async function runInitCommand(args) {
   console.log(`  ${color("bold", "Next steps:")}`);
   console.log("");
   console.log(`  ${color("dim", "1.")} Generate a Cipherwake API key at ${color("violet", "https://cipherwake.io/account#api-keys")}`);
-  console.log(`     ${color("dim", "Free tier: 30 Trust Diff calls/month")}`);
+  console.log(`     ${color("dim", "Free tier: 100 Trust Diff calls/month per repo")}`);
   console.log("");
   console.log(`  ${color("dim", "2.")} Add it as a repo secret:`);
   console.log(`     ${color("dim", "Settings → Secrets and variables → Actions → New repository secret")}`);
@@ -2701,7 +2701,7 @@ function renderTrustDiffWorkflow({ domain, failOn, baseline }) {
 # posture regresses vs the baseline (cert / SPKI / vendor scripts / HSTS / CSP /
 # DMARC / HNDL).
 #
-# Free tier: 30 Trust Diff calls/month per CIPHERWAKE_API_KEY.
+# Free tier: 100 Trust Diff calls/month per repo (OIDC-metered).
 # Methodology: https://cipherwake.io/methodology/
 # Action source: https://github.com/cipherwakelabs/pqcheck
 
@@ -2715,7 +2715,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write          # required for OIDC-based metering (Free=30 calls/repo/mo, no API key needed)
+  id-token: write          # required for OIDC-based metering (Free=100 calls/repo/mo, no API key needed)
   security-events: write   # required for SARIF upload to Code Scanning
   pull-requests: write     # required for sticky PR comment (Action v3.1+)
 
@@ -2762,7 +2762,7 @@ async function prompt(question) {
 //     pre-build, Netlify build commands, custom CD scripts)
 //
 // Exit codes match trust-diff: 0 pass · 1 warn · 2 fail · 3 error.
-// Consumes the same Free 30 Trust Diff calls/month quota.
+// Consumes the same Free 100 Trust Diff calls/month per repo quota.
 // =============================================================================
 
 async function runDeployCheckCommand(args) {
@@ -3310,7 +3310,7 @@ async function runOnboardCommand(args) {
   // to paste the key as a GitHub repo secret. With Action v3.2 + OIDC repo
   // metering, the scaffolded workflow has `permissions: { id-token: write }`
   // and the action fetches a GitHub-signed token automatically — no key, no
-  // secret, no browser hop. Free tier is 30 calls/repo/mo, enforced server-
+  // secret, no browser hop. Free tier is 100 calls/repo/mo, enforced server-
   // side via the `meter_gh_action_call` RPC against `gh_action_repo_quota`.
   // For higher limits, the user links this repo to a paid account at /account
   // (one-time OAuth) — still no API key in CI.

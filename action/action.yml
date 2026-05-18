@@ -70,7 +70,7 @@ inputs:
     required: false
     default: 'true'
   api-key:
-    description: 'Optional Cipherwake API key (qpk_<hex>). When set, the action authenticates with this key and uses your tier-based monthly quota (1K/10K/50K depending on Starter/Growth/Scale) instead of the per-IP rate limit. NEW in v3.2: API key is now OPTIONAL — if your workflow declares `permissions: id-token write`, the action fetches a signed GitHub OIDC token and uses it for per-repo metering (Free=30 calls/repo/mo, paid tiers same as api-key after linking the repo at cipherwake.io/account). Pass via secret: api-key set to `secrets.CIPHERWAKE_API_KEY` (or the legacy `secrets.QUANTAPACT_API_KEY` if you set it up under the old name — both names work forever).'
+    description: 'Optional Cipherwake API key (qpk_<hex>). When set, the action authenticates with this key and uses your tier-based monthly quota (1K/10K/50K depending on Starter/Growth/Scale) instead of the per-IP rate limit. NEW in v3.2: API key is now OPTIONAL — if your workflow declares `permissions: id-token write`, the action fetches a signed GitHub OIDC token and uses it for per-repo metering (Free=100 calls/repo/mo, paid tiers same as api-key after linking the repo at cipherwake.io/account). Pass via secret: api-key set to `secrets.CIPHERWAKE_API_KEY` (or the legacy `secrets.QUANTAPACT_API_KEY` if you set it up under the old name — both names work forever).'
     required: false
     default: ''
 
@@ -134,7 +134,7 @@ runs:
               echo "::error::jq is required to parse the GitHub OIDC token response. github-hosted ubuntu-latest runners ship jq by default; self-hosted runners may not. Install jq on this runner OR provide an explicit api-key input via the 'with: api-key:' input + a secret named CIPHERWAKE_API_KEY."
               exit 1
             fi
-            echo "::notice::No api-key provided. Fetching GitHub OIDC token for per-repo metering (Free: 30 calls/repo/mo)."
+            echo "::notice::No api-key provided. Fetching GitHub OIDC token for per-repo metering (Free: 100 calls/repo/mo)."
             OIDC_RESPONSE=$(curl -sS -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
               "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=cipherwake-action-v1")
             # Reduce exposure of the request token after consumption. GitHub
@@ -160,7 +160,7 @@ runs:
             esac
             export CIPHERWAKE_API_KEY
           else
-            echo "::error::Trust Diff needs auth. Either provide api-key (https://cipherwake.io/account#api-keys, Free=30/mo) OR add 'permissions: { id-token: write }' to your workflow so the action can use GitHub OIDC (Free=30/repo/mo, zero setup)."
+            echo "::error::Trust Diff needs auth. Either provide api-key (https://cipherwake.io/account#api-keys, Free=100/mo) OR add 'permissions: { id-token: write }' to your workflow so the action can use GitHub OIDC (Free=100/repo/mo, zero setup)."
             exit 1
           fi
         fi

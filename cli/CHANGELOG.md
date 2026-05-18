@@ -4,6 +4,33 @@ All notable changes to `pqcheck` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.2] — 2026-05-18
+
+### Changed — Free OIDC quota bumped 30 → 100 calls/repo/mo
+
+Server-side (Cipherwake migration `20260518c_bump_free_oidc_cap.sql`) and all
+client copy now reflect the new Free cap: **100 Trust Diff calls per repo per
+month** (was 30). Paid tiers unchanged (Starter 1K · Growth 10K · Scale 50K).
+
+Why: 30 was tuned for "solo CI on 1 domain" but bounced real evaluators — a
+small dev team doing 4-5 PRs/day burned the monthly cap inside a week, before
+seeing value. 100 covers the median active repo (~10-30 PRs/mo) comfortably
+and bites only genuinely PR-heavy CI workflows where the quota wall IS the
+qualified upgrade signal.
+
+Behaviour change is server-side; this CLI release only re-aligns the README,
+the workflow scaffold comments, and the next-step console output to the new
+number. The previously-shipped 0.13.0 wizards will keep working — they just
+under-state the Free cap until users upgrade to 0.13.2.
+
+## [0.13.1] — 2026-05-18
+
+### Fixed — README onboard description out of sync with shipped behavior
+
+The README's `Get started in 60 seconds` section still described the pre-OIDC flow ("open your browser to the API-key page", "add the API key as a repo secret + committing"). The wizard itself dropped those steps in 0.13.0, but the README didn't. This patch realigns the README with 0.13.0's actual behavior: scaffold workflow → commit + push, no API key required for the Free path. Higher-limit paid tiers are documented separately.
+
+No behavior change.
+
 ## [0.13.0] — 2026-05-18
 
 ### Added — Keyless setup via GitHub Actions OIDC (paired with Action v3.2.0)
