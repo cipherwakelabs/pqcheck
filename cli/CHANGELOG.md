@@ -4,11 +4,38 @@ All notable changes to `pqcheck` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.12.1] — 2026-05-18
+## [0.13.0] — 2026-05-18
 
-### Changed
+### Added — Keyless setup via GitHub Actions OIDC (paired with Action v3.2.0)
 
-- **npm description rewrite.** Replaces the abstract "find out how much of your data unlocks when quantum decryption arrives" with a concrete feature surface: "HTTPS posture scanner with Trust Diff for CI, vendor lockfile + drift alerts, cross-tenant key map, and HNDL/quantum-decryption risk scoring. Free, no signup." Surfaces the engineer-relatable hooks (Trust Diff, vendor allowlist, key map) alongside the HNDL/quantum moat layer. No behavior change.
+`npx pqcheck onboard <domain>` now scaffolds a GitHub workflow that uses GitHub's OIDC token instead of requiring a `CIPHERWAKE_API_KEY` repo secret. Free tier: 30 calls/repo/month, zero setup.
+
+Scaffolded `cipherwake.yml` includes `permissions: id-token: write`, which lets the Action mint a GitHub-signed JWT containing the `repository` claim. Server (cipherwake.io) verifies the JWT against GitHub's JWKS and meters per repo via the new `gh_action_repo_quota` table. Higher-limit paid tiers link the repo to a Cipherwake account via the dashboard (no API key in CI either).
+
+Setup flow before: `npx pqcheck onboard <domain>` → open browser → sign in → generate API key → copy → GitHub repo settings → New secret → paste → commit + push. **Six steps.**
+
+Setup flow now: `npx pqcheck onboard <domain>` → commit + push. **Two steps.**
+
+### Changed — onboard wizard output
+
+- Drops the "open browser to API-key page" step from the Free path.
+- Drops the "add CIPHERWAKE_API_KEY as a repo secret" instruction.
+- Now prints two next-steps (commit + push, then open a PR) instead of three.
+- Adds a footer link for higher-limit users to request repo-account linking (rolling out separately).
+- The `--no-open` flag is now a no-op (accepted for backward compat; will be removed in v1.0).
+
+### Changed — npm description
+
+Replaces the abstract "find out how much of your data unlocks when quantum decryption arrives" with a concrete feature surface: "HTTPS posture scanner with Trust Diff for CI, vendor lockfile + drift alerts, cross-tenant key map, and HNDL/quantum-decryption risk scoring. Free, no signup."
+
+### Compatibility
+
+- Workflows that explicitly pass `api-key: ${{ secrets.CIPHERWAKE_API_KEY }}` continue to work — the API-key path is unchanged. The OIDC path only fires when no key is provided AND the workflow has `id-token: write`.
+- Local CLI use (terminal, non-GitHub CI) is unchanged: per-IP rate limit for anonymous, per-account quota for `qpk_*` keys.
+
+### Fixed
+
+- Public repo URL in `package.json` corrected from the old `cipherwake-io/pqcheck` to the current `cipherwakelabs/pqcheck` (rebrand follow-up).
 
 ## [0.12.0] — 2026-05-16
 
