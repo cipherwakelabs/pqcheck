@@ -3,6 +3,91 @@
 All notable changes to the GitHub Action.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v3.4.0] — 2026-05-19
+
+### Added — `mode: preview-diff` (Preview Deploy Trust Diff)
+
+The stickiest dev-workflow mode. Compares a **preview deployment URL**
+against a **production URL** inside the PR. Surfaces new third-party
+scripts, security-header regressions (including CSP weakening like
+`script-src *` or `'unsafe-inline'` getting added), HSTS removal /
+`max-age=0`, and DBR score drops — before merge.
+
+```yaml
+- uses: cipherwakelabs/pqcheck@v3
+  with:
+    mode: preview-diff
+    preview-url: ${{ steps.vercel.outputs.preview-url }}
+    production-url: https://example.com
+    comment-on-pr: 'true'
+```
+
+New inputs (only used in `mode: preview-diff`):
+
+- `preview-url` — full URL of the preview deployment
+- `production-url` — full URL of the production canonical site
+- `compare-transport` (default `false`) — opt TLS/cert/SPKI diffs into
+  CI verdict. Default false because preview URLs typically use
+  edge-host TLS (Vercel/Netlify/Cloudflare) and direct comparison is
+  noise.
+
+The existing `fail-on` input is honored: `none` / `off` → report-only,
+anything else → CI fail on max severity ≥ threshold. Free tier silently
+downgrades to report-only and notes the upgrade hook in the PR comment.
+Starter+ honors `fail-on` for real CI gating.
+
+### Security / scan path
+
+Preview-diff uses a **dedicated SSRF-pinned scan path**
+(`runPreviewScanForDomain`) that only invokes connect-time IP-pinned
+probes: TLS handshake + page HTML fetch. It does NOT call the
+unpinned probes (cipher class / cert chain / CT logs / email security
+/ raw HTTP header fetch). Side benefit: preview-URL hostnames
+(`feature-abc.vercel.app`) never enter Cipherwake's observation
+tables — branch names stay private.
+
+Trade-off: `preview.score` and `production.score` may be `null` in the
+response (full DBR needs all components). Script / header / transport
+comparison still works fully. To get a full DBR score, run
+`npx pqcheck <domain>` separately — that path uses the standard
+`/api/scan` pipeline.
+
+### Hardening (R66 + R67 GPT review chain — both cleared 2026-05-19)
+
+- `Validate mode` step rejects unknown `mode` inputs up front (typos no
+  longer silently no-op)
+- URL validation via Node's WHATWG parser instead of metachar denylist
+  (allows query strings containing `&`)
+- PR comment construction uses `jq --arg` for marker / preview-url /
+  production-url variables (closes shell-concatenation injection on
+  URLs containing single quotes / backslashes)
+- Verdict-based exit code: `exit 2` on `verdict=fail` (CI blocked),
+  `::warning::` on `warn` (CI green to keep PR comment visible)
+
+## [v3.3.1] — 2026-05-18
+
+### Security — INPUT_DOMAIN validation across all jobs
+
+Per R52 / R51-B Q8.1 + Q8.3 review pass: the `domain` input is now validated
+against a strict hostname regex (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
+at the top of every job (`trust-diff`, the PR-comment step, and `scan`)
+before it touches any URL path, Markdown heading, badge image, or CLI
+subprocess. Invalid values fail loudly with `::error::` (PR-comment step
+downgrades to `::warning::` and skips so it never breaks the build for a
+typo in the input).
+
+Why: shell-quoted command substitution already prevented shell injection,
+but a domain containing backticks, brackets, slashes, or newlines could
+corrupt the rendered PR comment or the badge URL. Strict validation is
+the right preventative fix.
+
+### Copy — "highlight meaningful changes" replaces "flag any regressions"
+
+The first-run PR comment now says "Future PRs and pushes will compare
+against this snapshot and highlight meaningful changes." More accurate to
+what the Action does (Trust Diff surfaces material posture changes, not
+just regressions) and more developer-native voice.
+
 ## [v3.1.0] — 2026-05-16
 
 ### Added — Sticky PR comment for Trust Diff mode

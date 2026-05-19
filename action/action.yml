@@ -7,9 +7,21 @@ branding:
 
 inputs:
   mode:
-    description: 'Action mode. "scan" (default) — runs full Decryption Blast Radius scan and gates on threshold. "trust-diff" — calls /api/trust-diff and gates on regression severity vs a baseline (CLI v0.11.0+).'
+    description: 'Action mode. "scan" (default) — runs full Decryption Blast Radius scan and gates on threshold. "trust-diff" — calls /api/trust-diff and gates on regression severity vs a baseline (CLI v0.11.0+). "preview-diff" — compares a preview deployment URL against a production URL and surfaces new third-party scripts, header regressions, score drops (Action v3.3+).'
     required: false
     default: 'scan'
+  preview-url:
+    description: 'Preview deployment URL to scan (mode=preview-diff only). e.g. ${{ steps.vercel.outputs.preview_url }}'
+    required: false
+    default: ''
+  production-url:
+    description: 'Production canonical URL to compare against (mode=preview-diff only). e.g. https://example.com'
+    required: false
+    default: ''
+  compare-transport:
+    description: 'When true, transport diffs (TLS/cert/SPKI) contribute to CI verdict. Default false because preview URLs typically use edge-host TLS (Vercel/Netlify/Cloudflare) and direct comparison is noise. Set true only when both URLs are production-shaped origins you own.'
+    required: false
+    default: 'false'
   baseline:
     description: 'Trust Diff baseline (mode=trust-diff only). One of: last-week | last-month | last-scan | ISO 8601 timestamp. Default: last-week.'
     required: false
@@ -91,6 +103,19 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    # R66 (Q3.8 fix): reject unknown `mode` values up front so a typo doesn't
+    # silently no-op every subsequent step. Without this guard, `mode: prview-difff`
+    # passes through (every step's if-guard evaluates false) and the workflow
+    # exits 0 with no output — exactly the kind of "looks like it ran but
+    # didn't" failure mode that makes a CI gate untrustworthy.
+    - name: Validate mode
+      shell: bash
+      run: |
+        case "${{ inputs.mode }}" in
+          scan|trust-diff|preview-diff) ;;
+          *) echo "::error::Unknown 'mode' input: '${{ inputs.mode }}'. Valid values: scan | trust-diff | preview-diff."; exit 1 ;;
+        esac
+
     # CLI v0.11.0 (locked 2026-05-16): Trust Diff mode. Calls /api/trust-diff
     # with the configured baseline + fail-on threshold. Exits 2 on fail, 1 on
     # warn, 0 on pass. Skipped entirely when mode != "trust-diff".
@@ -115,6 +140,19 @@ runs:
         QUANTAPACT_API_KEY: ${{ inputs.api-key }}
       run: |
         set -euo pipefail
+        # R52 / R51-B Q8.1 + Q8.3: validate INPUT_DOMAIN before it touches
+        # Markdown, URLs, or badge paths. Command substitution + shell
+        # quoting already prevent code execution, but a domain containing
+        # backticks, brackets, slashes, or newlines can break the PR
+        # comment Markdown and the badge URL. Fail loudly with the rejected
+        # value so users can fix their workflow rather than ship corrupted
+        # comments.
+        if ! printf '%s' "$INPUT_DOMAIN" | grep -Eiq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'; then
+          echo "::error::Invalid 'domain' input: '$INPUT_DOMAIN'. Pass a hostname like example.com — no protocol, path, or wildcards."
+          exit 1
+        fi
+        INPUT_DOMAIN="$(printf '%s' "$INPUT_DOMAIN" | tr '[:upper:]' '[:lower:]')"
+
         # v3.2 OIDC fallback. If no api-key was provided AND the workflow
         # declared `permissions: { id-token: write }`, fetch a GitHub-signed
         # OIDC token and use that as the Bearer. The server distinguishes a
@@ -223,7 +261,7 @@ runs:
               if [ "$IS_FIRST_RUN" = "true" ]; then
                 echo "## 🟢 Cipherwake Trust Diff for \`$INPUT_DOMAIN\` — first run"
                 echo ""
-                echo "**First baseline captured.** Cipherwake recorded the current cert chain, SPKI, security headers, and observed third-party scripts for \`$INPUT_DOMAIN\`. Future PRs and pushes will diff against this snapshot and flag any regressions."
+                echo "**First baseline captured.** Cipherwake recorded the current cert chain, SPKI, security headers, and observed third-party scripts for \`$INPUT_DOMAIN\`. Future PRs and pushes will compare against this snapshot and highlight meaningful changes."
                 echo ""
                 echo "### What happens next"
                 echo ""
@@ -316,6 +354,14 @@ runs:
         SUMMARY: ${{ steps.trust-diff.outputs.trust-diff-markdown }}
       run: |
         set -euo pipefail
+        # R52 / R51-B Q8.1: validate INPUT_DOMAIN before it appears in the
+        # dedup marker. Markdown / URL safety is also relevant since the
+        # Trust Diff step's $SUMMARY may already have used $INPUT_DOMAIN.
+        if ! printf '%s' "$INPUT_DOMAIN" | grep -Eiq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'; then
+          echo "::warning::Skipping Cipherwake PR comment: invalid 'domain' input: '$INPUT_DOMAIN'."
+          exit 0
+        fi
+        INPUT_DOMAIN="$(printf '%s' "$INPUT_DOMAIN" | tr '[:upper:]' '[:lower:]')"
         # R40 fix (Q1.5): sticky-comment dedup uses a hidden HTML marker
         # bound to (action+version+domain), NOT the visible heading text.
         # A user pasting "Cipherwake Trust Diff for ..." into a comment
@@ -386,8 +432,247 @@ runs:
           fi
         fi
 
+    # ========================================================================
+    # Preview Deploy Trust Diff (mode=preview-diff)
+    # ========================================================================
+    # V1 (Action v3.3, locked 2026-05-19): compares two URLs in one call —
+    # preview-url (PR deployment) vs production-url (canonical site).
+    # Surfaces new third-party scripts + header regressions + score drops
+    # inside the PR review loop.
+    #
+    # Free tier: 100/repo/mo, report-only (no CI fail).
+    # Starter+: CI fail rules unlock via `fail-on` input (server downgrades
+    #           silently on free tier and notes the upgrade hook in the comment).
+    #
+    # Auth: same OIDC chain as trust-diff. No API key required for Free.
+    # ========================================================================
+    - name: Preview Trust Diff
+      id: preview-diff
+      if: inputs.mode == 'preview-diff'
+      shell: bash
+      env:
+        INPUT_PREVIEW_URL: ${{ inputs.preview-url }}
+        INPUT_PRODUCTION_URL: ${{ inputs.production-url }}
+        INPUT_COMPARE_TRANSPORT: ${{ inputs.compare-transport }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_COMMENT_ON_PR: ${{ inputs.comment-on-pr }}
+        INPUT_EVENT_NAME: ${{ github.event_name }}
+        CIPHERWAKE_API_KEY: ${{ inputs.api-key }}
+      run: |
+        set -euo pipefail
+        if [ -z "$INPUT_PREVIEW_URL" ] || [ -z "$INPUT_PRODUCTION_URL" ]; then
+          echo "::error::preview-diff mode requires both 'preview-url' and 'production-url' inputs."
+          exit 1
+        fi
+        # R66 (Q3.1 fix): URL validation via Node's WHATWG parser instead of
+        # a brittle metachar denylist. The denylist rejected legitimate query
+        # strings containing `&`. Server-side does the SSRF check anyway
+        # (assertResolvesToPublicAddress); the Action's responsibility here
+        # is just to ensure the URLs are well-formed http(s) before we
+        # serialize them into the API request body.
+        if ! node -e '
+          for (const v of [process.env.INPUT_PREVIEW_URL, process.env.INPUT_PRODUCTION_URL]) {
+            try {
+              const u = new URL(v);
+              if (u.protocol !== "https:" && u.protocol !== "http:") {
+                console.error("::error::URL must use http(s) scheme: " + v); process.exit(1);
+              }
+            } catch (e) {
+              console.error("::error::URL is not parseable: " + v); process.exit(1);
+            }
+          }
+        '; then
+          exit 1
+        fi
+
+        # OIDC fallback (same shape as Trust Diff step).
+        if [ -z "${CIPHERWAKE_API_KEY}" ]; then
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            if ! command -v jq >/dev/null 2>&1; then
+              echo "::error::jq is required to parse the GitHub OIDC token. Install it on this runner or pass an explicit api-key."; exit 1
+            fi
+            echo "::notice::Preview Diff: fetching GitHub OIDC token (Free: 100 calls/repo/mo)."
+            OIDC_RESPONSE=$(curl -sS -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=cipherwake-action-v1")
+            unset ACTIONS_ID_TOKEN_REQUEST_TOKEN
+            CIPHERWAKE_API_KEY=$(echo "$OIDC_RESPONSE" | jq -r '.value // empty')
+            if [ -z "${CIPHERWAKE_API_KEY}" ]; then
+              echo "::error::OIDC token fetch failed."; head -c 200 <<<"$OIDC_RESPONSE"; exit 1
+            fi
+            case "$CIPHERWAKE_API_KEY" in *.*.*) ;; *)
+              echo "::error::OIDC response was not a JWT."; exit 1 ;;
+            esac
+            export CIPHERWAKE_API_KEY
+          else
+            echo "::error::Preview Diff needs auth. Add 'permissions: { id-token: write }' to the workflow, or pass an api-key."
+            exit 1
+          fi
+        fi
+
+        # R66 (B4 fix): policy_mode mirrors the user's intent.
+        # `fail-on: none` (case-insensitive) → report-only; any other value
+        # → fail mode (server downgrades for Free tier and notes it in the
+        # response via downgraded_from_fail). Default `fail-on: high` means
+        # paid users get CI gating out of the box.
+        POLICY_MODE="fail"
+        case "$(printf '%s' "$INPUT_FAIL_ON" | tr '[:upper:]' '[:lower:]')" in
+          none|off|"") POLICY_MODE="report" ;;
+        esac
+
+        echo "Cipherwake Preview Diff: preview=$INPUT_PREVIEW_URL production=$INPUT_PRODUCTION_URL policy=$POLICY_MODE fail-on=$INPUT_FAIL_ON"
+        RESP=$(mktemp)
+        HTTP=$(curl -sS -w "%{http_code}" -o "$RESP" \
+          -X POST "https://cipherwake.io/api/preview-diff" \
+          -H "Authorization: Bearer ${CIPHERWAKE_API_KEY}" \
+          -H "Content-Type: application/json" \
+          --data "$(jq -n \
+            --arg p "$INPUT_PREVIEW_URL" \
+            --arg q "$INPUT_PRODUCTION_URL" \
+            --arg fo "$INPUT_FAIL_ON" \
+            --arg pm "$POLICY_MODE" \
+            --argjson ct "$INPUT_COMPARE_TRANSPORT" \
+            '{preview_url:$p, production_url:$q, fail_on:$fo, compare_transport:$ct, policy_mode:$pm}')")
+        if [ "$HTTP" -lt 200 ] || [ "$HTTP" -ge 300 ]; then
+          echo "::error::Preview Diff API returned HTTP $HTTP"
+          head -c 1000 "$RESP"; echo ""
+          exit 1
+        fi
+
+        # Surface the diff as a workflow summary + step output for the PR
+        # comment step below. We do NOT exit non-zero on Free tier (server
+        # downgrades policy_mode to report); paid tiers can opt into fail.
+        VERDICT=$(jq -r '.result.verdict' < "$RESP")
+        MAX_SEV=$(jq -r '.result.max_severity' < "$RESP")
+        SUMMARY_LINES=$(jq -r '.result.summary_lines[]' < "$RESP")
+        DOWNGRADED=$(jq -r '.downgraded_from_fail' < "$RESP")
+        PREVIEW_SCORE=$(jq -r '.preview.score // "—"' < "$RESP")
+        PROD_SCORE=$(jq -r '.production.score // "—"' < "$RESP")
+
+        {
+          echo "## 🔬 Cipherwake Preview Trust Diff"
+          echo ""
+          echo "**Preview:** \`$INPUT_PREVIEW_URL\` (DBR: $PREVIEW_SCORE)"
+          echo "**Production:** \`$INPUT_PRODUCTION_URL\` (DBR: $PROD_SCORE)"
+          echo ""
+          echo "**Verdict:** $VERDICT (max severity: $MAX_SEV)"
+          echo ""
+          echo "**Application surface changes:**"
+          echo "$SUMMARY_LINES" | sed 's/^/- /'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        # Build a hidden-marker comment block for the PR comment step.
+        # R66 (B3 fix): construct the jq program with --arg, NOT shell
+        # concatenation. The previous form interpolated $INPUT_PREVIEW_URL
+        # into the jq program string, which would break (or worse, inject)
+        # on URLs containing single quotes or backslashes. --arg passes the
+        # value as a jq variable, escaped by jq's own JSON encoder.
+        MARKER="cipherwake-preview-diff-comment:v1 preview=$(printf '%s' "$INPUT_PREVIEW_URL" | sha256sum | cut -c1-12)"
+        COMMENT_BODY=$(jq -r \
+          --arg marker "$MARKER" \
+          --arg preview "$INPUT_PREVIEW_URL" \
+          --arg production "$INPUT_PRODUCTION_URL" \
+          '
+            .result |
+            "<!-- \($marker) -->\n" +
+            "### 🔬 Cipherwake Preview Trust Diff\n\n" +
+            "**Preview:** `\($preview)`\n" +
+            "**Production:** `\($production)`\n\n" +
+            "**Verdict:** \(.verdict) (max severity: \(.max_severity))\n\n" +
+            "**Application surface:**\n" +
+            (.summary_lines | map("- " + .) | join("\n"))
+          ' < "$RESP")
+        {
+          echo "preview-diff-markdown<<EOF_MD"
+          echo "$COMMENT_BODY"
+          echo "EOF_MD"
+        } >> "$GITHUB_OUTPUT"
+
+        if [ "$DOWNGRADED" = "true" ]; then
+          echo "::notice::Free tier is report-only. Starter (\$29/mo) unlocks CI fail rules + approved-vendor allowlist."
+        fi
+
+        # R66 (B4 fix): exit code now mirrors the server's verdict.
+        # - verdict=fail (paid tier with policy_mode=fail + max_severity >= fail_on)
+        #   → exit 2 (CI block)
+        # - verdict=warn (paid tier with regression below threshold, OR free
+        #   tier with any regression) → exit 1 emitted as ::warning::, but
+        #   CI is not blocked (exit 0 to keep PR comment visible)
+        # - verdict=pass → exit 0
+        case "$VERDICT" in
+          fail)
+            echo "::error::Preview Trust Diff: regression at or above fail-on=$INPUT_FAIL_ON. CI blocked."
+            exit 2
+            ;;
+          warn)
+            echo "::warning::Preview Trust Diff: changes observed below fail-on threshold. CI not blocked."
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+
+    # Sticky PR comment for Preview Diff.
+    - name: Comment on pull request (Preview Diff)
+      if: |
+        always() &&
+        inputs.mode == 'preview-diff' &&
+        inputs.comment-on-pr == 'true' &&
+        github.event_name == 'pull_request' &&
+        steps.preview-diff.outputs.preview-diff-markdown != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        SUMMARY: ${{ steps.preview-diff.outputs.preview-diff-markdown }}
+        INPUT_PREVIEW_URL: ${{ inputs.preview-url }}
+      run: |
+        set -euo pipefail
+        MARKER="cipherwake-preview-diff-comment:v1 preview=$(printf '%s' "$INPUT_PREVIEW_URL" | sha256sum | cut -c1-12)"
+        LIST_BODY=$(mktemp)
+        LIST_CODE=$(curl -sS -w "%{http_code}" -o "$LIST_BODY" \
+          -H "Authorization: Bearer $GH_TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments?per_page=100")
+        if [ "$LIST_CODE" -lt 200 ] || [ "$LIST_CODE" -ge 300 ]; then
+          echo "::warning::Cipherwake Preview Diff PR comment list failed with HTTP $LIST_CODE."
+          head -c 500 "$LIST_BODY"; echo ""
+          exit 0
+        fi
+        EXISTING_ID=$(jq -r --arg m "$MARKER" '[.[] | select(.body | contains($m))] | .[0].id // empty' < "$LIST_BODY")
+        # Defense-in-depth: strip image markdown + raw HTML from line 2+
+        SUMMARY_HEAD=$(printf '%s' "$SUMMARY" | head -n 1)
+        SUMMARY_REST=$(printf '%s' "$SUMMARY" | tail -n +2 \
+          | sed -E 's/!\[[^]]*\]\([^)]*\)//g' \
+          | sed -E 's/<[^>]+>//g')
+        SAFE_SUMMARY="${SUMMARY_HEAD}"$'\n'"${SUMMARY_REST}"
+        BODY=$(jq -n --arg b "$SAFE_SUMMARY" '{body: $b}')
+        WRITE_BODY=$(mktemp)
+        if [ -n "$EXISTING_ID" ] && [ "$EXISTING_ID" != "null" ]; then
+          HTTP_CODE=$(curl -sS -w "%{http_code}" -o "$WRITE_BODY" \
+            -X PATCH \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/issues/comments/$EXISTING_ID" \
+            -d "$BODY")
+        else
+          HTTP_CODE=$(curl -sS -w "%{http_code}" -o "$WRITE_BODY" \
+            -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
+            -d "$BODY")
+        fi
+        if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+          echo "Preview Diff PR comment posted/updated."
+        else
+          echo "::warning::Preview Diff PR comment write failed with HTTP $HTTP_CODE."
+          head -c 500 "$WRITE_BODY"; echo ""
+        fi
+
     - id: scan
-      if: inputs.mode != 'trust-diff'
+      if: inputs.mode != 'trust-diff' && inputs.mode != 'preview-diff'
       shell: bash
       env:
         INPUT_DOMAIN: ${{ inputs.domain }}
@@ -401,6 +686,14 @@ runs:
         QUANTAPACT_API_KEY: ${{ inputs.api-key }}
       run: |
         set -euo pipefail
+        # R52 / R51-B Q8.1: validate INPUT_DOMAIN before it touches URLs,
+        # the Markdown summary, or the CLI subprocess. Same hostname-only
+        # regex as the Trust Diff job — keep the two in sync.
+        if ! printf '%s' "$INPUT_DOMAIN" | grep -Eiq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'; then
+          echo "::error::Invalid 'domain' input: '$INPUT_DOMAIN'. Pass a hostname like example.com — no protocol, path, or wildcards."
+          exit 1
+        fi
+        INPUT_DOMAIN="$(printf '%s' "$INPUT_DOMAIN" | tr '[:upper:]' '[:lower:]')"
 
         # First-run onboarding nudge: when no api-key is configured, surface
         # a one-line tip so the operator knows there's a higher-limit path.
@@ -560,7 +853,7 @@ runs:
         fi
 
     - name: Generate SARIF report
-      if: inputs.mode != 'trust-diff' && inputs.generate-sarif == 'true'
+      if: inputs.mode != 'trust-diff' && inputs.mode != 'preview-diff' && inputs.generate-sarif == 'true'
       shell: bash
       env:
         INPUT_DOMAIN: ${{ inputs.domain }}
@@ -579,7 +872,7 @@ runs:
         echo "  with sarif_file: $SARIF_PATH"
 
     - name: Generate cipherwake.lock
-      if: inputs.mode != 'trust-diff' && inputs.generate-lockfile == 'true'
+      if: inputs.mode != 'trust-diff' && inputs.mode != 'preview-diff' && inputs.generate-lockfile == 'true'
       shell: bash
       env:
         INPUT_DOMAIN: ${{ inputs.domain }}
@@ -598,7 +891,7 @@ runs:
         echo "Use github/upload-artifact@v4 to retain across runs, or commit them to track posture changes in PR diffs."
 
     - name: Supply-chain change detection
-      if: inputs.mode != 'trust-diff' && inputs.supply-chain-baseline != ''
+      if: inputs.mode != 'trust-diff' && inputs.mode != 'preview-diff' && inputs.supply-chain-baseline != ''
       shell: bash
       env:
         INPUT_DOMAIN: ${{ inputs.domain }}
