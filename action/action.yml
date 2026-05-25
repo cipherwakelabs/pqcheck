@@ -11,7 +11,7 @@ inputs:
     required: false
     default: 'scan'
   preview-url:
-    description: 'Preview deployment URL to scan (mode=preview-diff only). e.g. ${{ steps.vercel.outputs.preview_url }}'
+    description: 'Preview deployment URL to scan (mode=preview-diff only). e.g. the previous step's preview_url output'
     required: false
     default: ''
   production-url:
