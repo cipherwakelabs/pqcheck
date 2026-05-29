@@ -3,6 +3,65 @@
 All notable changes to the GitHub Action.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v4.0.0] — 2026-05-29
+
+### Changed — `action.yml` lives at repo root now (Marketplace listing requirement)
+
+Same Action, cleaner ref. Use:
+
+```yaml
+- uses: cipherwakelabs/pqcheck@v4
+```
+
+instead of the v3 sub-path form `cipherwakelabs/pqcheck/action@v3`. v3 stays live for backward-compat — existing workflows keep working indefinitely. v4 is identical in behavior; the only change is the manifest's location in the repo.
+
+### Why this version exists
+
+GitHub Marketplace requires `action.yml` at the repo root to publish a listing. v3's sub-path layout (`/action/action.yml`) blocked the Marketplace listing checkbox from appearing on releases. v4 moves the canonical manifest to root so the Action shows up in Marketplace search results (positioned under **AI-assisted** + **Security** categories). v3 customers see zero impact.
+
+### Migration (optional, not required for existing customers)
+
+If you're on v3 and want to move to v4:
+
+```diff
+-      - uses: cipherwakelabs/pqcheck/action@v3
++      - uses: cipherwakelabs/pqcheck@v4
+```
+
+No other changes. All inputs/outputs/behavior identical.
+
+## [server-side fixes] — 2026-05-20
+
+### Fixed (server-side — affects Action results, no Action version bump)
+
+Server-side data-path bug fixes that flow through to every `mode: preview-diff`,
+`mode: deps`, and `mode: scan` run. Action version doesn't change; the data
+the Action surfaces in PR comments / CI logs / SARIF reports just got more
+accurate.
+
+- **Preview Trust Diff PR comment is no longer always-empty for vendor
+  changes.** The underlying `scanPublicDeps` probe wasn't wired into the
+  production scan path, so the third-party-script section of `preview-diff`
+  output produced 0 deltas regardless of what changed. Now it correctly
+  shows added/removed hosts.
+- **89% more apex domains scan successfully.** Apex-to-www redirects
+  (microsoft.com, google.com, stripe.com, …) now follow up to 2 hops with
+  full SSRF re-validation. Previously they collapsed to "scanner couldn't
+  reach the site" silently.
+- **HTML-comment vendor tags no longer counted as live third parties.**
+  Removed-by-comment vendor `<script>` tags no longer trigger false-positive
+  "new vendor host" PR comments.
+- **`--threshold` / `--fail-on` gating produces stable exit codes.** The DBR
+  score on flagship sites was oscillating ±1.0 daily because of probe-data
+  variance; that's fixed via a stale-cache fallback. Daily CI runs against
+  stable sites should now stop seeing false-fail cycles.
+- **PR-comment "since previous scan" reason** is now populated when the
+  diff includes a score change. Previously the `score-delta` line was bare;
+  now it carries `prior 5.2 → current 6.0 (Δ +0.8)` from `change_reason`.
+
+No `action.yml` changes. No version bump. Workflows pinned to `cipherwakelabs/pqcheck@v3`
+get the improvement on the next run.
+
 ## [v3.4.0] — 2026-05-19
 
 ### Added — `mode: preview-diff` (Preview Deploy Trust Diff)
