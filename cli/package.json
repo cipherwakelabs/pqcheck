@@ -1,24 +1,32 @@
 {
   "name": "pqcheck",
-  "version": "0.13.2",
-  "description": "HTTPS posture scanner with Trust Diff for CI, vendor lockfile + drift alerts, cross-tenant key map, and HNDL/quantum-decryption risk scoring. Free, no signup.",
+  "version": "0.16.15",
+  "description": "Deploy gate for AI-coded web apps. `pqcheck deploy-check --ai` returns ship_decision=pass|review|block for Claude Code / Cursor / Copilot / Aider to gate deploys before they ship. Anonymous, no signup, free for first use.",
   "keywords": [
-    "post-quantum",
-    "cryptography",
+    "ai-coder",
+    "claude-code",
+    "cursor",
+    "copilot",
+    "aider",
+    "deploy-gate",
+    "deploy-check",
+    "ai-coder-mode",
+    "ship-decision",
+    "deploy-guard",
+    "ci",
     "security",
     "tls",
     "ssl",
     "scanner",
+    "post-quantum",
     "harvest-now-decrypt-later",
     "hndl",
     "blast-radius",
     "pqc",
-    "quantum",
-    "crypto-audit",
-    "crypto-inventory"
+    "quantum"
   ],
   "homepage": "https://cipherwake.io",
-  "bugs": "https://cipherwake.io",
+  "bugs": "https://github.com/cipherwakelabs/pqcheck/issues",
   "repository": {
     "type": "git",
     "url": "https://github.com/cipherwakelabs/pqcheck.git",
@@ -31,7 +39,10 @@
     "node": ">=18"
   },
   "bin": {
-    "pqcheck": "./bin/pqcheck.js"
+    "pqcheck": "./bin/pqcheck.js",
+    "cipherwake-statusline": "./bin/cipherwake-statusline.js",
+    "cipherwake-chat-hook": "./bin/cipherwake-chat-hook.js",
+    "cipherwake-prompt-hook": "./bin/cipherwake-prompt-hook.js"
   },
   "files": [
     "bin/",

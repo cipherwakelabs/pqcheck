@@ -1,14 +1,166 @@
 # pqcheck
 
-> **Decryption Blast Radius scanner** — find out how much of your data unlocks when quantum decryption arrives.
+> **Type `npx pqcheck stripe.com`** (or any HTTPS domain) to scan its public posture in seconds — Decryption Blast Radius grade (0–10), letter (A–F), and findings ranked by severity. No signup, no API key, per-IP rate limited.
+>
+> **Or, for your own deploys:** wire `npx pqcheck deploy-check yourdomain.com --ai` into Claude Code / Cursor / Copilot. Your AI coder parses `ship_decision=pass|review|block` and decides whether to announce the deploy, ask you, or stop.
+
+[![npm version](https://img.shields.io/npm/v/pqcheck.svg?style=flat-square&color=06b6d4)](https://www.npmjs.com/package/pqcheck)
+[![npm downloads](https://img.shields.io/npm/dm/pqcheck.svg?style=flat-square&color=06b6d4)](https://www.npmjs.com/package/pqcheck)
+[![license](https://img.shields.io/npm/l/pqcheck.svg?style=flat-square&color=06b6d4)](./LICENSE)
+
+> **Latest: v0.16.12** — ⚠️ **Existing GitHub Action users:** one-line fix required in `.github/workflows/cipherwake.yml` (`uses: cipherwakelabs/pqcheck@v3` → `cipherwakelabs/pqcheck/action@v3`). The old ref was broken since v0.15 and silently failed every CI run; today's end-to-end test caught it. Re-running `pqcheck onboard` also regenerates the workflow correctly. Plus: README rewritten to advertise both `pqcheck <domain>` and `pqcheck deploy-check --ai` equally, rate limits corrected. [Full changelog →](./CHANGELOG.md)
+
+## Two ways to use it
+
+### 1. Scan any domain — no signup, no API key, no per-account quota
 
 ```bash
 npx pqcheck stripe.com
 ```
 
-Zero install. Works in any terminal with Node 18+. Free, no signup, no API key.
+```
+◆ Cipherwake · stripe.com  DBR 2.3 B · 1 finding
 
-The same scanner that powers [cipherwake.io](https://cipherwake.io), the browser extension, and the GitHub Action.
+Top finding:
+  [MEDIUM] Intermediate cert uses RSA — quantum-vulnerable chain link
+
+Full report: https://cipherwake.io/r/stripe.com
+```
+
+Anonymous. Per-IP rate limited (120 scans/hour) for cost protection — that's it. Use it to spot-check a vendor before signing, audit a competitor's HTTPS posture, or just satisfy "I wonder how `<domain>` grades."
+
+### 2. Gate your own deploys with your AI coder
+
+```bash
+npx pqcheck deploy-check yourdomain.com --ai
+```
+
+```
+◆ Cipherwake · yourdomain.com ⚠ REVIEW · 2 changes since last scan · HIGH
+
+Surface changes:
+  + New third-party script: widget.intercom.io
+  ~ Strict-Transport-Security weakened: max-age=31536000 → max-age=3600
+
+CIPHERWAKE_AI_GUARD_RESULT
+ship_decision=review
+top_issue=vendor.new_third_party_script
+END_CIPHERWAKE_AI_GUARD_RESULT
+```
+
+The last block — `CIPHERWAKE_AI_GUARD_RESULT` — is what your AI coding agent parses. It contains a single field, `ship_decision=pass|review|block`, that tells the agent whether to:
+
+- **pass** — go ahead and announce the deploy is shipped
+- **review** — stop and ask you what to do (your HTTPS posture drifted vs. last scan)
+- **block** — refuse to announce until you investigate (something critical changed)
+
+Zero install. Works in any terminal with Node 18+. Both modes are free — no signup, no API key required for first use of either.
+
+## What pqcheck actually checks
+
+### Bare scan (`pqcheck <domain>`) — current-state posture grade
+
+Scans any public HTTPS surface and produces a **DBR score** (0–10), a **letter grade** (A–F), and a **findings list** ranked by severity. Same scanner that powers [cipherwake.io](https://cipherwake.io), the browser extension, and the GitHub Action — what it checks:
+
+- **TLS posture** — ciphersuite class, hybrid PQC key agreement (`X25519MLKEM768`), forward secrecy
+- **Certificate chain** — issuer, intermediate quality, key reuse across rotations (★ unique to pqcheck), wildcard / subdomain blast radius
+- **Security headers** — HSTS (preload + max-age), CSP, X-Frame-Options, Referrer-Policy, Permissions-Policy, COOP, CORP
+- **Email security** — SPF, DMARC, DKIM (~30 selectors probed including Resend/Mailgun/SES), BIMI
+- **Supply chain** — every third-party script loaded by the page, graded for quantum risk
+- **Subdomain takeover** — fingerprint scan against AWS S3, GitHub Pages, Heroku, Shopify, Fastly, etc.
+
+### Deploy gate (`pqcheck deploy-check --ai`) — drift since your last scan
+
+Compares your site's public HTTPS surface *now* against your last scan and surfaces what changed:
+
+- **New third-party scripts** loading on the page that weren't there before (the Polyfill.io-class supply-chain risk)
+- **Header regressions** — CSP weakened, HSTS shortened or removed, X-Frame-Options dropped, permissive tokens (`'unsafe-inline'`, `*`) introduced
+- **Certificate / SPKI changes** — unexpected rotations, key reuse across renewals, intermediate-chain changes
+- **TLS posture changes** — ciphersuite shifts, hybrid PQC key-agreement added or removed
+- **Vendor surface changes** — new email senders (SPF/DMARC), new CDN origins, new analytics endpoints
+- **Subdomain takeover exposure** — new dangling CNAMEs
+
+The gate routes each change through the same DBR severity model above to decide `pass` / `review` / `block`. Cosmetic drift passes; high-severity drift (new script from an unknown origin, header regression that breaks defense-in-depth, cert SPKI change without a rotation event) triggers `review`; critical drift (expired cert served, takeover-vulnerable subdomain, malicious vendor injected) triggers `block`. DBR's full severity rubric: [/methodology/decryption-blast-radius](https://cipherwake.io/methodology/decryption-blast-radius).
+
+On **first use** with no prior scan to diff against, `deploy-check` falls back to the bare scan's absolute-posture grading to give you a baseline. Every subsequent run is drift-relative to the previous scan.
+
+---
+
+## Commands at a glance
+
+Grouped by intent: **deploy gate** (the flagship wedge) → **drift comparison** (the engine the gate runs on) → **AI setup / install** → **workflow scaffolds** → **committable artifacts** → **posture grade + tracking** → **diagnostic**. Every CLI command is listed here exactly once; flags / output formats / exit codes are in [Flags, formats & exit codes](#flags-formats--exit-codes) further down.
+
+| Command | What it gives you |
+|---|---|
+| **Deploy gate — the flagship wedge** | |
+| `npx pqcheck deploy-check <domain> --ai` | **The flagship.** Scans the domain, compares against the previous scan (first run sets the baseline), and emits a `ship_decision=pass\|review\|block` field your AI coding agent parses to decide whether to announce the deploy, ask you, or stop. Works anonymously — no signup needed. |
+| **`npx pqcheck guard --domain <D> -- <cmd>`** | **Deploy guard wrapper.** Wraps any deploy command. Runs `deploy-check` first; conditionally runs `<cmd>` based on `ship_decision`. Modes: `--gate-mode balanced` (default) / `advisory` / `strict`. ONE command instead of two — the strongest single artifact for AI-coder workflows because the AI never has to remember to chain check + deploy. |
+| **`--ai` flag** (any of the above) | **AI Coder Mode.** Three-layer output (banner / body / structured `CIPHERWAKE_AI_GUARD_RESULT` block) tuned for Claude Code / Cursor / Aider / Zed. Includes a `ship_decision=pass\|review\|block` field your AI coworker parses to decide whether to announce the deploy, ask you, or revert. See [/methodology/ai-coder-mode](https://cipherwake.io/methodology/ai-coder-mode). |
+| **Drift comparison — what the gate runs on** | |
+| `npx pqcheck trust-diff <domain>` | Compare today's HTTPS surface against a saved baseline (last week / last month / a saved CI baseline). For CI gates and release checklists. |
+| `npx pqcheck preview-diff --preview <URL> --production <URL>` | Compare a Vercel/Netlify preview deployment URL to production. Surfaces new third-party scripts, header regressions, and DBR score drops *inside the PR*, before merge. Renders per-signal N vs N+1 status on every run (scripts, headers, cert SPKI, TLS, …) so you can see *every* check fired, not just "did something change." Add `--verbose` for the full side-by-side table. |
+| **AI setup / install** | |
+| **`npx pqcheck setup --auto --domain <D>`** | **One-command full setup for every AI coder.** Installs (idempotently): GitHub Action workflow, AI Coder Protocol across all detected rules files (Claude / Cursor / Copilot / Aider / Windsurf / Continue / Cline / AGENTS.md) using fenced markers (`<!-- CIPHERWAKE_AI_CODER_PROTOCOL_START/END -->`), git pre-push hook, Claude Code statusLine + 2 hooks (PostToolUse Bash + **UserPromptSubmit**), per-repo `.cipherwake/last-status.json` for Cursor / Copilot / Continue to read as context. Skip flags available. Backups taken before any `~/.claude/settings.json` write. Audit trail at `~/.config/cipherwake/install-prefs.json`; install manifest at `~/.config/cipherwake/install-manifest.json`. |
+| **`npx pqcheck setup --plan --domain <D>`** | **Dry-run mode.** Prints every file change `--auto` would make (target paths + operation type: create / append-markered / deep-merge / backup-first) without writing anything. Run this first when you're not sure what `--auto` will touch. |
+| **`npx pqcheck protocol install`** | **Opt-in installer** for the AI Coder Protocol — appends the pre-deploy verification rule to your `CLAUDE.md` / `.cursorrules` / `.aider.conf.yml` with explicit consent (Rule 17). One upfront question (auto / manual / no). Never silent writes. |
+| **`UserPromptSubmit` hook** | **Claude sees `ship_decision` before responding to every prompt.** When `pqcheck setup --auto` runs, it wires `cipherwake-prompt-hook` as a Claude Code UserPromptSubmit hook. On every user prompt, the hook injects `additionalContext` with the current scan's `ship_decision` IF it's `review`/`block` and the state is <24h old. Silent when state is missing, stale, or `pass`. Different timing from the PostToolUse chat-hook: this fires *before* Claude thinks (proactive), the chat-hook fires *after* a Bash command (reactive). |
+| **Per-repo state file** `.cipherwake/last-status.json` | **Cursor / Copilot / Continue read this for workspace context.** Every `pqcheck` scan writes the same payload as the per-user file. Created by `setup --auto`; auto-added to `.gitignore` (per-developer state, not committable). Gives AI agents inside VS Code-family editors a repo-local artifact they pick up automatically when reading workspace files. |
+| **Workflow scaffolds** | |
+| `npx pqcheck onboard <domain>` | One command: scan → scaffold the GitHub Action → capture a vendor lockfile → set a baseline → commit + push. Zero copy-paste from docs. |
+| `npx pqcheck init` | Interactive scaffold for `.github/workflows/cipherwake.yml`. Use when you want manual control instead of `onboard`'s all-in-one flow. |
+| `npx pqcheck release-checklist [domain]` | Pre-release trust checklist (markdown, offline). Paste into release notes. |
+| `npx pqcheck vendors export/check/sync <domain>` | Vendor lockfile (`cipherwake.vendors.json`) + CI gate that exits non-zero when a new third-party origin appears. Like `package-lock.json` for vendor scripts. |
+| **Committable artifacts (SBOM-style)** | |
+| `npx pqcheck lock <domain>` | Generate `cipherwake.lock` (QXM committable manifest) + human-readable `cipherwake-report.md`. SBOM-style artifact for quantum exposure — commit both, diff in PRs. |
+| `npx pqcheck diff <old.lock> <new.lock>` | Compare two QXM lockfiles; exit 2 on regression. For CI PR-comment diffs. |
+| `npx pqcheck deps <domain>` | Scan all third-party origins on the page (supply-chain HNDL grading). `--lock` writes `cipherwake-deps.lock` + `.md`; `--allowlist`, `--baseline`, `--fail-on-new` for CI vendor gates. |
+| `npx pqcheck cert <file.pem>` | Analyze a local PEM/CRT cert file offline (no network). |
+| **Posture grade + tracking** | |
+| `npx pqcheck <domain>` | **Posture grade (no diff baseline).** Returns DBR score (0–10), letter grade (A–F), and a list of findings ranked by severity. Use when you want a one-shot health check without setting up a baseline — for first-time audits, ad-hoc spot checks, or grading a domain you don't own. For ongoing deploys, use `deploy-check` instead. |
+| `npx pqcheck history <domain>` | 90-day score history (sparkline + samples). `--days <N>` to change window. |
+| `npx pqcheck changes <domain>` | Summarize public attack-surface changes in last 14 days. |
+| `npx pqcheck watch <domain>` | Add domain to your watched list on the server (needs `CIPHERWAKE_API_KEY`). Distinct from the `--watch <secs>` flag, which is local polling. |
+| **Diagnostic** | |
+| **`npx pqcheck debug-network`** | **Connectivity diagnostic.** Probes cipherwake.io API, homepage, crt.sh upstream, and the direct Vercel URL (bypassing Cloudflare). Reports HTTP status + timing per hop. Use when "scan hung" / "command not found" / corporate proxy issues come up — surfaces the actual broken hop with an actionable cause list. |
+
+Free tier covers all of the above within 100 Trust Diff calls/month per repo via OIDC. **Founder Pro** ($19.99/mo, locked while subscription active) raises that to 5,000 calls/month + unlocks custom thresholds, vendor lockfile, CI fail rules, and 5 watched domains. Single-domain scans (`npx pqcheck <domain>`) are anonymous + rate-limited per IP — no account or key needed. `npx pqcheck deploy-check <domain> --ai` also works fully anonymously for first-deploy gating.
+
+### AI Coder Mode in 30 seconds
+
+```bash
+npx pqcheck deploy-check cipherwake.io --ai
+```
+
+Output:
+
+```
+◆ Cipherwake · cipherwake.io ⚠ REVIEW · 1 change since last scan · HIGH
+
+Surface changes:
+  + New third-party script: widget.intercom.io
+    Loaded from an origin not present in your last scan.
+
+Why it matters:
+  New third-party scripts execute in full page context. A script that
+  appeared without an intentional code change = supply-chain risk vector
+  (Polyfill.io-class). Confirm it was added on purpose.
+
+Recommended next action:
+  Review the change above and decide if it was intentional.
+  View full report: https://cipherwake.io/r/cipherwake.io
+  Re-scan after fix: npx pqcheck deploy-check cipherwake.io --ai
+
+CIPHERWAKE_AI_GUARD_RESULT
+status=review
+domain=cipherwake.io
+ship_decision=review
+max_severity=high
+top_issue=vendor.new_third_party_script
+advisory_only=true
+END_CIPHERWAKE_AI_GUARD_RESULT
+```
+
+The structured block is what your AI coworker (Claude / Cursor / Aider / Zed) parses to decide whether to announce the deploy, ask you, or revert. Exit code in `--ai` mode reflects `ship_decision`: `0` pass · `1` review · `2` block.
 
 ---
 
@@ -38,7 +190,7 @@ git push
 
 That's it. The scaffolded workflow includes `permissions: id-token: write`, so the runner mints a signed OIDC token on each run and Cipherwake meters per repo — no secret to manage. Open a PR and Cipherwake comments inline when cert / SPKI / HSTS / CSP / DMARC / vendor scripts drift since your baseline.
 
-**Need higher limits?** Paid tiers (Starter $29/mo · Growth $79/mo · Scale $199/mo) lift the per-repo quota to 1,000 / 10,000 / 50,000 calls/month. Generate an API key at [/account#api-keys](https://cipherwake.io/account#api-keys), then add it as the repo secret `CIPHERWAKE_API_KEY`. The Action uses the secret when present and falls back to OIDC when not — no code change needed to upgrade.
+**Need higher limits?** **Founder Pro ($19.99/mo)** lifts the per-repo quota to 5,000 calls/month and unlocks custom thresholds, the approved-vendor allowlist, vendor lockfile, CI fail rules, and 5 watched domains. Generate an API key at [/account#api-keys](https://cipherwake.io/account#api-keys), then add it as the repo secret `CIPHERWAKE_API_KEY`. The Action uses the secret when present and falls back to OIDC when not — no code change needed to upgrade. *Founder pricing is locked while your subscription remains active.*
 
 **Want more?**
 - Pre-commit hook: `npx pqcheck deploy-check <domain>` before every deploy
@@ -47,34 +199,91 @@ That's it. The scaffolded workflow includes `permissions: id-token: write`, so t
 
 ---
 
-## What's new in 0.12.0
+## Features
 
-**Developer habit-loop bundle (locked 2026-05-16).** Five new subcommands that put Cipherwake where developers already work: PRs, CI, release notes, vendor allowlists. Free tier covers all of them within the 100 Trust Diff calls/month per repo quota.
+For the per-release version history see [CHANGELOG.md](./CHANGELOG.md).
 
-- `pqcheck init` — interactive scaffold for `.github/workflows/cipherwake.yml`. Prompts for domain, fail-on severity, baseline. No copy-paste from docs required.
-- `pqcheck deploy-check <domain>` — pre-deploy Trust Diff gate with deploy-friendly framing. Uses last-scan as default baseline. Same exit semantics as `trust-diff`.
-- `pqcheck release-checklist [domain]` — markdown checklist for release notes. Offline, no API call.
-- `pqcheck vendors export <domain>` — write `cipherwake.vendors.json` from currently observed third-party origins. Like `package-lock.json` for vendor scripts.
-- `pqcheck vendors check <domain>` — CI gate; exits **4** when new origins appear that aren't in the lockfile.
-- `pqcheck vendors sync <domain>` — Starter+ only; pulls your dashboard-managed approved-vendor allowlist into the lockfile.
+### Trust Diff — CI gate for posture regressions
 
-Plus: the GitHub Action v3.1 now posts a **sticky PR comment** with Trust Diff results when `comment-on-pr: true` is set, and `/r/<domain>` has a "Copy as GitHub issue" button on every finding.
+```bash
+npx pqcheck trust-diff mycompany.com --baseline last-week --fail-on high
+```
 
-## What's new in 0.11.0
+Compares today's public trust posture against a configured baseline (`last-week`, `last-month`, or a saved per-branch baseline). Surfaces cert / SPKI / HSTS / CSP / DMARC / vendor-script drift since the baseline and gates the PR by severity. SARIF output uploads to GitHub Code Scanning. Pair with the [GitHub Action](https://github.com/cipherwakelabs/pqcheck/tree/main/action) `mode: trust-diff` for one-line CI integration.
 
-**Trust Diff subcommand** — `npx pqcheck trust-diff <domain>` calls `/api/trust-diff` and gates CI on regression severity vs a configured baseline. SARIF output uploads to GitHub's Code Scanning. Pair with `cipherwakelabs/pqcheck@v3` action `mode: trust-diff` for one-line CI integration.
+Exit codes: `0` pass · `1` warn · `2` fail · `3` error. Free tier (100 calls/repo/mo via GitHub Actions OIDC, no API key required) silently downgrades fail → report; **Founder Pro** honors `--fail-on` for real CI gating.
 
-## What's new in 0.7.9
+### Preview Trust Diff — PR-time URL-vs-URL comparison
 
-**CSP verdict + vendor labels on `pqcheck deps`.** The supply-chain table now shows a friendly vendor label (`New Relic · errors` / `Cloudflare · cdn` / `Adobe Fonts · fonts`) per host instead of raw `bam.nr-data.net`-style hostnames, plus a one-line site-wide CSP verdict above the table (`✗ No CSP enforcement` / `⚠ CSP is permissive` / `✓ Strict CSP enforced`). Same data shape ships on `/r/<domain>` and in the browser extension — cross-surface parity for the supply-chain story. See [CHANGELOG.md](./CHANGELOG.md).
+```bash
+npx pqcheck preview-diff \
+  --preview https://feature-x-abc123.vercel.app \
+  --production https://example.com
+```
 
-## What's new in 0.7.8
+Compares a preview-deployment URL to a production URL and surfaces application-surface changes (new third-party scripts, header regressions, DBR score drops) *inside the PR review, before merge*. SSRF-pinned scan path keeps preview-URL hostnames out of Cipherwake's moat tables — feature-branch names stay private.
 
-**Supply-chain change detection in CI** — `pqcheck deps <domain> --baseline file.json` compares the current third-party host list to a stored baseline. New hosts since the last accepted state are flagged `*NEW*` in the pretty table and `"isNew": true` in JSON. Add `--fail-on-new` to exit `4` if anything new appeared — the Polyfill.io-style CI gate that fails PRs introducing third-party scripts until you deliberately accept them with `--write-baseline`. Each row also shows an `SRI` column (on/off/n/a) so you can see which scripts allow silent vendor-side content swaps. See [CHANGELOG.md](./CHANGELOG.md).
+Sample output:
+
+```
+  Cipherwake Preview Trust Diff
+  preview=https://feature-x-abc123.vercel.app
+  production=https://example.com
+
+  Application surface:
+    + New third-party script: widget.intercom.io
+    - Content-Security-Policy [script-src] added permissive token(s): 'unsafe-inline'
+    ~ Strict-Transport-Security weakened: max-age=31536000 → max-age=3600
+
+  Transport: preview is edge-hosted (Let's Encrypt) — informational only.
+
+  Verdict: WARN (max severity: high)
+  Tier: free · policy: report
+```
+
+Flags: `--preview <URL>` · `--production <URL>` · `--compare-transport` · `--fail-on <severity>` (default `high`; `none` for report-only) · `--format pretty|json` · `--protected-path <PATH>` (repeatable) · `--first-party-host <HOSTNAME>` (repeatable). CSP weakening detection diffs `script-src` / `default-src` / `object-src` / `frame-ancestors` / `base-uri` / `style-src` for newly-permissive tokens (`*`, `'unsafe-inline'`, `'unsafe-eval'`, `data:`, `blob:`).
+
+**First-party hosts.** Subdomains of the scanned hostname are auto-promoted to first-party (PSL-backed: scanning `acme.com` makes `api.acme.com` first-party, but `acme.co.uk` does NOT auto-promote `evil.co.uk`). If your owned hosts span different registrable domains (`acme.com` + `acmecdn.net`), add them via `--first-party-host` or persist in `.cipherwake/config.json`:
+
+```json
+{
+  "firstPartyHosts": ["acmecdn.net", "static.acme.io"],
+  "protectedPaths": ["/api/admin/export", "/internal/billing"]
+}
+```
+
+**Diffing a local dev build against prod?** Cipherwake runs the comparison server-side, so `--preview http://localhost:3000` is rejected (we'd be reaching for *our* loopback, not yours). Expose your dev build via a public tunnel:
+
+```bash
+# Vercel/Netlify preview deploys — automatic per PR, free, the design target
+--preview https://feature-x-abc123.vercel.app
+
+# ngrok — ad-hoc, one command
+ngrok http 3000
+--preview https://9b1f-203-0-113-7.ngrok-free.app
+
+# Cloudflare Tunnel — zero-auth quick tunnel
+cloudflared tunnel --url http://localhost:3000
+--preview https://random-words-1234.trycloudflare.com
+```
+
+### Vendor lockfile — `cipherwake.vendors.json`
+
+Like `package-lock.json`, but for the third-party scripts that load on your domain. Capture currently observed vendor origins, commit the lockfile, and CI fails when a PR introduces a new vendor.
+
+```bash
+npx pqcheck vendors export mycompany.com    # write cipherwake.vendors.json
+npx pqcheck vendors check mycompany.com     # CI gate; exit 4 on new origins
+npx pqcheck vendors sync mycompany.com      # Founder Pro — pull dashboard allowlist
+```
+
+`pqcheck deps` also surfaces a one-line site-wide **CSP verdict** above the supply-chain table (`✗ No CSP enforcement` / `⚠ CSP is permissive` / `✓ Strict CSP enforced`) and friendly vendor labels (`New Relic · errors` / `Cloudflare · cdn` / `Adobe Fonts · fonts`) instead of raw hostnames. Same data shape ships on `/r/<domain>` and in the browser extension.
+
+> **GitHub Action note:** when scaffolded via `pqcheck onboard` or `pqcheck init`, the Action posts a **sticky PR comment** with results when `comment-on-pr: true` is set on `pull_request` events. The comment auto-edits on subsequent pushes — no spam.
 
 ---
 
-## What it does
+## How DBR scoring works
 
 `pqcheck` scans any HTTPS domain and computes its **Decryption Blast Radius score** — the first continuous metric for harvest-now-decrypt-later (HNDL) risk. Every other TLS scanner answers "is post-quantum cryptography enabled?" with yes/no. `pqcheck` answers the question that actually matters: *if an adversary harvests this traffic today and decrypts it in 2035, how much past + future data unlocks?*
 
@@ -90,26 +299,9 @@ Plus a full ASM check suite for credibility:
 - **HTTP header security** — HSTS (with preload + max-age), CSP, X-Frame-Options, Referrer-Policy, Permissions-Policy, COOP, CORP
 - **Subdomain takeover detection** — fingerprint-based scan against AWS S3, GitHub Pages, Heroku, Shopify, Fastly, etc.
 
-## Commands
+## Flags, formats & exit codes
 
-```
-npx pqcheck <domain>                          Scan + print human-readable report
-npx pqcheck lock <domain>                     Generate cipherwake.lock (QXM) committable manifest
-npx pqcheck deps <domain>                     Scan all third-party origins on the page (supply-chain HNDL)
-npx pqcheck diff <old.lock> <new.lock>        Compare two QXM lockfiles; exit 2 on regression
-npx pqcheck history <domain>                  Show 90-day score history (sparkline + samples)
-npx pqcheck changes <domain>                  Summarize public attack-surface changes in last 14 days
-npx pqcheck cert <file.pem>                   Analyze a local PEM/CRT cert file (offline, no network)
-npx pqcheck trust-diff <domain>               Trust Diff vs configured baseline; CI gate (Free: 30/mo)
-npx pqcheck deploy-check <domain>             Pre-deploy gate (Trust Diff alias with last-scan baseline)
-npx pqcheck onboard <domain>                  One-command setup wizard (scan + init + vendors + checklist)
-npx pqcheck init                              Interactive scaffold for .github/workflows/cipherwake.yml
-npx pqcheck release-checklist [domain]        Pre-release trust checklist (markdown, offline)
-npx pqcheck vendors export <domain>           Write cipherwake.vendors.json from observed third-party scripts
-npx pqcheck vendors check <domain>            CI gate; exit 4 on new origins not in lockfile
-npx pqcheck vendors sync <domain>             Pull dashboard allowlist into lockfile (Starter+, needs API key)
-npx pqcheck watch <domain>                    Add domain to your watched list (needs CIPHERWAKE_API_KEY)
-```
+Every CLI command is documented in [Commands at a glance](#commands-at-a-glance) above. What follows is reference material for usage patterns, flags, output formats, and exit codes shared across commands.
 
 ### Multi-domain
 
@@ -248,9 +440,8 @@ This CLI is one of four ways to consume the [Decryption Blast Radius API](https:
 | Surface | Where |
 |---|---|
 | **CLI** (this package) | `npx pqcheck` |
-| **Browser extension** | Chrome Web Store / Firefox AMO / Edge — toolbar badge per tab + dependency analysis |
+| **Browser extension** | [Chrome Web Store](https://chromewebstore.google.com/) — toolbar badge per tab + dependency analysis. Runs on any Chromium-based browser (Edge, Brave, Arc) via sideload. |
 | **GitHub Action** | [`cipherwakelabs/pqcheck/action@main`](https://github.com/cipherwakelabs/pqcheck/tree/main/action) — PR comments, SARIF upload, lockfile generation |
-| **Slack `/pqcheck`** | [Install on workspace](https://cipherwake.io/install-slack) |
 | **Web** | [cipherwake.io](https://cipherwake.io) — share-friendly URLs at `/r/<domain>` |
 
 ## Public API
@@ -263,7 +454,7 @@ curl -s "https://www.cipherwake.io/api/scan?domain=stripe.com" | jq '.grade, .sc
 
 Full API reference at [cipherwake.io/api](https://cipherwake.io/api).
 
-**Rate limits:** 300 scans per hour per IP, 20 `--fresh` (force-refresh) scans per hour per IP. No API key required. Returns HTTP 429 if exceeded — back off and retry, or [let us know via the feedback form](https://cipherwake.io/feedback) if you need higher limits (we're prioritizing the API tier based on real demand).
+**Rate limits:** 120 scans per hour per IP for anonymous CLI use, 20 `--fresh` (force-refresh) scans per hour per IP. **Authenticated paths bypass this:** GitHub Actions OIDC (Free = 100 calls/month per repo) and API key (Founder Pro = 5,000/month per account) each have their own per-account / per-repo quota with no per-IP cap. No API key required for the anonymous path. Returns HTTP 429 if exceeded — back off and retry, or [let us know via the feedback form](https://cipherwake.io/feedback) if you need higher limits.
 
 ## Methodology
 

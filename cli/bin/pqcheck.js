@@ -6,22 +6,57 @@
 // Zero deps (uses node:fetch). Works under `npx pqcheck` without installation.
 // =============================================================================
 
-const API_BASE = process.env.PQCHECK_API_BASE || "https://cipherwake.io";
-const VERSION = "0.12.0";
+// R74-confirm BLOCKING #5 (GPT 2026-05-22): Node version startup guard.
+// Native fetch requires Node 18+. Without this guard, pre-Node-18 users see
+// "fetch is not defined" at runtime — confusing because package.json `engines`
+// is not enforced by npm/npx. Fail loud + actionable.
+(() => {
+  const major = Number((process.versions.node || "0").split(".")[0]);
+  if (Number.isFinite(major) && major < 18) {
+    process.stderr.write(
+      `\n  ✗ pqcheck requires Node 18 or newer (you have ${process.versions.node}).\n` +
+      `    Native fetch is unavailable on this version.\n` +
+      `    Install Node 18+ from https://nodejs.org or use nvm: \`nvm install 18 && nvm use 18\`\n` +
+      `    Then retry: \`npx pqcheck <domain>\`\n\n`
+    );
+    process.exit(1);
+  }
+})();
 
-// API-key support — paid tiers (Starter $29 / Growth $79 / Scale $199) get
+const API_BASE = process.env.PQCHECK_API_BASE || "https://cipherwake.io";
+const VERSION = "0.16.15";
+
+// v0.16.15 — attribution suffix. When the CLI runs inside GitHub Actions
+// (GH sets GITHUB_ACTIONS=true automatically in every step) we append
+// "(pqcheck-action)" to the User-Agent so the server-side classifier
+// (lib/events.ts) buckets the call as `action` rather than `cli`. Lets
+// the analytics dashboard split humans/CI invocations cleanly.
+//
+// No new data is collected — the User-Agent string was already being
+// sent on every call; this is a labeling change.
+//
+// Opt out via PQCHECK_DISABLE_ACTION_ATTRIBUTION=1 (UA stays plain
+// `pqcheck-cli/X.Y.Z` even under GitHub Actions). The env var is only
+// honored when GITHUB_ACTIONS=true — it does nothing in other contexts.
+const CI_ACTION_SUFFIX =
+  process.env.GITHUB_ACTIONS === "true" &&
+  process.env.PQCHECK_DISABLE_ACTION_ATTRIBUTION !== "1"
+    ? " (pqcheck-action)"
+    : "";
+
+// API-key support — paid tier (Founder Pro $19.99/mo launch pricing, locked while sub active) gets
 // per-account monthly quotas instead of the per-IP rate limit. Set via:
 //   export CIPHERWAKE_API_KEY=qpk_<32-hex>
 // Anonymous CLI use still works (no env var → falls back to IP rate limit).
 //
-// QUANTAPACT_API_KEY is honored as a deprecated fallback for existing users
-// (rebrand 2026-05-15). Will be removed in v1.0; in the meantime no break.
-const QP_API_KEY = (process.env.CIPHERWAKE_API_KEY || process.env.QUANTAPACT_API_KEY || "").trim();
+// Removed QUANTAPACT_API_KEY backwards-compat fallback 2026-05-22.
+// Pre-launch, no customers had it set in production — no break.
+const QP_API_KEY = (process.env.CIPHERWAKE_API_KEY || "").trim();
 
 // Builds headers with optional Authorization. Use for every CLI → API call
 // so a single env-var toggle authenticates every endpoint at once.
 function apiHeaders(extra = {}) {
-  const h = { accept: "application/json", "user-agent": `pqcheck-cli/${VERSION}`, ...extra };
+  const h = { accept: "application/json", "user-agent": `pqcheck-cli/${VERSION}${CI_ACTION_SUFFIX}`, ...extra };
   if (QP_API_KEY) h.authorization = `Bearer ${QP_API_KEY}`;
   return h;
 }
@@ -78,6 +113,16 @@ async function main() {
     process.exit(0);
   }
 
+  // v0.16.13: opportunistic update-check banner. Reads cached registry
+  // result from disk and prints a one-line stderr banner if a newer
+  // version is published; refreshes the cache in the background for next
+  // time. Never blocks the command. See maybeShowVersionBanner() for the
+  // full rationale (TL;DR: prevents the npx-cached-stale-version trap
+  // that caused 0.7.0 to silently run for months on existing users).
+  // Awaited so the banner appears BEFORE the command output for visibility,
+  // but it only reads a tiny file (no network on hot path).
+  await maybeShowVersionBanner(args);
+
   // Subcommand dispatch.
   if (args[0] === "lock") {
     return runLockCommand(args.slice(1));
@@ -93,6 +138,17 @@ async function main() {
     // and outputs verdict in selected format. Designed for CI use via the
     // cipherwakelabs/pqcheck Action mode: trust-diff.
     return runTrustDiffCommand(args.slice(1));
+  }
+  if (args[0] === "preview-diff") {
+    // CLI v0.14.0 (locked 2026-05-19): preview deployment vs production diff.
+    // Calls /api/preview-diff with two URLs and reports application-surface
+    // changes (new third-party scripts, header regressions, score drops).
+    return runPreviewDiffCommand(args.slice(1));
+  }
+  if (args[0] === "guards") {
+    // CLI v0.16.9 (2026-05-23, R80, EXPERIMENTAL): Site Guards beta.
+    // Subcommands manage `.cipherwake/guards.json` and run guards against a URL.
+    return runGuardsCommand(args.slice(1));
   }
   if (args[0] === "history") {
     return runHistoryCommand(args.slice(1));
@@ -120,6 +176,36 @@ async function main() {
   }
   if (args[0] === "onboard") {
     return runOnboardCommand(args.slice(1));
+  }
+  if (args[0] === "guard") {
+    // CLI v0.15.0 — `pqcheck guard --domain X -- <deploy command>`.
+    // Wraps any deploy command: runs deploy-check first, conditionally
+    // executes the deploy command based on ship_decision. The strongest
+    // single artifact for terminal-first AI-coder workflows because the
+    // AI doesn't have to remember two commands.
+    return runGuardCommand(args.slice(1));
+  }
+  if (args[0] === "protocol") {
+    // CLI v0.15.0 — `pqcheck protocol install` opt-in installer with
+    // Rule 17 consent flow. Adds the AI Coder Protocol to ~/.claude/CLAUDE.md
+    // / .cursorrules (with auto/manual/no consent). Never silent.
+    return runProtocolCommand(args.slice(1));
+  }
+  if (args[0] === "setup") {
+    // CLI v0.15.0 — `pqcheck setup --auto --domain <D>` consolidated installer.
+    // One command installs everything: GitHub Action workflow, AI Coder
+    // Protocol across detected rules files, git pre-push hook, and
+    // statusline config. The launch-story command for AI-coder workflows
+    // ("one command sets you up across every AI coder").
+    return runSetupCommand(args.slice(1));
+  }
+  if (args[0] === "debug-network" || args.includes("--debug-network")) {
+    // R74-confirm SHIP #14-15 (GPT 2026-05-22): probe connectivity to every
+    // upstream Cipherwake depends on + report which ones are reachable.
+    // Customer-facing diagnostic for "the scan hung" / "command-not-found"
+    // / "corporate proxy" / "VPN-blocked" failure modes — instead of leaving
+    // them to guess, surface the actual broken hop.
+    return runDebugNetworkCommand();
   }
 
   // Multi-domain support: positional args are domains.
@@ -182,17 +268,19 @@ async function main() {
   // a cert/key change you just deployed. Subject to a 20/hr per-IP cap on
   // the server side.
   const fresh = args.includes("--fresh") || args.includes("--force");
+  const aiMode = parseAiMode(args);
+  const verbose = isVerboseMode(args);  // v0.16.0 — opt-in detailed panel
 
   // One-shot scan(s)
   let worstExit = 0;
   for (const domain of domains) {
-    const exit = await runOneScan({ domain, format, quiet, threshold, webhookUrl, multi: domains.length > 1, fresh });
+    const exit = await runOneScan({ domain, format, quiet, threshold, webhookUrl, multi: domains.length > 1, fresh, aiMode, verbose });
     if (exit > worstExit) worstExit = exit;
   }
   process.exit(worstExit);
 }
 
-async function runOneScan({ domain, format, quiet, threshold, webhookUrl, multi, fresh }) {
+async function runOneScan({ domain, format, quiet, threshold, webhookUrl, multi, fresh, aiMode, verbose }) {
   if (!quiet && format === "text") process.stderr.write(color("dim", `Scanning ${domain}${fresh ? " (forcing fresh)" : ""} ...`));
   let report;
   try {
@@ -204,18 +292,39 @@ async function runOneScan({ domain, format, quiet, threshold, webhookUrl, multi,
     const qs = fresh ? `?domain=${encodeURIComponent(domain)}&force=1` : `?domain=${encodeURIComponent(domain)}`;
     const resp = await fetch(`${API_BASE}/api/scan${qs}`, {
       method: "GET",
-      headers: apiHeaders({ "user-agent": `pqcheck-cli/${VERSION} (scan)` }),
+      headers: apiHeaders({ "user-agent": `pqcheck-cli/${VERSION}${CI_ACTION_SUFFIX} (scan)` }),
     });
     if (!quiet && format === "text") process.stderr.write("\r\x1b[K");
     if (!resp.ok) {
       const errBody = await safeJSON(resp);
-      console.error(color("red", `error scanning ${domain}: ${resp.status} ${errBody?.error || resp.statusText}`));
-      if (errBody?.detail) console.error(color("dim", errBody.detail));
-      // Surface the 429 upsell hint if present — tells users how to ask for
-      // higher limits via the feedback form. Same demand signal we capture
-      // on the homepage.
-      if (resp.status === 429 && errBody?.need_more?.feedback_url) {
-        console.error(color("dim", `${errBody.need_more.message} → ${errBody.need_more.feedback_url}`));
+      // Friendly per-status messages so customers see actionable guidance
+      // instead of "error scanning X: 429 rate_limit_exceeded" raw HTTP
+      // verbiage. Batch users scripting many scans in a row hit this hardest
+      // — surface what they should do (wait + retry, or upgrade) rather than
+      // leaving them to guess.
+      if (resp.status === 429) {
+        const retryAfter = resp.headers.get("retry-after");
+        const waitMsg = retryAfter ? `Wait ${retryAfter}s then retry.` : "Wait ~60s then retry.";
+        console.error(color("yellow", `⚠ Rate limit hit on ${domain} — too many scans from this IP in the current window.`));
+        console.error(color("dim", `  ${waitMsg} For higher limits, get an account: ${API_BASE}/account`));
+        if (errBody?.need_more?.feedback_url) {
+          console.error(color("dim", `  Need much higher throughput? ${errBody.need_more.feedback_url}`));
+        }
+      } else if (resp.status >= 500) {
+        console.error(color("red", `error scanning ${domain}: Cipherwake's scanner hit a transient issue (HTTP ${resp.status}).`));
+        console.error(color("dim", `  Retry in ~1 minute. If it keeps happening, report at ${API_BASE}/feedback (include the domain + timestamp).`));
+        if (errBody?.detail) console.error(color("dim", `  Detail: ${errBody.detail}`));
+      } else if (resp.status === 400) {
+        // Most 400s on /api/scan are "invalid domain" — typically the
+        // customer typed a URL with a path or used localhost. The
+        // server already returns a clear message; just present it
+        // without raw HTTP noise.
+        console.error(color("red", `error scanning ${domain}: ${errBody?.error || resp.statusText}`));
+        if (errBody?.detail) console.error(color("dim", `  ${errBody.detail}`));
+        console.error(color("dim", `  Cipherwake only scans public domains. URLs with paths, IPs, and \`localhost\` aren't supported.`));
+      } else {
+        console.error(color("red", `error scanning ${domain}: ${resp.status} ${errBody?.error || resp.statusText}`));
+        if (errBody?.detail) console.error(color("dim", errBody.detail));
       }
       return 1;
     }
@@ -230,7 +339,7 @@ async function runOneScan({ domain, format, quiet, threshold, webhookUrl, multi,
   if (webhookUrl) {
     fetch(webhookUrl, {
       method: "POST",
-      headers: { "content-type": "application/json", "user-agent": `pqcheck-cli/${VERSION}` },
+      headers: { "content-type": "application/json", "user-agent": `pqcheck-cli/${VERSION}${CI_ACTION_SUFFIX}` },
       body: JSON.stringify({ domain, report, source: "pqcheck-cli", at: new Date().toISOString() }),
     }).catch(() => { /* best-effort — never fail the scan on webhook delivery */ });
   }
@@ -240,6 +349,155 @@ async function runOneScan({ domain, format, quiet, threshold, webhookUrl, multi,
   // mislead a CI gate or one-off check.
   if (quiet && report._meta?.degraded) {
     console.error(`pqcheck: ⚠ ${domain} — using cached score (live probe failed: ${report._meta.degradedReason || "unknown"}; last verified ${report._meta.lastUpdated || "?"})`);
+  }
+
+  // Compute ship-decision once — needed both for AI-mode footer AND for the
+  // per-user/per-repo state files that statusline/chat-hook/prompt-hook read.
+  // State files must update on every successful scan, regardless of --ai, so
+  // downstream agents see the same scan the human just ran.
+  const findings = Array.isArray(report.findings) ? report.findings : [];
+  const maxSev = highestSeverity(findings);
+  let shipDecision = computeShipDecision({ maxSeverity: maxSev });
+  const topFinding = [...findings].sort((a, b) => severityRank(b.severity) - severityRank(a.severity))[0];
+
+  // Unreachable / degraded → force "block". A scan that couldn't actually
+  // reach the domain (no DNS, TLS handshake failed, deploy hadn't propagated
+  // yet, typo in the domain) is categorically different from "trust drift
+  // detected" — we couldn't evaluate the trust surface AT ALL. "review"
+  // would be too soft (the AI agent might shrug and ship); "block" properly
+  // halts announcement per the AI Coder Protocol until the human confirms
+  // the unreachability was expected (e.g., they know DNS is still
+  // propagating) or fixes the deploy. This matches the protocol's "STOP,
+  // wait for explicit override" routing.
+  // Treat as "cannot evaluate" — and route through the UNREACHABLE label —
+  // when either:
+  //   • reachable === false  (no TCP/TLS handshake at all)
+  //   • scanAvailable === false  (TCP/TLS up, but scan couldn't produce a
+  //     coherent fingerprint — e.g. medium.com churning vendor scripts
+  //     faster than our dual-fingerprint check)
+  //
+  // _meta.degraded alone is too broad (fires on cache fallback + mid-scan
+  // state changes on otherwise-scoreable domains like stripe.com), so we
+  // narrow to the structured failure signals the server emits.
+  const unreachable = report?.reachable === false || report?.scanAvailable === false;
+  if (unreachable) {
+    shipDecision = "block";
+  }
+
+  // Capture reachability AFTER ship_decision override so state files reflect
+  // the truth: ship_decision=block + unreachable=true means "we couldn't
+  // reach it, treat as block." Downstream surfaces (statusline / VS Code
+  // extension / AI banner) display the "UNREACHABLE" label when
+  // unreachable=true instead of the generic "BLOCK" — more informative,
+  // same protocol routing.
+  await writeLastScanFile({
+    domain,
+    kind: "scan",
+    score: typeof report.score === "number" ? report.score : null,
+    grade: report.grade || null,
+    max_severity: maxSev,
+    ship_decision: shipDecision,
+    unreachable: unreachable || false,
+    top_issue: topFinding?.id || topFinding?.title || null,
+  });
+
+  // AI Coder Mode — three-layer output for Claude Code / Cursor / Aider.
+  // Overrides --format when --ai is set; emits the structured block at the
+  // bottom so downstream agents can parse ship_decision deterministically.
+  if (aiMode) {
+    let topIssue, whyMatters, nextActions;
+    if (unreachable) {
+      const isUnstable = report?.reason === "scan_unstable";
+      topIssue = isUnstable
+        ? "[REACHABILITY] Scan unstable — site changing faster than we can scan it"
+        : "[REACHABILITY] Domain unreachable — TLS probe failed or DNS unresolved";
+      whyMatters = report?.userMessage || report?._meta?.degradedReason || (isUnstable
+        ? "The scanner reached the site but couldn't produce a coherent fingerprint — rolling deploy, rapid A/B variation, or fast vendor-script rotation. Retry usually succeeds once the site settles."
+        : "The scanner couldn't reach the domain on port 443. Either DNS hasn't propagated, the deploy hasn't completed, or this domain isn't deployed at the address we expected.");
+      nextActions = isUnstable
+        ? [
+            `Wait ~1 minute then retry: npx pqcheck deploy-check ${domain} --ai`,
+            `View full report (last successful scan): ${API_BASE}/r/${domain}`,
+          ]
+        : [
+            `Check the domain is correct (typo?): ${domain}`,
+            `Verify DNS: dig +short ${domain}`,
+            `Verify deploy completed and TLS is live on https://${domain}`,
+            `Re-run after fix: npx pqcheck deploy-check ${domain} --ai`,
+          ];
+    } else {
+      topIssue = topFinding
+        ? `[${String(topFinding.severity || "").toUpperCase()}] ${topFinding.title || topFinding.detail || "finding"}`
+        : "No findings at or above LOW severity.";
+      whyMatters = topFinding?.detail || "DBR scoring measures harvest-now-decrypt-later risk. Findings reflect public-surface signals only.";
+      nextActions = shipDecision === "pass"
+        ? [`Domain looks healthy. View full report: ${API_BASE}/r/${domain}`]
+        : [
+            `Review finding above and decide if it was intentional.`,
+            `View full report: ${API_BASE}/r/${domain}`,
+            `Re-scan with --fresh after fix: npx pqcheck ${domain} --fresh --ai`,
+          ];
+    }
+
+    // v0.16.0 high-yield rendering. Old layout was: banner + body + footer.
+    // New layout: brand header → decision pulse → alerts (if any) → trust
+    // posture → verified-signals summary → (verbose body if --verbose) →
+    // AI footer block. The structured footer is always last so downstream
+    // agents can parse ship_decision regardless of the verbose flag.
+    const highSevFindings = findings.filter((f) => severityRank(f.severity) >= 3);
+    const alertCount = highSevFindings.length;
+
+    console.log("");
+    console.log(formatBrandHeader(domain));
+    console.log("");
+    console.log(formatDecisionPulse({ shipDecision, alertCount, unreachable, diffContext: false }));
+
+    if (unreachable) {
+      // Unreachable path: surface the friendly explanation + next actions
+      // immediately (no "verified signals" block — there's nothing to
+      // verify if we couldn't reach the site).
+      console.log(formatAiBody({ topIssue, whyMatters, nextActions }));
+    } else {
+      // Alerts above trust posture so the actionable change is first.
+      if (alertCount > 0) {
+        const alerts = formatAlertsLine(highSevFindings);
+        if (alerts) console.log(alerts);
+      }
+      const tpl = formatTrustPostureLine(report);
+      if (tpl) console.log(tpl);
+      const vsl = formatVerifiedSignalsLine(report);
+      if (vsl) console.log(vsl);
+      if (verbose) {
+        console.log("");
+        console.log(formatHighYieldVerbose(report));
+      } else {
+        console.log(color("dim", "  Run with --verbose to see all verified signals."));
+      }
+    }
+
+    console.log(formatAiFooterBlock({
+      status: shipDecision,
+      domain,
+      kind: "scan",
+      dbr: typeof report.score === "number" ? report.score.toFixed(1) : "",
+      grade: report.grade || "",
+      max_severity: maxSev,
+      ship_decision: shipDecision,
+      unreachable: unreachable ? "true" : "false",
+      top_issue: topFinding?.id || topFinding?.title || "none",
+      findings_high: findings.filter((f) => severityRank(f.severity) === 3).length,
+      findings_critical: findings.filter((f) => severityRank(f.severity) === 4).length,
+      scanned_at: new Date().toISOString(),
+      advisory_only: "true",
+    }));
+    console.log("");
+
+    // Threshold check still applies under --ai (script-pipeable). Otherwise
+    // exit code reflects ship_decision so the caller can route on it.
+    if (threshold !== null && typeof report.score === "number" && report.score >= threshold) {
+      return 2;
+    }
+    return shipDecisionExitCode(shipDecision);
   }
 
   // Output dispatch
@@ -303,7 +561,7 @@ async function runWatch({ domains, format, quiet, threshold, webhookUrl, interva
       try {
         const resp = await fetch(`${API_BASE}/api/scan?domain=${encodeURIComponent(domain)}`, {
           method: "GET",
-          headers: apiHeaders({ "user-agent": `pqcheck-cli/${VERSION} (watch)` }),
+          headers: apiHeaders({ "user-agent": `pqcheck-cli/${VERSION}${CI_ACTION_SUFFIX} (watch)` }),
         });
         if (!resp.ok) continue;
         const report = await resp.json();
@@ -314,7 +572,7 @@ async function runWatch({ domains, format, quiet, threshold, webhookUrl, interva
         if (changed && webhookUrl) {
           fetch(webhookUrl, {
             method: "POST",
-            headers: { "content-type": "application/json", "user-agent": `pqcheck-cli/${VERSION}` },
+            headers: { "content-type": "application/json", "user-agent": `pqcheck-cli/${VERSION}${CI_ACTION_SUFFIX}` },
             body: JSON.stringify({
               type: "score_changed",
               domain,
@@ -399,6 +657,753 @@ function parseWebhook(args) {
   return raw;
 }
 
+// =============================================================================
+// AI Coder Mode — `--ai` / `--agent` output
+// =============================================================================
+// Three-layer output designed for AI-coder workflows (Claude Code / Cursor /
+// Aider / etc.) where the user can't see GitHub PR comments and the chat
+// scrollback buries verbose CLI output:
+//
+//   Layer 1 (top banner)   — un-missable one-liner with status + ship_decision
+//   Layer 2 (body)         — top finding + why it matters + next action (≤12 lines)
+//   Layer 3 (footer block) — machine-readable CIPHERWAKE_AI_GUARD_RESULT block
+//                            that AI agents can deterministically parse to
+//                            decide pass / review / block
+//
+// The `ship_decision` field is advisory only — Cipherwake is a scanner, not
+// an authoritative deploy-blocker. The methodology page documents this
+// explicitly (Rule 1).
+// =============================================================================
+
+function parseAiMode(args) {
+  return args.includes("--ai") || args.includes("--agent");
+}
+
+function severityRank(s) {
+  const map = { critical: 4, high: 3, medium: 2, low: 1, info: 0, none: -1 };
+  return map[String(s || "none").toLowerCase()] ?? 0;
+}
+
+function highestSeverity(findings) {
+  if (!Array.isArray(findings) || findings.length === 0) return "none";
+  let best = "none";
+  for (const f of findings) {
+    if (severityRank(f.severity) > severityRank(best)) best = f.severity;
+  }
+  return best;
+}
+
+// Compute ship_decision: pass | review | block.
+// Used in three contexts:
+//   - one-shot scan: severity-only, no diff baseline
+//   - trust-diff / preview-diff: severity + diff-since-baseline
+//   - deploy-check: same as trust-diff (it's an alias)
+//
+// Decision rules (advisory only):
+//   * `block`  — critical severity present
+//   * `review` — high severity OR diff introduced new high-severity OR DBR drop ≥1.0
+//   * `pass`   — everything else
+function computeShipDecision({ maxSeverity, hasUnexpectedDiff, scoreDelta }) {
+  const sev = String(maxSeverity || "none").toLowerCase();
+  if (sev === "critical") return "block";
+  if (sev === "high") return "review";
+  if (hasUnexpectedDiff) return "review";
+  if (typeof scoreDelta === "number" && scoreDelta <= -1.0) return "review";
+  return "pass";
+}
+
+function aiBannerColor(shipDecision) {
+  if (shipDecision === "pass") return "green";
+  if (shipDecision === "block") return "red";
+  return "yellow"; // review
+}
+
+function aiStatusEmoji(shipDecision) {
+  if (shipDecision === "pass") return "✓";
+  if (shipDecision === "block") return "✗";
+  return "⚠";
+}
+
+function formatAiBanner({ domain, kind, dbr, grade, maxSeverity, shipDecision, unreachable }) {
+  // When the scanner couldn't reach the domain we render "UNREACHABLE"
+  // (with a distinct ⊘ glyph) instead of the generic "BLOCK" — semantically
+  // clearer for the customer: their site isn't deployed / isn't responding,
+  // not that we found a critical security finding.
+  //
+  // Suppress DBR + severity trailing segments when unreachable: even if the
+  // API returned a stale cached score on a degraded scan, surfacing it next
+  // to "UNREACHABLE" reads as contradictory ("how can it score X if you
+  // couldn't reach it?"). The age + banner already convey the situation.
+  const isUnreachable = !!unreachable;
+  const emoji = isUnreachable ? "⊘" : aiStatusEmoji(shipDecision);
+  const statusWord = isUnreachable
+    ? "UNREACHABLE"
+    : (({ pass: "PASS", review: "REVIEW", block: "BLOCK" })[shipDecision] || "REVIEW");
+  const c = aiBannerColor(isUnreachable ? "block" : shipDecision);
+  const dbrSegment = (!isUnreachable && typeof dbr === "number")
+    ? ` · DBR ${dbr.toFixed(1)}${grade ? " " + grade : ""}`
+    : "";
+  const sevSegment = (!isUnreachable && maxSeverity && maxSeverity !== "none")
+    ? ` · ${String(maxSeverity).toUpperCase()}`
+    : "";
+  const kindSegment = (kind && kind !== "scan") ? ` · ${kind}` : "";
+  return color(c, `◆ Cipherwake · ${domain} ${emoji} ${statusWord}${dbrSegment}${sevSegment}${kindSegment}`);
+}
+
+function formatAiBody({ topIssue, whyMatters, nextActions }) {
+  const lines = [];
+  if (topIssue) {
+    lines.push("");
+    lines.push(color("bold", "Top finding:"));
+    lines.push(`  ${topIssue}`);
+  }
+  if (whyMatters) {
+    lines.push("");
+    lines.push(color("bold", "Why it matters:"));
+    lines.push(`  ${whyMatters}`);
+  }
+  if (Array.isArray(nextActions) && nextActions.length > 0) {
+    lines.push("");
+    lines.push(color("bold", "Recommended next action:"));
+    for (const a of nextActions) {
+      lines.push(`  ${a}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+// Emit the machine-readable block. Keys are normalized; values are
+// newline-stripped. AI agents grep between the CIPHERWAKE_AI_GUARD_RESULT
+// and END_CIPHERWAKE_AI_GUARD_RESULT markers and parse key=value lines.
+function formatAiFooterBlock(fields) {
+  const lines = ["", "CIPHERWAKE_AI_GUARD_RESULT"];
+  for (const [k, v] of Object.entries(fields)) {
+    if (v === undefined || v === null) continue;
+    const safeK = String(k).replace(/[\s=]/g, "_");
+    const safeV = String(v).replace(/[\r\n]+/g, " ");
+    lines.push(`${safeK}=${safeV}`);
+  }
+  lines.push("END_CIPHERWAKE_AI_GUARD_RESULT");
+  return color("dim", lines.join("\n"));
+}
+
+// v0.16.13 — fail-loud AI guard for fetch/quota/server errors during
+// deploy-check. Without this, a network blip during `pqcheck deploy-check
+// --ai` would print a red error to stderr and exit 3 — but the AI Coder
+// Protocol relies on the CIPHERWAKE_AI_GUARD_RESULT block. Missing block =
+// AI agent assumes "no signal" and may continue shipping. The fix: in AI
+// mode, always emit a block with ship_decision=review and a top_issue code
+// the agent can route on. Behaviour in non-AI text mode is unchanged.
+function emitAiGuardReviewAndExit(args, errorDetail) {
+  if (parseAiMode(args)) {
+    const positional = args.filter((a) => !a.startsWith("-"));
+    const domain = positional[0] || "";
+    const baseline = parseFlag(args, "--baseline") || "last-scan";
+    try {
+      console.log("");
+      console.log(formatBrandHeader(domain));
+      console.log("");
+      console.log(color("yellow", "  ⚠ REVIEW — Cipherwake deploy-check could not complete"));
+      console.log(color("dim",    `  ${errorDetail.message}`));
+      console.log(color("dim",    "  Treating as REVIEW per fail-safe policy. Do NOT announce the deploy until you manually verify or rerun the check successfully."));
+      console.log(formatAiFooterBlock({
+        status: "review",
+        domain,
+        kind: "trust-diff",
+        baseline,
+        verdict: "review",
+        delta_count: 0,
+        max_severity: "unknown",
+        ship_decision: "review",
+        top_issue: errorDetail.code,
+        top_issue_title: errorDetail.message,
+        dbr: "",
+        grade: "",
+        quota_used: "",
+        quota_limit: "",
+        scanned_at: new Date().toISOString(),
+        advisory_only: "true",
+        error: errorDetail.code,
+      }));
+      console.log("");
+      // Persist the review state so the IDE statusbar reflects the failure
+      // (otherwise the bar stays on the previous successful scan).
+      writeLastScanFile({
+        domain,
+        kind: "trust-diff",
+        score: null,
+        grade: null,
+        max_severity: "unknown",
+        ship_decision: "review",
+        baseline,
+        delta_count: 0,
+        top_issue: errorDetail.code,
+        error: errorDetail.code,
+      }).catch(() => { /* best-effort */ });
+    } catch {
+      // even error path must not throw — fall through to exit
+    }
+  }
+  process.exit(errorDetail.exitCode ?? 3);
+}
+
+// v0.16.13 — opportunistic version check. Reads a small cache file on cold
+// start; if a newer version is in cache AND we haven't already banner'd
+// today, prints a banner to stderr. Separately, if cache is >24h old, fires
+// off a background fetch (non-blocking) whose result lands for the NEXT
+// invocation. Zero network on hot path. Skipped in machine-readable formats
+// (JSON/SARIF/github) so it never pollutes scripted output. The banner
+// helps users who installed via `npx pqcheck` months ago and have a stale
+// version cached in ~/.npm/_npx/ that they don't know is stale.
+const VERSION_CHECK_TTL_MS = 24 * 60 * 60 * 1000;
+const VERSION_REGISTRY_URL = "https://registry.npmjs.org/pqcheck";
+
+async function maybeShowVersionBanner(args) {
+  // Skip in machine-parsed output formats.
+  const format = parseFlag(args, "--format");
+  if (format === "json" || format === "sarif" || format === "github") return;
+  // Skip if explicitly disabled (env opt-out).
+  if (process.env.PQCHECK_NO_UPDATE_CHECK === "1") return;
+
+  try {
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const fs = await import("node:fs/promises");
+
+    const cacheDir = path.join(os.homedir(), ".config", "cipherwake");
+    const cachePath = path.join(cacheDir, "version-check.json");
+
+    let cached = null;
+    try {
+      cached = JSON.parse(await fs.readFile(cachePath, "utf8"));
+    } catch {
+      // first run or unreadable — fall through
+    }
+
+    const now = Date.now();
+    const stale = !cached || !cached.checked_at || (now - cached.checked_at) > VERSION_CHECK_TTL_MS;
+
+    // 1. If cache has a known-newer version, print banner now (synchronous,
+    //    cheap, no network).
+    if (cached && cached.latest && isNewerVersion(cached.latest, VERSION)) {
+      const lastShownAt = cached.last_shown_at || 0;
+      const showThrottleMs = 6 * 60 * 60 * 1000; // at most once per 6h
+      if (now - lastShownAt > showThrottleMs) {
+        process.stderr.write(
+          color("yellow", `\n  ⬆ pqcheck ${cached.latest} is available `) +
+          color("dim",    `(you have ${VERSION}) — run: `) +
+          color("bold",   "npm i -g pqcheck@latest") +
+          color("dim",    "  (or: rm -rf ~/.npm/_npx && npx pqcheck@latest ...)\n\n")
+        );
+        // Persist that we just shown the banner so we don't spam.
+        await fs.mkdir(cacheDir, { recursive: true });
+        await fs.writeFile(cachePath, JSON.stringify({ ...cached, last_shown_at: now }, null, 2));
+      }
+    }
+
+    // 2. If cache is stale, fire-and-forget a registry fetch so the NEXT
+    //    cold start has fresh data. Detached from the await chain so it
+    //    never delays exit.
+    if (stale) {
+      void refreshVersionCacheInBackground(cachePath);
+    }
+  } catch {
+    // best-effort — never break the CLI for an update check
+  }
+}
+
+async function refreshVersionCacheInBackground(cachePath) {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2500);
+    const resp = await fetch(VERSION_REGISTRY_URL, {
+      headers: { "Accept": "application/json", "User-Agent": `pqcheck-cli/${VERSION}${CI_ACTION_SUFFIX}` },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (!resp.ok) return;
+    const body = await resp.json();
+    const latest = body?.["dist-tags"]?.latest;
+    if (!latest) return;
+    const fs = await import("node:fs/promises");
+    const path = await import("node:path");
+    await fs.mkdir(path.dirname(cachePath), { recursive: true });
+    // Preserve last_shown_at so we don't reset the throttle on every refresh.
+    let prior = {};
+    try { prior = JSON.parse(await fs.readFile(cachePath, "utf8")); } catch { /* none */ }
+    await fs.writeFile(cachePath, JSON.stringify({
+      ...prior,
+      latest,
+      checked_at: Date.now(),
+    }, null, 2));
+  } catch {
+    // best-effort
+  }
+}
+
+function isNewerVersion(remote, local) {
+  const parse = (v) => String(v).split(".").map((n) => parseInt(n, 10) || 0);
+  const [a, b, c] = parse(remote);
+  const [x, y, z] = parse(local);
+  if (a !== x) return a > x;
+  if (b !== y) return b > y;
+  return c > z;
+}
+
+// v0.16.0 — high-yield output formatters.
+//
+// Design (per user direction 2026-05-22): every scan should deliver
+// substantive insight, but the default must stay tight (3-5 lines max) so
+// running pqcheck 100 times/month doesn't feel like a mini audit every
+// time. The verbose panel is opt-in via `--verbose`.
+//
+// Three rendering tiers:
+//   1. Status line (1 line):        ◆ Cipherwake · X ✓ PASS · DBR 4.7 C · stable 14d
+//   2. Default CLI (3-5 lines):     "✓ PASS · no public-surface drift detected"
+//                                   "✓ Trust posture: DBR 4.7 C · top 23% in fintech · stable 14d"
+//                                   "✓ Verified 8 signals · scripts, headers, cookies, cert/SPKI, ..."
+//   3. Verbose (--verbose, 8+ lines): full per-signal breakdown
+// =============================================================================
+
+// Plain-English percentile copy. report.sectorRanking.percentile uses
+// "100 = worst, 0 = best". Customer copy inverts to "top N%" framing.
+// No cryptic p-quantiles — `p23` reads like jargon; `top 23%` is universal.
+function formatPercentileCopy(percentile, sectorName) {
+  if (typeof percentile !== "number" || !isFinite(percentile)) return null;
+  const sector = sectorName || "industry";
+  if (percentile <= 10) return `top 10% in ${sector}`;
+  if (percentile <= 25) return `top 25% in ${sector}`;
+  if (percentile <= 50) return `above median in ${sector}`;
+  if (percentile <= 75) return `below median in ${sector}`;
+  if (percentile <= 90) return `bottom 25% in ${sector}`;
+  return `bottom 10% in ${sector}`;
+}
+
+// "stable 14d" / "drifted 2d ago" / "first scan" depending on report data.
+// Reads from report._meta.lastChanged (smartCache populates) — if not
+// available, falls back to "tracked since first scan."
+function formatStabilityCopy(report) {
+  const lastChanged = report?._meta?.lastChanged || report?._meta?.lastUpdated;
+  if (lastChanged) {
+    const ms = Date.now() - new Date(lastChanged).getTime();
+    const days = Math.floor(ms / 86400000);
+    if (days <= 0) return "drifted today";
+    if (days < 7) return `drifted ${days}d ago`;
+    return `stable ${days}d`;
+  }
+  return null;
+}
+
+// "✓ Trust posture: DBR 4.7 C · top 23% in fintech · stable 14d"
+//   - Only includes sub-segments we have data for. If we can't compute a
+//     section, we omit it rather than padding with "—" / "n/a".
+function formatTrustPostureLine(report) {
+  const dbr = typeof report?.score === "number" ? report.score.toFixed(1) : null;
+  const grade = report?.grade || "";
+  if (!dbr) return null;
+  const parts = [`DBR ${dbr}${grade ? " " + grade : ""}`];
+  const sr = report?.sectorRanking;
+  const pctCopy = formatPercentileCopy(sr?.percentile, sr?.sectorLabel || sr?.sectorName || sr?.sector);
+  if (pctCopy) parts.push(pctCopy);
+  const stability = formatStabilityCopy(report);
+  if (stability) parts.push(stability);
+  return color("green", "✓ ") + color("bold", "Trust posture: ") + parts.join(color("dim", " · "));
+}
+
+// Count verified signals from the scan report. A "signal" is something
+// Cipherwake actively checked AND would surface in a diff if it changed.
+// Returns: { count, categories }.
+function countVerifiedSignals(report) {
+  const cats = [];
+  // 1. Third-party scripts
+  if (report?.publicDeps?.fetched || Array.isArray(report?.publicDeps?.thirdParties)) cats.push("scripts");
+  // 2. Security headers (CSP/HSTS/XFO at minimum)
+  if (report?.httpHeaders?.reachable) cats.push("headers");
+  // 3. Cookies (v0.16.0 — new)
+  if (report?.cookies?.reachable) cats.push("cookies");
+  // 4. Cert / SPKI
+  if (report?.cert || report?._meta?.certSerial) cats.push("cert/SPKI");
+  // 5. Source maps (v0.16.0 — new)
+  if (report?.sourceMaps?.reachable) cats.push("source maps");
+  // 6. TLS posture
+  if (report?.publicSurface?.tlsVersion || report?.tlsVersion) cats.push("TLS");
+  // 7. Mixed content — v0.16.2 promoted to dedicated probe; falls back to
+  //    publicDeps inference when explicit field missing.
+  if (report?.mixedContent?.probed || report?.publicDeps?.fetched) cats.push("mixed-content");
+  // 8. Subdomain scale (from CT log scan)
+  if (typeof report?.publicSurface?.subdomainCount === "number") cats.push("subdomain scale");
+  // 9. Protected paths (v0.16.2 — the headline feature)
+  if (report?.protectedPaths?.probed) cats.push("protected paths");
+  return { count: cats.length, categories: cats };
+}
+
+// Default ("Verified N signals · scripts, headers, ...") is for first scans
+// where there's no baseline to compare. With a baseline + no drift we
+// switch to "Security-relevant surface unchanged" — it directly answers
+// the customer's question ("did anything that matters change?") instead
+// of just naming what we checked. User direction 2026-05-22.
+function formatVerifiedSignalsLine(report, options = {}) {
+  const { count, categories } = countVerifiedSignals(report);
+  if (count === 0) return null;
+  const head = options.diffNoChange === true
+    ? "Security-relevant surface unchanged"
+    : `Verified ${count} signal${count === 1 ? "" : "s"}`;
+  return color("green", "✓ ") + color("bold", head) + color("dim", " · " + categories.join(", "));
+}
+
+// Default high-yield panel — 3-5 lines max. Used in `pqcheck <domain> --ai`
+// and `pqcheck deploy-check --ai` when no critical findings need to be
+// surfaced prominently (otherwise the alerts go above this block).
+function formatHighYieldDefault(report, { shipDecision, diffContext, diffNoChange } = {}) {
+  const lines = [];
+  // Header pulse: "✓ PASS · no public-surface drift detected"
+  //               "⚠ REVIEW · 2 public-surface changes"
+  //               "⛔ BLOCK · protected path changed"
+  if (diffContext) {
+    lines.push(diffContext);
+  }
+  const tpl = formatTrustPostureLine(report);
+  if (tpl) lines.push(tpl);
+  // diffNoChange flag tells the verified-signals line to switch wording
+  // from "Verified N signals" to "Security-relevant surface unchanged" —
+  // only set this when there IS a baseline to compare against AND the
+  // diff returned zero deltas.
+  const vsl = formatVerifiedSignalsLine(report, { diffNoChange: !!diffNoChange });
+  if (vsl) lines.push(vsl);
+  lines.push(color("dim", "  Run with --verbose to see all verified signals."));
+  return lines.join("\n");
+}
+
+// Verbose panel — opt-in via --verbose. Per-signal bullet breakdown.
+// Used for first-run, troubleshooting, public benchmark/report pages.
+// The caller renders the trust-posture line ABOVE this block, so we
+// don't duplicate it here.
+function formatHighYieldVerbose(report) {
+  const lines = [];
+  lines.push(color("green", "✓ ") + color("bold", "Verified this deploy:"));
+  // Scripts
+  if (Array.isArray(report?.publicDeps?.thirdParties)) {
+    const hosts = report.publicDeps.thirdParties.slice(0, 6).map(d => d.host || d).filter(Boolean);
+    const more = report.publicDeps.thirdParties.length > 6
+      ? `, +${report.publicDeps.thirdParties.length - 6} more` : "";
+    lines.push(color("dim", `  · ${hosts.length} third-party script${hosts.length === 1 ? "" : "s"} intact (${hosts.join(", ")}${more})`));
+  }
+  // Headers (always-on)
+  const hh = report?.httpHeaders;
+  if (hh?.reachable) {
+    const hdrs = [];
+    if (hh.csp?.present) hdrs.push("CSP enforced");
+    if (hh.hsts?.present) hdrs.push(`HSTS${hh.hsts.preload ? " preload" : ""}`);
+    if (hh.xFrameOptions?.present) hdrs.push(`X-Frame-Options ${hh.xFrameOptions.value || ""}`.trim());
+    if (hh.xContentTypeOptions?.present) hdrs.push("X-Content-Type-Options nosniff");
+    if (hh.referrerPolicy?.present) hdrs.push(`Referrer-Policy ${hh.referrerPolicy.value || ""}`.trim());
+    if (hh.permissionsPolicy?.present) hdrs.push("Permissions-Policy set");
+    if (hdrs.length > 0) lines.push(color("dim", `  · ${hdrs.join(" · ")}`));
+  }
+  // Cert
+  if (report?.cert || report?._meta?.certSerial) {
+    const cert = report.cert || {};
+    const days = cert.notAfter
+      ? Math.floor((new Date(cert.notAfter).getTime() - Date.now()) / 86400000)
+      : null;
+    const certLine = days !== null
+      ? `Cert: ${days}d until expiry${cert.issuer ? " · issued by " + cert.issuer : ""}`
+      : `Cert: ${cert.issuer || "issued"}`;
+    lines.push(color("dim", `  · ${certLine}`));
+  }
+  // Cookies (v0.16.0)
+  const ck = report?.cookies;
+  if (ck?.reachable) {
+    if (ck.count === 0) {
+      lines.push(color("dim", `  · Cookies: none set`));
+    } else {
+      const flags = [];
+      if (!ck.anyMissingSecure) flags.push("all Secure");
+      if (!ck.anyMissingHttpOnly) flags.push("all HttpOnly");
+      if (!ck.anyMissingSameSite) flags.push("all SameSite set");
+      lines.push(color("dim", `  · Cookies: ${ck.count} set${flags.length ? " · " + flags.join(" + ") : ""}`));
+    }
+  }
+  // Source maps (v0.16.0)
+  const sm = report?.sourceMaps;
+  if (sm?.reachable) {
+    lines.push(color("dim", `  · ${sm.exposed ? `Source maps EXPOSED on ${sm.exposedCount} script(s)` : "No source maps exposed"}`));
+  }
+  // Mixed content
+  if (Array.isArray(report?.publicDeps?.thirdParties)) {
+    const insecure = report.publicDeps.thirdParties.filter(d => d.loadedOverHttps === false).length;
+    lines.push(color("dim", `  · ${insecure === 0 ? "No mixed-content (all third-parties over HTTPS)" : `Mixed content: ${insecure} resource(s) over HTTP`}`));
+  }
+  return lines.join("\n");
+}
+
+// v0.16.3 — preview-diff per-signal comparison. Render N vs N+1 signal
+// values for both sides side-by-side so the customer SEES that every
+// signal was checked, even when delta_count=0. Without this, preview-diff
+// was silent on non-changing signals and looked like a binary "did
+// anything change" detector. With this, every preview-diff output proves
+// the 9 signals were exercised on both URLs.
+function formatPreviewDiffPerSignal(prev, prod, options = {}) {
+  if (!prev || !prod) return null;
+  const verbose = options.verbose === true;
+  // v0.16.5 — caller may pass the application_surface.scripts diff so the
+  // Scripts row can name the specific hosts that were added/removed
+  // (preview-diff was rendering "Scripts | 2 → 3" with no indication of
+  // WHICH vendor changed; the answer was buried in summary_lines above).
+  const scriptDeltas = Array.isArray(options.scriptDeltas) ? options.scriptDeltas : [];
+  const rows = [];
+  const push = (name, l, r, extra) => rows.push({ name, prev: l, prod: r, same: l === r, extra: extra || null });
+
+  if (typeof prev?.score === "number" || typeof prod?.score === "number") {
+    const dbrL = typeof prev?.score === "number" ? `${prev.score.toFixed(1)}${prev.grade ? " " + prev.grade : ""}` : "—";
+    const dbrR = typeof prod?.score === "number" ? `${prod.score.toFixed(1)}${prod.grade ? " " + prod.grade : ""}` : "—";
+    push("DBR", dbrL, dbrR);
+  }
+
+  const prevScripts = prev?.publicDeps?.thirdPartyCount;
+  const prodScripts = prod?.publicDeps?.thirdPartyCount;
+  if (prevScripts !== undefined || prodScripts !== undefined) {
+    // Sub-lines naming the specific hosts that changed (added/removed),
+    // when application_surface.scripts is available. A substitution
+    // (a.com → c.com, count unchanged) still surfaces because the diff
+    // is computed by host-set, not by count.
+    const scriptSubLines = scriptDeltas.length > 0
+      ? scriptDeltas.map((s) => {
+          const sigil = s.kind === "added" ? "+" : s.kind === "removed" ? "-" : "~";
+          const tone = s.kind === "added" ? "yellow" : s.kind === "removed" ? "red" : "dim";
+          return color(tone, `${sigil} ${s.host}`);
+        })
+      : null;
+    push("Scripts", String(prevScripts ?? "—"), String(prodScripts ?? "—"), scriptSubLines);
+  }
+
+  const hdrSummary = (h) => {
+    if (!h?.reachable) return "—";
+    const flags = [];
+    flags.push(h.csp?.present ? "CSP✓" : "CSP✗");
+    flags.push(h.hsts?.present ? `HSTS${h.hsts.preload ? "+preload" : ""}✓` : "HSTS✗");
+    flags.push(h.xFrameOptions?.present ? "XFO✓" : "XFO✗");
+    return flags.join(" ");
+  };
+  if (prev?.httpHeaders || prod?.httpHeaders) {
+    push("Headers", hdrSummary(prev?.httpHeaders), hdrSummary(prod?.httpHeaders));
+  }
+
+  const ckSummary = (c) => {
+    if (!c) return "—";
+    if (!c.reachable) return "unreachable";
+    const issues = [];
+    if (c.anyMissingSecure) issues.push("Secure");
+    if (c.anyMissingHttpOnly) issues.push("HttpOnly");
+    if (c.anyMissingSameSite) issues.push("SameSite");
+    const tag = issues.length ? `miss:${issues.join(",")}` : "all flags";
+    return `${c.count ?? 0} (${tag})`;
+  };
+  if (prev?.cookies || prod?.cookies) push("Cookies", ckSummary(prev?.cookies), ckSummary(prod?.cookies));
+
+  const smSummary = (s) => {
+    if (!s) return "—";
+    if (!s.reachable) return "unreachable";
+    if (s.exposed) return `${s.exposedCount} EXPOSED`;
+    return "none exposed";
+  };
+  if (prev?.sourceMaps || prod?.sourceMaps) push("Source maps", smSummary(prev?.sourceMaps), smSummary(prod?.sourceMaps));
+
+  const mcSummary = (m) => {
+    if (m === null || m === undefined) return "—";
+    if (typeof m === "number") return String(m);
+    if (typeof m === "object") {
+      if (typeof m.insecureCount === "number") return String(m.insecureCount);
+      if (typeof m.count === "number") return String(m.count);
+    }
+    return "—";
+  };
+  if (prev?.mixedContent !== null || prod?.mixedContent !== null) {
+    push("Mixed content", mcSummary(prev?.mixedContent), mcSummary(prod?.mixedContent));
+  }
+
+  const ppSummary = (p) => {
+    if (!p?.probed) return "—";
+    const protected_ = p.protectedCount ?? 0;
+    const exposed = p.exposedCount ?? 0;
+    const total = protected_ + exposed;
+    return total === 0 ? "0/0" : `${protected_}/${total} protected`;
+  };
+  if (prev?.protectedPaths || prod?.protectedPaths) {
+    push("Protected paths", ppSummary(prev?.protectedPaths), ppSummary(prod?.protectedPaths));
+  }
+
+  const certSummary = (c) => {
+    if (!c) return "—";
+    if (c.spkiSha256) return `${String(c.spkiSha256).slice(0, 10)}…`;
+    return c.issuer || "—";
+  };
+  if (prev?.cert || prod?.cert) push("Cert SPKI", certSummary(prev?.cert), certSummary(prod?.cert));
+
+  if (prev?.tlsVersion || prod?.tlsVersion) push("TLS", prev?.tlsVersion || "—", prod?.tlsVersion || "—");
+
+  const prevSub = prev?.publicSurface?.subdomainCount;
+  const prodSub = prod?.publicSurface?.subdomainCount;
+  if (prevSub !== undefined || prodSub !== undefined) {
+    push("Subdomains", String(prevSub ?? "—"), String(prodSub ?? "—"));
+  }
+
+  if (rows.length === 0) return null;
+
+  if (!verbose) {
+    // Compact 1-line summary: "✓ 9/9 signals match (preview ↔ production)"
+    const sameCount = rows.filter((r) => r.same).length;
+    const allMatch = sameCount === rows.length;
+    const symbol = allMatch ? color("green", "✓ ") : color("yellow", "~ ");
+    const head = symbol + color("bold", `${sameCount}/${rows.length} signals match`) + color("dim", " (preview ↔ production)");
+    // v0.16.5 — if the Scripts row changed AND we have the host-level
+    // diff, append a sub-line naming each added/removed host even in
+    // compact mode. Keeps the customer from having to scroll up to
+    // summary_lines to find out WHICH vendor changed.
+    const scriptsRow = rows.find((r) => r.name === "Scripts");
+    if (scriptsRow && scriptsRow.extra && scriptsRow.extra.length > 0) {
+      const shown = scriptsRow.extra.slice(0, 5);
+      const more = scriptsRow.extra.length > 5 ? color("dim", `  +${scriptsRow.extra.length - 5} more`) : "";
+      return [head, ...shown.map((l) => "  " + l)].join("\n") + (more ? "\n" + more : "");
+    }
+    return head;
+  }
+
+  // Verbose: per-row table
+  const lines = [];
+  lines.push("");
+  lines.push(color("bold", "Per-signal verification (preview ↔ production):"));
+  const nameWidth = Math.max(...rows.map((r) => r.name.length));
+  const prevWidth = Math.max(...rows.map((r) => r.prev.length));
+  for (const r of rows) {
+    const arrow = r.same ? color("dim", "↔") : color("yellow", "→");
+    const valueColor = r.same ? "dim" : "yellow";
+    lines.push(
+      "  " +
+      color("bold", r.name.padEnd(nameWidth)) + "  " +
+      color(valueColor, r.prev.padEnd(prevWidth)) + "  " +
+      arrow + "  " +
+      color(valueColor, r.prod)
+    );
+    // v0.16.5 — sub-lines under Scripts row naming added/removed hosts.
+    // Indent past the name+value columns so the per-host info reads as
+    // a nested detail of the parent row, not a peer signal.
+    if (r.extra && r.extra.length > 0) {
+      const indent = "  " + " ".repeat(nameWidth) + "  " + " ".repeat(prevWidth) + "     ";
+      for (const sub of r.extra) lines.push(indent + sub);
+    }
+  }
+  return lines.join("\n");
+}
+
+// Helper: pretty-print 1-3 alerts (when ship_decision = review/block) ABOVE
+// the trust-posture line, so the actionable change is the FIRST thing the
+// customer sees. Each alert is one line with an emoji + concise summary.
+function formatAlertsLine(findings, max = 3) {
+  if (!Array.isArray(findings) || findings.length === 0) return null;
+  const sortedAlerts = [...findings].sort(
+    (a, b) => severityRank(b.severity) - severityRank(a.severity),
+  );
+  const lines = [];
+  for (const f of sortedAlerts.slice(0, max)) {
+    const sev = String(f.severity || "").toLowerCase();
+    const sym = sev === "critical" ? "⛔" : sev === "high" ? "⚠" : "ⓘ";
+    const c = sev === "critical" ? "red" : sev === "high" ? "yellow" : "dim";
+    const title = f.title || f.id || "finding";
+    lines.push(color(c, `${sym} ${title}`));
+  }
+  if (sortedAlerts.length > max) {
+    lines.push(color("dim", `  +${sortedAlerts.length - max} more (run with --verbose)`));
+  }
+  return lines.join("\n");
+}
+
+function isVerboseMode(args) {
+  return args.includes("--verbose") || args.includes("--explain");
+}
+
+// One-line "decision pulse" — the prominent first line that tells the customer
+// the answer to "is this deploy safe to announce?" in <80 characters.
+// Wording branches on context:
+//   - Diff context (deploy-check / trust-diff / preview-diff): talks about
+//     CHANGES vs the baseline ("no public-surface drift detected").
+//   - Basic scan (no baseline): talks about FINDINGS from this scan
+//     ("no high-severity findings").
+function formatDecisionPulse({ shipDecision, alertCount, unreachable, diffContext }) {
+  if (unreachable) {
+    return color("red", "⛔ UNREACHABLE") + color("dim", " · scanner couldn't reach the domain");
+  }
+  const n = alertCount || 0;
+  if (shipDecision === "pass") {
+    const tail = diffContext
+      ? "no public-surface drift detected"
+      : "no high-severity findings";
+    return color("green", "✓ PASS") + color("dim", " · " + tail);
+  }
+  if (shipDecision === "review") {
+    const noun = diffContext ? "public-surface change" : "high-severity finding";
+    return color("yellow", "⚠ REVIEW") + color("dim", ` · ${n} ${noun}${n === 1 ? "" : "s"}`);
+  }
+  if (shipDecision === "block") {
+    const noun = diffContext ? "critical change" : "critical finding";
+    return color("red", "⛔ BLOCK") + color("dim", ` · ${n} ${noun}${n === 1 ? "" : "s"}`);
+  }
+  return color("dim", "· no decision");
+}
+
+// "◆ Cipherwake — domain" — the v0.16.0 brand+domain header line. Shorter
+// than the old AI banner so the decision-pulse line below it carries the
+// status. The banner color stays neutral (no decision color) because the
+// decision-pulse line owns that semantic.
+function formatBrandHeader(domain) {
+  return color("bold", "◆ Cipherwake") + color("dim", " — ") + color("bold", domain);
+}
+
+// Persist last-scan state to ~/.config/cipherwake/last-scan.json.
+// Feeds the cipherwake-statusline + cipherwake-prompt-hook + cipherwake-chat-hook
+// scripts so users get persistent ambient state in their AI coder's surfaces.
+//
+// v0.15.1 (2026-05-22): ALSO writes a per-repo state file at
+// .cipherwake/last-status.json IF that directory exists in cwd (created by
+// `pqcheck setup --auto`). This gives Cursor / Copilot / Continue / Cline
+// agents a read-on-demand surface inside the repo — they see the latest
+// trust posture for the customer's primary domain when scanning repo state.
+//
+// Best-effort — never throws (a write failure doesn't break the scan).
+async function writeLastScanFile(payload) {
+  try {
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const fs = await import("node:fs/promises");
+    const enriched = { ...payload, written_at: new Date().toISOString() };
+
+    // Per-user state file (primary, always written)
+    const userDir = path.join(os.homedir(), ".config", "cipherwake");
+    await fs.mkdir(userDir, { recursive: true });
+    await fs.writeFile(path.join(userDir, "last-scan.json"), JSON.stringify(enriched, null, 2));
+
+    // Per-repo state file (secondary, only if .cipherwake/ exists in cwd
+    // — i.e., this repo went through `pqcheck setup --auto`). Gives Cursor/
+    // Copilot/Continue/Cline agents a repo-local artifact they pick up
+    // automatically when reading workspace state.
+    const repoDir = path.join(process.cwd(), ".cipherwake");
+    try {
+      await fs.access(repoDir);
+      await fs.writeFile(path.join(repoDir, "last-status.json"), JSON.stringify(enriched, null, 2));
+    } catch {
+      // .cipherwake/ doesn't exist here — that's fine, user didn't run setup --auto in this repo
+    }
+  } catch {
+    // best-effort
+  }
+}
+
+// Map ship_decision → exit code so CI / shell scripts can act on it
+// without parsing the structured block. pass=0, review=1, block=2.
+function shipDecisionExitCode(d) {
+  return d === "block" ? 2 : d === "review" ? 1 : 0;
+}
+
 // ---------- format renderers (CSV + markdown) ----------
 
 let _csvHeaderPrinted = false;
@@ -477,7 +1482,7 @@ function printMarkdown(r, multi) {
   // not the old "watch free / weekly digest"). PR-comment context plants
   // team-invitation idea for the eventual Growth tier upgrade.
   lines.push(`📌 **Monitor ${r.domain} continuously?** ${API_BASE}/watch/${encodeURIComponent(r.domain)}`);
-  lines.push(`Cipherwake Starter $29/mo · 5 domains · daily scans + email alerts on cert/script/posture changes. Invite your team on Growth ($79/mo) when ready.`);
+  lines.push(`Cipherwake Founder Pro $19.99/mo (launch pricing, locked while subscription active) · 5 watched domains · daily scans · full CI Trust Gate · approved-vendor allowlist · webhook delivery (Slack incoming-webhook URLs work).`);
   if (multi) lines.push("\n---\n");
   console.log(lines.join("\n"));
 }
@@ -607,7 +1612,7 @@ function printReport(r) {
   // 2026-05-14: copy must match current locked revenue plan ($29 Starter,
   // not the old "free 1-domain weekly digest").
   console.log(color("violet", `  📌 Monitor ${r.domain} daily: ${API_BASE}/watch/${encodeURIComponent(r.domain)}`));
-  console.log(color("dim",    `     Cipherwake Starter $29/mo · 5 watched domains · email alerts · cancel anytime`));
+  console.log(color("dim",    `     Cipherwake Founder Pro $19.99/mo · 5 watched domains · email alerts · launch pricing locked while subscription active · cancel anytime`));
   console.log("");
   console.log(color("dim",    `  → Full report: ${API_BASE}/?check=${encodeURIComponent(r.domain)}`));
   console.log(color("dim",    `  → Share this:  ${API_BASE}/r/${encodeURIComponent(r.domain)}`));
@@ -654,7 +1659,7 @@ ${color("bold", "What you'll see:")} a single letter grade (A–F), the score co
 top findings, and a link to the full interactive report.
 
 ${color("bold", "Free + open methodology.")} No account needed for single-domain scans.
-Add ${color("dim", "QUANTAPACT_API_KEY")} env var for higher rate limits + private results
+Add ${color("dim", "CIPHERWAKE_API_KEY")} env var for higher rate limits + private results
 (create one at ${color("dim", "https://cipherwake.io/signin")}).
 `);
 }
@@ -676,7 +1681,10 @@ ${color("bold", "Commands:")}
   npx pqcheck watch <domain>                    Add a domain to your watched-domain list (requires CIPHERWAKE_API_KEY)
   npx pqcheck onboard <domain>                  One-command setup wizard (scan + init + vendors + checklist + open browser)
   npx pqcheck init                              Interactive scaffold for .github/workflows/cipherwake.yml
-  npx pqcheck deploy-check <domain>             Pre-deploy trust gate (Trust Diff vs last scan; deploy-friendly framing)
+  npx pqcheck deploy-check <domain>             Pre-deploy trust gate (Trust Diff vs last scan; deploy-friendly framing) — see also: AI Coder Protocol at https://cipherwake.io/methodology/ai-coder-protocol
+  npx pqcheck guard --domain <D> -- <cmd>       NEW: wrap any deploy command. Runs deploy-check first; conditionally runs <cmd> based on ship_decision. The strongest single artifact for AI-coder workflows.
+  npx pqcheck protocol install                  NEW: install the AI Coder Protocol into your CLAUDE.md / .cursorrules (Rule 17 consent flow)
+  npx pqcheck guards <init|list|run>            EXPERIMENTAL (BETA): manage Site Guards (.cipherwake/guards.json) — runtime policies for source-maps / mixed-content / approved-hosts / protected-paths / cookie-flags / link-integrity. See: https://cipherwake.io/methodology/site-guards
   npx pqcheck release-checklist [domain]        Print a pre-release trust checklist (markdown, offline)
   npx pqcheck vendors export <domain>           Write cipherwake.vendors.json from observed third-party scripts
   npx pqcheck vendors check <domain>            Compare current scan to lockfile; exit 4 on new origins (Free CI gate)
@@ -839,7 +1847,7 @@ async function runLockCommand(args) {
   try {
     const resp = await fetch(`${API_BASE}/api/scan?domain=${encodeURIComponent(domain)}`, {
       method: "GET",
-      headers: apiHeaders({ "user-agent": `pqcheck-cli/${VERSION} (lock)` }),
+      headers: apiHeaders({ "user-agent": `pqcheck-cli/${VERSION}${CI_ACTION_SUFFIX} (lock)` }),
     });
     if (!stdout) process.stderr.write("\r\x1b[K");
     if (!resp.ok) {
@@ -919,7 +1927,7 @@ function buildQxmManifest(report, crypto) {
   return {
     schema: "https://cipherwake.io/schemas/qxm/v1",
     schemaVersion: 1,
-    generator: `pqcheck-cli/${VERSION}`,
+    generator: `pqcheck-cli/${VERSION}${CI_ACTION_SUFFIX}`,
     generatedAt: report.generatedAt || new Date().toISOString(),
     domain: report.domain,
     reachable: !!report.reachable,
@@ -1162,7 +2170,7 @@ async function runDepsCommand(args) {
       batch.map(async (h) => {
         try {
           const r = await fetch(`${API_BASE}/api/scan?domain=${encodeURIComponent(h.host)}&source=cli-deps`, {
-            headers: apiHeaders({ "user-agent": `pqcheck-cli/${VERSION} (deps)` }),
+            headers: apiHeaders({ "user-agent": `pqcheck-cli/${VERSION}${CI_ACTION_SUFFIX} (deps)` }),
           });
           if (!r.ok) return { ...h, types: Array.from(h.types), scan: null, error: `${r.status}` };
           const body = await r.json();
@@ -1401,7 +2409,7 @@ async function fetchPageHTML(domain) {
       method: "GET",
       redirect: "follow",
       signal: ctrl.signal,
-      headers: { "User-Agent": `pqcheck-cli/${VERSION} (deps; +https://cipherwake.io)` },
+      headers: { "User-Agent": `pqcheck-cli/${VERSION}${CI_ACTION_SUFFIX} (deps; +https://cipherwake.io)` },
     });
     clearTimeout(t);
     if (!resp.ok) return null;
@@ -1858,7 +2866,7 @@ async function runHistoryCommand(args) {
   let h;
   try {
     const r = await fetch(`${API_BASE}/api/history?domain=${encodeURIComponent(domain)}&days=${days}`, {
-      headers: apiHeaders({ "user-agent": `pqcheck-cli/${VERSION} (history)` }),
+      headers: apiHeaders({ "user-agent": `pqcheck-cli/${VERSION}${CI_ACTION_SUFFIX} (history)` }),
     });
     if (!r.ok) {
       console.error(color("red", `error: ${r.status} ${r.statusText}`));
@@ -1941,7 +2949,7 @@ async function runChangesCommand(args) {
   let summary;
   try {
     const r = await fetch(`${API_BASE}/api/changes-summary?domain=${encodeURIComponent(domain)}`, {
-      headers: apiHeaders({ "user-agent": `pqcheck-cli/${VERSION} (changes)` }),
+      headers: apiHeaders({ "user-agent": `pqcheck-cli/${VERSION}${CI_ACTION_SUFFIX} (changes)` }),
     });
     if (!r.ok) {
       console.error(color("red", `error: ${r.status} ${r.statusText}`));
@@ -2015,8 +3023,177 @@ async function runChangesCommand(args) {
  *   2 = fail     — deltas observed at or above fail-on threshold
  *   3 = error    — auth/quota/network failure
  *
- * Requires CIPHERWAKE_API_KEY env var (Free tier: 30 calls/mo at /account#api-keys).
+ * Authentication paths (per server's applyRepoQuota — supports all three):
+ *   • CIPHERWAKE_API_KEY=qpk_... (paid quota, higher cap, off-Actions usage)
+ *   • GITHUB_ACTIONS=true + id-token (OIDC, keyless, Free 100 calls/repo/mo)
+ *   • No auth (anonymous per-IP rate limit — first-use friction-free path)
+ *
+ * R74-confirm friction fix (GPT 2026-05-22): previously the CLI hard-gated
+ * on CIPHERWAKE_API_KEY before even attempting the call, which broke the
+ * frictionless first-use AI-coder funnel. The hard-gate was gratuitous —
+ * the server has supported anonymous calls since the applyRepoQuota
+ * middleware shipped. Now the CLI just attempts the call with whatever
+ * auth context is available; server applies the appropriate quota path.
  */
+// R74-confirm friction fix (GPT 2026-05-22): when deploy-check has no
+// baseline yet (first-deploy of a brand-new domain), fall through to
+// /api/scan and emit ship_decision based on current absolute findings.
+// This makes `pqcheck deploy-check <new-domain> --ai` work on first call
+// with zero setup — no API key, no prior scan, nothing.
+async function runScanBasedDeployCheck(domain, args) {
+  const headers = {
+    "Content-Type": "application/json",
+    "User-Agent": `pqcheck-cli/${VERSION}${CI_ACTION_SUFFIX}`,
+  };
+  if (QP_API_KEY) headers["Authorization"] = `Bearer ${QP_API_KEY}`;
+
+  let resp;
+  try {
+    resp = await fetch(`${API_BASE}/api/scan?domain=${encodeURIComponent(domain)}`, { headers });
+  } catch (err) {
+    console.error(color("red", `error: network failure calling /api/scan: ${err.message}`));
+    process.exit(3);
+  }
+  if (!resp.ok) {
+    console.error(color("red", `error: /api/scan returned ${resp.status}`));
+    process.exit(3);
+  }
+  const report = await resp.json();
+  const findings = Array.isArray(report.findings) ? report.findings : [];
+  const maxSev = highestSeverity(findings);
+  let shipDecision = computeShipDecision({ maxSeverity: maxSev });
+  const topFinding = [...findings].sort((a, b) => severityRank(b.severity) - severityRank(a.severity))[0];
+
+  // Unreachable / degraded → force "block" with an UNREACHABLE display label
+  // downstream. See main scan path for the rationale: an undeployed-or-broken
+  // domain can't be evaluated, so the AI agent must halt announcement and ask
+  // the human (was this expected? did the deploy fail?). The `unreachable`
+  // field travels in the state file + structured block so statusline /
+  // VS Code ext / chat-hook can render "UNREACHABLE" instead of generic
+  // "BLOCK" — semantically clearer for this specific failure mode.
+  // Treat as "cannot evaluate" — and route through the UNREACHABLE label —
+  // when either:
+  //   • reachable === false  (no TCP/TLS handshake at all)
+  //   • scanAvailable === false  (TCP/TLS up, but scan couldn't produce a
+  //     coherent fingerprint — e.g. medium.com churning vendor scripts
+  //     faster than our dual-fingerprint check)
+  //
+  // _meta.degraded alone is too broad (fires on cache fallback + mid-scan
+  // state changes on otherwise-scoreable domains like stripe.com), so we
+  // narrow to the structured failure signals the server emits.
+  const unreachable = report?.reachable === false || report?.scanAvailable === false;
+  if (unreachable) {
+    shipDecision = "block";
+  }
+
+  let topIssue, whyMatters, nextActions;
+  if (unreachable) {
+    const isUnstable = report?.reason === "scan_unstable";
+    topIssue = isUnstable
+      ? "[REACHABILITY] Scan unstable — site changing faster than we can scan it"
+      : "[REACHABILITY] Domain unreachable — TLS probe failed or DNS unresolved";
+    whyMatters = report?.userMessage || report?._meta?.degradedReason || (isUnstable
+      ? "The scanner reached the site but couldn't produce a coherent fingerprint — rolling deploy, rapid A/B variation, or fast vendor-script rotation. Retry usually succeeds once the site settles."
+      : "The scanner couldn't reach the domain on port 443. Either DNS hasn't propagated, the deploy hasn't completed, or this domain isn't deployed at the address we expected.");
+    nextActions = isUnstable
+      ? [
+          `Wait ~1 minute then retry: npx pqcheck deploy-check ${domain} --ai`,
+          `View full report (last successful scan): ${API_BASE}/r/${domain}`,
+        ]
+      : [
+          `Check the domain is correct (typo?): ${domain}`,
+          `Verify DNS: dig +short ${domain}`,
+          `Verify deploy completed and TLS is live on https://${domain}`,
+          `Re-run after fix: npx pqcheck deploy-check ${domain} --ai`,
+        ];
+  } else {
+    topIssue = topFinding
+      ? `[${String(topFinding.severity || "").toUpperCase()}] ${topFinding.title || topFinding.detail || "finding"}`
+      : "No findings at or above LOW severity.";
+    whyMatters = topFinding?.detail || "DBR scoring measures harvest-now-decrypt-later risk on the public TLS surface.";
+    nextActions = shipDecision === "pass"
+      ? [`Domain looks healthy on first scan. View full report: ${API_BASE}/r/${domain}`]
+      : [
+          `Review finding above and decide if it was intentional.`,
+          `View full report: ${API_BASE}/r/${domain}`,
+          `Subsequent deploy-checks will diff against this scan as baseline.`,
+        ];
+  }
+
+  // v0.16.0 high-yield rendering — same shape as runOneScan but with the
+  // "first-deploy" context line above the brand header (since this path
+  // fires only when there's no baseline to diff against).
+  const verbose = isVerboseMode(args);
+  const highSevFindings = findings.filter((f) => severityRank(f.severity) >= 3);
+  const alertCount = highSevFindings.length;
+
+  console.log("");
+  console.log(color("dim", `  ℹ first deploy-check for ${domain} — using current scan state (no baseline yet to diff against)`));
+  console.log("");
+  console.log(formatBrandHeader(domain));
+  console.log("");
+  console.log(formatDecisionPulse({ shipDecision, alertCount, unreachable, diffContext: true }));
+
+  if (unreachable) {
+    console.log(formatAiBody({ topIssue, whyMatters, nextActions }));
+  } else {
+    if (alertCount > 0) {
+      const alerts = formatAlertsLine(highSevFindings);
+      if (alerts) console.log(alerts);
+    }
+    const tpl = formatTrustPostureLine(report);
+    if (tpl) console.log(tpl);
+    const vsl = formatVerifiedSignalsLine(report);
+    if (vsl) console.log(vsl);
+    if (verbose) {
+      console.log("");
+      console.log(formatHighYieldVerbose(report));
+    } else {
+      console.log(color("dim", "  Run with --verbose to see all verified signals."));
+    }
+  }
+
+  console.log(formatAiFooterBlock({
+    status: shipDecision,
+    domain,
+    kind: "scan",
+    dbr: report.score,
+    grade: report.grade,
+    max_severity: maxSev,
+    ship_decision: shipDecision,
+    unreachable: unreachable ? "true" : "false",
+    top_issue: unreachable
+      ? "findings.reachability.unreachable"
+      : (topFinding ? `findings.${topFinding.id || "unknown"}` : "none"),
+    findings_high: findings.filter((f) => severityRank(f.severity) >= severityRank("high")).length,
+    findings_critical: findings.filter((f) => severityRank(f.severity) >= severityRank("critical")).length,
+    scanned_at: new Date().toISOString(),
+    advisory_only: true,
+    note: unreachable
+      ? "domain unreachable on port 443; deploy may have failed or DNS not propagated"
+      : "first-deploy: no baseline yet, scored on current state",
+  }));
+
+  await writeLastScanFile({
+    domain,
+    kind: "scan",
+    score: typeof report.score === "number" ? report.score : null,
+    grade: report.grade || null,
+    max_severity: maxSev,
+    ship_decision: shipDecision,
+    unreachable: unreachable || false,
+    top_issue: unreachable
+      ? "findings.reachability.unreachable"
+      : (topFinding?.id || topFinding?.title || null),
+    note: unreachable
+      ? "domain unreachable on port 443; deploy may have failed or DNS not propagated"
+      : "first-deploy: no baseline yet, scored on current state",
+  });
+
+  // Exit code: 0 on pass, non-zero on review/block (matches deploy-check contract)
+  process.exit(shipDecision === "pass" ? 0 : 1);
+}
+
 async function runTrustDiffCommand(args) {
   const positional = args.filter((a) => !a.startsWith("-") && !isFlagValue(args, a));
   if (positional.length === 0) {
@@ -2029,53 +3206,175 @@ async function runTrustDiffCommand(args) {
     console.error(color("red", `error: invalid domain "${positional[0]}"`));
     process.exit(3);
   }
-  if (!QP_API_KEY) {
-    console.error(color("red", "error: pqcheck trust-diff requires CIPHERWAKE_API_KEY"));
-    console.error(color("dim", "Generate a free key (30 calls/mo) at https://cipherwake.io/account#api-keys"));
-    console.error(color("dim", "Then: export CIPHERWAKE_API_KEY=qpk_<32-hex>"));
-    process.exit(3);
-  }
 
   const baseline = parseFlag(args, "--baseline") || "last-week";
   const failOn = parseFlag(args, "--fail-on") || "high";
   const format = parseFlag(args, "--format") || "pretty";
 
+  // Build headers conditionally — Authorization is set ONLY if the user has
+  // an API key. Without it, the server's applyRepoQuota falls through to the
+  // anonymous per-IP rate limit path (just like /api/scan).
+  const headers = {
+    "Content-Type": "application/json",
+    "User-Agent": `pqcheck-cli/${VERSION}${CI_ACTION_SUFFIX}`,
+  };
+  if (QP_API_KEY) {
+    headers["Authorization"] = `Bearer ${QP_API_KEY}`;
+  }
+
   let resp;
   try {
     resp = await fetch(`${API_BASE}/api/trust-diff`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${QP_API_KEY}`,
-        "User-Agent": `pqcheck-cli/${VERSION}`,
-      },
+      headers,
       body: JSON.stringify({ domain, baseline, fail_on: failOn }),
     });
   } catch (err) {
     console.error(color("red", `error: network failure calling /api/trust-diff: ${err.message}`));
-    process.exit(3);
+    // v0.16.13: in AI mode, emit a ship_decision=review block so the
+    // calling agent doesn't silently treat a fetch failure as "no signal".
+    return emitAiGuardReviewAndExit(args, {
+      code: "deploy_check_fetch_failed",
+      message: `Network failure: ${err?.message || "fetch failed"}`,
+      exitCode: 3,
+    });
   }
 
   if (resp.status === 401 || resp.status === 403) {
     await handleAuthError(resp);
-    process.exit(3);
+    return emitAiGuardReviewAndExit(args, {
+      code: "deploy_check_auth_failed",
+      message: `Authorization failed (${resp.status}). Check CIPHERWAKE_API_KEY or hit /account#api-keys.`,
+      exitCode: 3,
+    });
   }
   if (resp.status === 429) {
     const body = await safeJSON(resp);
-    console.error(color("red", "error: Trust Diff API quota exceeded for this month"));
+    console.error(color("red", "error: Trust Diff API quota exceeded"));
     if (body?.message) console.error(color("dim", body.message));
-    process.exit(3);
+    console.error(color("dim", "Higher quota via free API key (no card): https://cipherwake.io/account#api-keys"));
+    return emitAiGuardReviewAndExit(args, {
+      code: "deploy_check_quota_exceeded",
+      message: body?.message || "Trust Diff monthly quota exceeded — upgrade or wait for monthly reset.",
+      exitCode: 3,
+    });
+  }
+  // R74-confirm friction fix #2 (GPT 2026-05-22): 404 on first-deploy is
+  // expected — the domain has never been scanned, so there's no baseline to
+  // diff against. Instead of asking the user to run `pqcheck <domain>` first
+  // (a friction step that breaks the AI-coder funnel), automatically fall
+  // through to /api/scan, populate the cache, and emit ship_decision based
+  // on the scan's current absolute state. Subsequent deploy-checks will
+  // have a baseline and produce a real drift verdict.
+  if (resp.status === 404 && parseAiMode(args)) {
+    return await runScanBasedDeployCheck(domain, args);
   }
   if (!resp.ok) {
     const body = await safeJSON(resp);
     console.error(color("red", `error: /api/trust-diff returned ${resp.status}`));
     if (body?.message) console.error(color("dim", body.message));
-    process.exit(3);
+    if (body?.hint) console.error(color("dim", body.hint));
+    return emitAiGuardReviewAndExit(args, {
+      code: "deploy_check_server_error",
+      message: body?.message || `Cipherwake server returned ${resp.status}.`,
+      exitCode: 3,
+    });
   }
 
   const result = await resp.json();
   const verdict = result.verdict || "pass";
   const deltas = Array.isArray(result.deltas) ? result.deltas : [];
+
+  // AI Coder Mode — three-layer output (banner / body / structured block).
+  if (parseAiMode(args)) {
+    const maxSev = highestSeverity(deltas);
+    const hasUnexpectedDiff = deltas.length > 0;
+    const shipDecision = computeShipDecision({ maxSeverity: maxSev, hasUnexpectedDiff });
+    const topDelta = [...deltas].sort((a, b) => severityRank(b.severity) - severityRank(a.severity))[0];
+
+    const topIssue = topDelta
+      ? `[${String(topDelta.severity || "").toUpperCase()}] ${topDelta.title || topDelta.type}${topDelta.what_changed ? ` — ${topDelta.what_changed}` : ""}`
+      : "No deltas observed since baseline.";
+    const whyMatters = topDelta
+      ? `This change happened between your baseline (${baseline}) and now. If it's an intentional change you shipped, accept it. If unexpected, your domain's posture drifted without an associated deploy — investigate before the diff compounds.`
+      : `Your public trust posture is stable since ${baseline}. No CSP / HSTS / cert / SPKI / DMARC / vendor-script regressions.`;
+    const nextActions = shipDecision === "pass"
+      ? [`Posture stable. Safe to announce deploy.`]
+      : [
+          `Review each delta and decide if it was intentional.`,
+          `If intentional: accept (no action needed in CI; quota tick recorded).`,
+          `If not intentional: revert the deploy or investigate the drift source.`,
+        ];
+
+    // v0.16.0 high-yield rendering for trust-diff.
+    const verbose = isVerboseMode(args);
+    const diffNoChange = deltas.length === 0;
+    const fakeReport = {
+      domain,
+      score: result.current_score,
+      grade: result.current_grade,
+      _meta: { lastChanged: result.last_changed },
+      sectorRanking: result.sectorRanking,
+    };
+
+    console.log("");
+    console.log(formatBrandHeader(domain));
+    console.log("");
+    console.log(formatDecisionPulse({ shipDecision, alertCount: deltas.length, unreachable: false, diffContext: true }));
+
+    if (deltas.length > 0) {
+      // Surface top deltas as alerts
+      const alertFindings = deltas.slice(0, 3).map((d) => ({
+        severity: d.severity || "medium",
+        title: d.title || d.what_changed || d.type || "drift",
+        id: d.id,
+      }));
+      const alerts = formatAlertsLine(alertFindings);
+      if (alerts) console.log(alerts);
+      if (deltas.length > 3) console.log(color("dim", `  +${deltas.length - 3} more (run with --verbose)`));
+    }
+    const tpl = formatTrustPostureLine(fakeReport);
+    if (tpl) console.log(tpl);
+    const vsl = formatVerifiedSignalsLine(fakeReport, { diffNoChange });
+    if (vsl) console.log(vsl);
+    if (!verbose) {
+      console.log(color("dim", "  Run with --verbose to see all verified signals."));
+    }
+
+    console.log(formatAiFooterBlock({
+      status: shipDecision,
+      domain,
+      kind: "trust-diff",
+      baseline,
+      verdict,
+      delta_count: deltas.length,
+      max_severity: maxSev,
+      ship_decision: shipDecision,
+      top_issue: topDelta?.id || topDelta?.type || "none",
+      top_issue_title: topDelta?.title || "",
+      dbr: typeof result.current_score === "number" ? result.current_score.toFixed(1) : "",
+      grade: result.current_grade || "",
+      quota_used: result.quota?.used_this_month ?? "",
+      quota_limit: result.quota?.monthly_limit ?? "",
+      scanned_at: new Date().toISOString(),
+      advisory_only: "true",
+    }));
+    console.log("");
+
+    await writeLastScanFile({
+      domain,
+      kind: "trust-diff",
+      score: typeof result.current_score === "number" ? result.current_score : null,
+      grade: result.current_grade || null,
+      max_severity: maxSev,
+      ship_decision: shipDecision,
+      baseline,
+      delta_count: deltas.length,
+      top_issue: topDelta?.id || topDelta?.title || null,
+    });
+
+    process.exit(shipDecisionExitCode(shipDecision));
+  }
 
   // Format output
   if (format === "json") {
@@ -2118,6 +3417,601 @@ async function runTrustDiffCommand(args) {
   }
 
   // Exit code based on verdict
+  if (verdict === "fail") process.exit(2);
+  if (verdict === "warn") process.exit(1);
+  process.exit(0);
+}
+
+/**
+ * `pqcheck preview-diff --preview <URL> --production <URL>` — compare a preview
+ * deployment URL against a production canonical URL. Surfaces new third-party
+ * scripts, security-header regressions, and DBR score drops. CLI v0.14.0.
+ *
+ * Inputs:
+ *   --preview <URL>       Preview deployment URL (required)
+ *   --production <URL>    Production canonical URL (required)
+ *   --compare-transport   Include TLS/cert/SPKI in verdict (default off — preview
+ *                         URLs are typically edge-hosted by Vercel/Netlify/Cloudflare
+ *                         and direct transport comparison is noise).
+ *   --fail-on <severity>  any | low | medium | high | critical (default high).
+ *                         Honored on paid tiers; Free is report-only.
+ *   --format              pretty (default) | json
+ *
+ * Exit codes match trust-diff: 0 pass · 1 warn · 2 fail · 3 error.
+ *
+ * Authentication paths (server's applyRepoQuota supports all three):
+ *   • CIPHERWAKE_API_KEY=qpk_... (paid quota, higher cap)
+ *   • GITHUB_ACTIONS=true + id-token (OIDC, keyless, Free 100 calls/repo/mo)
+ *   • No auth (anonymous per-IP rate limit — frictionless first-use)
+ *
+ * R74-confirm friction fix (GPT 2026-05-22): the hard-gate on API key has
+ * been removed; server applyRepoQuota handles all 3 auth paths, including
+ * anonymous per-IP rate limit for frictionless first use.
+ */
+// v0.16.6 R76 — collect custom protected paths from flags + config file.
+// Returns a sanitized array (max 20 entries, each ≤200 chars, starts with "/").
+// Server applies the same sanitizer, so anything that gets past this still
+// gets filtered server-side — defense in depth.
+async function loadCustomProtectedPaths(args) {
+  const out = [];
+  // Source 1: --protected-path flag, repeatable
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--protected-path" && i + 1 < args.length) {
+      out.push(args[i + 1]);
+    }
+  }
+  // Source 2: .cipherwake/config.json `protectedPaths`
+  try {
+    const fs = await import("node:fs/promises");
+    const path = await import("node:path");
+    const cfgPath = path.join(process.cwd(), ".cipherwake", "config.json");
+    const raw = await fs.readFile(cfgPath, "utf8");
+    const cfg = JSON.parse(raw);
+    if (Array.isArray(cfg.protectedPaths)) {
+      for (const p of cfg.protectedPaths) {
+        if (typeof p === "string") out.push(p);
+      }
+    }
+  } catch {
+    // No config file or invalid JSON — that's fine, fall back to flag-only.
+  }
+  // Sanitize + dedupe + cap
+  const seen = new Set();
+  const sanitized = [];
+  for (const p of out) {
+    const trimmed = String(p).trim();
+    if (trimmed.length === 0 || trimmed.length > 200) continue;
+    if (!trimmed.startsWith("/")) continue;
+    if (seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    sanitized.push(trimmed);
+    if (sanitized.length >= 20) break;
+  }
+  return sanitized;
+}
+
+// v0.16.9 R80 — EXPERIMENTAL Site Guards. Load .cipherwake/guards.json
+// (when --guards flag is present). Returns a {version, guards[]} object or
+// null when --guards is absent / file missing / invalid. Sanitization runs
+// AGAIN server-side via sanitizeGuardsConfig — both layers run so the API
+// never trusts arbitrary structure that landed in the request body.
+async function loadSiteGuards(args) {
+  if (!args.includes("--guards")) return null;
+  try {
+    const fs = await import("node:fs/promises");
+    const path = await import("node:path");
+    const cfgPath = path.join(process.cwd(), ".cipherwake", "guards.json");
+    const raw = await fs.readFile(cfgPath, "utf8");
+    const cfg = JSON.parse(raw);
+    if (!cfg || typeof cfg !== "object" || !Array.isArray(cfg.guards)) return null;
+    // Pass through more-or-less verbatim; server sanitizes. We don't try to
+    // duplicate the full sanitizer here — just sanity-check the shape so we
+    // don't ship obviously bad payloads.
+    return {
+      version: typeof cfg.version === "number" ? cfg.version : 1,
+      guards: cfg.guards.slice(0, 50),
+    };
+  } catch {
+    return null;
+  }
+}
+
+// v0.16.8 — collect first-party host overrides from flags + config file.
+// PSL-backed subdomain auto-promote happens server-side regardless (scanning
+// quantasyte.com always treats *.quantasyte.com as first-party). This list
+// is the escape hatch for multi-domain shops whose owned hosts live under
+// DIFFERENT registrable domains (acme.com + acmecdn.net). Up to 50 entries,
+// each must pass a strict hostname regex (lowercase alphanumeric + hyphen
+// labels separated by dots, no leading/trailing/double dots, ≤253 chars).
+// Server applies the same sanitizer — defense in depth.
+//
+// Source priority:
+//   1. --first-party-host flag, repeatable (e.g. --first-party-host api.acme.com)
+//   2. .cipherwake/config.json `firstPartyHosts: string[]` in CWD
+const FIRST_PARTY_HOST_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/;
+async function loadFirstPartyHosts(args) {
+  const out = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--first-party-host" && i + 1 < args.length) {
+      out.push(args[i + 1]);
+    }
+  }
+  try {
+    const fs = await import("node:fs/promises");
+    const path = await import("node:path");
+    const cfgPath = path.join(process.cwd(), ".cipherwake", "config.json");
+    const raw = await fs.readFile(cfgPath, "utf8");
+    const cfg = JSON.parse(raw);
+    if (Array.isArray(cfg.firstPartyHosts)) {
+      for (const h of cfg.firstPartyHosts) {
+        if (typeof h === "string") out.push(h);
+      }
+    }
+  } catch {
+    // No config file or invalid JSON — fall back to flag-only.
+  }
+  const seen = new Set();
+  const sanitized = [];
+  for (const h of out) {
+    const norm = String(h).trim().toLowerCase();
+    if (norm.length === 0 || norm.length > 253) continue;
+    if (!FIRST_PARTY_HOST_RE.test(norm)) continue;
+    if (seen.has(norm)) continue;
+    seen.add(norm);
+    sanitized.push(norm);
+    if (sanitized.length >= 50) break;
+  }
+  return sanitized;
+}
+
+// v0.16.9 R80 — EXPERIMENTAL Site Guards subcommand surface.
+// Subcommands:
+//   pqcheck guards init [--domain D]   — create .cipherwake/guards.json with default guard set
+//   pqcheck guards list                 — show configured guards + mode/severity
+//   pqcheck guards run --preview URL    — run guards against a URL via preview-diff
+//                       --production URL  (required because guards run as part of the same scan path)
+//
+// The full activate/observe/disable/approve-host/add-protected-path surface from
+// the original spec is intentionally deferred — those are JSON edits the user
+// can do by hand against `.cipherwake/guards.json`. We can add the editor sugar
+// once the core flow has soaked in real use.
+async function runGuardsCommand(args) {
+  const sub = args[0];
+  if (!sub || sub === "--help" || sub === "-h") {
+    console.log(`${color("bold", "pqcheck guards")} — Site Guards beta (EXPERIMENTAL)`);
+    console.log("");
+    console.log("Subcommands:");
+    console.log(`  ${color("cyan", "init")} [--domain D]              Create .cipherwake/guards.json with default guards`);
+    console.log(`  ${color("cyan", "list")}                            Show configured guards from .cipherwake/guards.json`);
+    console.log(`  ${color("cyan", "run")} --preview URL --production URL`);
+    console.log(`                                  Run guards against a URL (uses preview-diff path)`);
+    console.log("");
+    console.log("Or pass " + color("bold", "--guards") + " to " + color("bold", "pqcheck preview-diff") + " to run guards alongside the diff.");
+    console.log("");
+    console.log(color("yellow", "BETA: Site Guards are experimental. New guards default to observe mode."));
+    console.log(color("dim", "Docs: https://cipherwake.io/methodology/site-guards"));
+    return;
+  }
+  if (sub === "init") return runGuardsInitCommand(args.slice(1));
+  if (sub === "list") return runGuardsListCommand(args.slice(1));
+  if (sub === "run") return runGuardsRunCommand(args.slice(1));
+  console.error(color("red", `error: unknown guards subcommand: ${sub}`));
+  console.error(color("dim", "Run `pqcheck guards --help` for usage."));
+  process.exit(1);
+}
+
+async function runGuardsInitCommand(args) {
+  const fs = await import("node:fs/promises");
+  const path = await import("node:path");
+  const domain = parseFlag(args, "--domain") || "your-domain.com";
+  const force = args.includes("--force");
+  const cfgDir = path.join(process.cwd(), ".cipherwake");
+  const cfgPath = path.join(cfgDir, "guards.json");
+  try {
+    await fs.access(cfgPath);
+    if (!force) {
+      console.error(color("yellow", `warn: ${cfgPath} already exists. Pass --force to overwrite.`));
+      process.exit(1);
+    }
+  } catch { /* file doesn't exist, fine */ }
+  // Default set mirrors lib/siteGuards.ts defaultGuardsConfig — duplicated here
+  // to avoid an import dependency from the CLI bundle on the TS lib at runtime.
+  const defaults = {
+    version: 1,
+    domain,
+    firstPartyHosts: [],
+    guards: [
+      { id: "no-source-maps", type: "source_map_exposure", mode: "observe", severity: "review" },
+      { id: "no-mixed-content", type: "mixed_content", mode: "observe", severity: "review" },
+      { id: "approved-hosts", type: "approved_hosts", mode: "observe", severity: "review", approvedHosts: [] },
+      { id: "protected-admin", type: "protected_path", path: "/admin", expect: "401_or_302", mode: "observe", severity: "block" },
+      { id: "session-cookie-flags", type: "cookie_flags", cookieNamePattern: "(?:session|sess|auth|token|sid|csrf|jwt)", require: ["Secure", "HttpOnly"], sameSiteMinimum: "Lax", mode: "observe", severity: "block" },
+      { id: "primary-links-resolve", type: "link_integrity", mode: "observe", severity: "review" },
+    ],
+  };
+  await fs.mkdir(cfgDir, { recursive: true });
+  await fs.writeFile(cfgPath, JSON.stringify(defaults, null, 2) + "\n");
+  console.log(color("green", `✓ wrote ${cfgPath}`));
+  console.log(color("dim", "  6 guards configured · all in observe mode (default)"));
+  console.log(color("dim", "  Edit guards.json to flip to active mode or seed approvedHosts."));
+  console.log(color("dim", "  Then: npx pqcheck preview-diff --preview <URL> --production <URL> --guards"));
+}
+
+async function runGuardsListCommand(_args) {
+  const fs = await import("node:fs/promises");
+  const path = await import("node:path");
+  const cfgPath = path.join(process.cwd(), ".cipherwake", "guards.json");
+  let cfg;
+  try {
+    cfg = JSON.parse(await fs.readFile(cfgPath, "utf8"));
+  } catch (err) {
+    console.error(color("red", `error: could not read ${cfgPath}: ${err.message}`));
+    console.error(color("dim", "Run `pqcheck guards init` to create one."));
+    process.exit(1);
+  }
+  const guards = Array.isArray(cfg.guards) ? cfg.guards : [];
+  if (guards.length === 0) {
+    console.log(color("dim", "(no guards configured)"));
+    return;
+  }
+  console.log(`${color("bold", `${guards.length} guard${guards.length === 1 ? "" : "s"}`)}${cfg.domain ? color("dim", ` · ${cfg.domain}`) : ""}`);
+  for (const g of guards) {
+    const mode = g.mode ?? "observe";
+    const modeChip = mode === "active" ? color("cyan", `[${mode}]`)
+      : mode === "disabled" ? color("dim", `[${mode}]`)
+      : color("yellow", `[${mode}]`);
+    const sev = color("dim", `· ${g.severity ?? "review"}`);
+    console.log(`  ${modeChip} ${color("bold", g.id)} (${g.type}) ${sev}`);
+  }
+  console.log("");
+  console.log(color("yellow", "BETA — Site Guards are experimental. Observe-mode guards never affect CI."));
+}
+
+async function runGuardsRunCommand(args) {
+  // Convenience wrapper — re-runs preview-diff with --guards forced on.
+  // Useful for "just run my guards, don't think about preview-diff" UX.
+  if (!args.includes("--guards")) args = ["--guards", ...args];
+  return runPreviewDiffCommand(args);
+}
+
+async function runPreviewDiffCommand(args) {
+  const previewUrl = parseFlag(args, "--preview");
+  const productionUrl = parseFlag(args, "--production");
+  if (!previewUrl || !productionUrl) {
+    console.error(color("red", "error: pqcheck preview-diff requires --preview and --production URLs"));
+    console.error(color("dim", "Usage: npx pqcheck preview-diff --preview https://preview-xyz.vercel.app --production https://example.com [--compare-transport] [--fail-on high] [--format pretty|json] [--protected-path /api/admin/export]... [--first-party-host api.acme.com]..."));
+    process.exit(3);
+  }
+
+  const compareTransport = args.includes("--compare-transport");
+  const failOn = parseFlag(args, "--fail-on") || "high";
+  const format = parseFlag(args, "--format") || "pretty";
+
+  // R66 (B4 / Q4.2 fix): policy_mode mirrors --fail-on intent.
+  // `--fail-on none` (or `off`) → report-only; anything else → fail mode.
+  // Server silently downgrades on Free tier; paid tier honors fail.
+  // This makes the CLI exit-code semantics actually fire for paid users.
+  const policyMode = ["none", "off", ""].includes(String(failOn).toLowerCase())
+    ? "report"
+    : "fail";
+
+  // v0.16.6 R76 — custom protected paths. Source priority:
+  //   1. --protected-path flag (repeatable, e.g. --protected-path /api/admin/export)
+  //   2. .cipherwake/config.json `protectedPaths: string[]` in CWD
+  // Sanitized + capped server-side. Lets each customer probe their own auth-
+  // gated routes alongside the universal default list.
+  const customProtectedPaths = await loadCustomProtectedPaths(args);
+
+  // v0.16.8 — first-party host overrides. Server unconditionally treats
+  // subdomains of the scanned hostname as first-party (PSL-backed); this
+  // list adds owned hosts whose registrable domains differ.
+  const customFirstPartyHosts = await loadFirstPartyHosts(args);
+
+  // v0.16.9 R80 — EXPERIMENTAL Site Guards. Only loaded when --guards flag
+  // is present; otherwise the request includes no site_guards block and the
+  // response's site_guards array stays empty.
+  const siteGuardsPayload = await loadSiteGuards(args);
+
+  const headers = {
+    "Content-Type": "application/json",
+    "User-Agent": `pqcheck-cli/${VERSION}${CI_ACTION_SUFFIX}`,
+  };
+  if (QP_API_KEY) {
+    headers["Authorization"] = `Bearer ${QP_API_KEY}`;
+  }
+
+  let resp;
+  try {
+    resp = await fetch(`${API_BASE}/api/preview-diff`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        preview_url: previewUrl,
+        production_url: productionUrl,
+        compare_transport: compareTransport,
+        fail_on: failOn,
+        policy_mode: policyMode,
+        ...(customProtectedPaths.length > 0 ? { protected_paths: customProtectedPaths } : {}),
+        ...(customFirstPartyHosts.length > 0 ? { first_party_hosts: customFirstPartyHosts } : {}),
+        ...(siteGuardsPayload ? { site_guards: siteGuardsPayload } : {}),
+      }),
+    });
+  } catch (err) {
+    console.error(color("red", `error: network failure calling /api/preview-diff: ${err.message}`));
+    process.exit(3);
+  }
+
+  if (resp.status === 401 || resp.status === 403) {
+    await handleAuthError(resp);
+    process.exit(3);
+  }
+  if (resp.status === 429) {
+    const body = await safeJSON(resp);
+    console.error(color("red", "error: Preview Diff API quota exceeded for this month"));
+    if (body?.message) console.error(color("dim", body.message));
+    process.exit(3);
+  }
+  if (!resp.ok) {
+    const body = await safeJSON(resp);
+    console.error(color("red", `error: /api/preview-diff returned ${resp.status}`));
+    if (body?.message) console.error(color("dim", body.message));
+    // Server-side may return a `hint` field on rejected inputs (e.g. localhost
+    // / private-IP URLs surface the tunnel-options hint). Print it so the
+    // user knows what to do next instead of just seeing the rejection.
+    if (body?.hint) console.error(color("dim", body.hint));
+    process.exit(3);
+  }
+
+  const result = await resp.json();
+  const verdict = result?.result?.verdict || "pass";
+  const summaryLines = result?.result?.summary_lines || [];
+  // v0.16.6 R78 — plain-English "what this means" sentence per finding,
+  // parallel to summaryLines. Renders as a dim sub-line under each tech
+  // line so non-security readers see the consequence at a glance.
+  const summaryLinesHuman = result?.result?.summary_lines_human || [];
+
+  // AI Coder Mode — three-layer output (banner / body / structured block).
+  if (parseAiMode(args)) {
+    const maxSev = result?.result?.max_severity || "none";
+    const hasUnexpectedDiff = summaryLines.some((l) => !/no meaningful/i.test(l));
+    const prevScore = result?.preview?.score;
+    const prodScore = result?.production?.score;
+    const scoreDelta = (typeof prevScore === "number" && typeof prodScore === "number")
+      ? Number((prevScore - prodScore).toFixed(2))
+      : null;
+    const shipDecision = computeShipDecision({ maxSeverity: maxSev, hasUnexpectedDiff, scoreDelta });
+
+    const firstDelta = summaryLines.find((l) => !/no meaningful/i.test(l));
+    const topIssue = firstDelta || "No meaningful application-surface changes between preview and production.";
+    const whyMatters = hasUnexpectedDiff
+      ? `Preview URL introduces application-surface changes vs production. If you intentionally added (e.g.) a new third-party script or relaxed a CSP, accept and merge. If unexpected, the change is hidden in this PR's bundle — investigate before merge.`
+      : `Your preview is application-equivalent to production. No new vendors, no header regressions, no DBR score drop.`;
+    const nextActions = shipDecision === "pass"
+      ? [`Preview matches production. Safe to merge.`]
+      : [
+          `Review the changes above in this PR before merging.`,
+          `Each "+ New third-party script" is a real new third-party request your users will make on this deploy.`,
+          `Each "- CSP weakened" or "~ HSTS weakened" reduces production safety.`,
+        ];
+
+    // v0.16.3 high-yield rendering for preview-diff. Uses the per-side
+    // `signals` snapshot returned by /api/preview-diff so the customer
+    // sees N vs N+1 on every signal (not just the binary "no drift").
+    // Falls back to the v0.16.2 shape when the server hasn't deployed
+    // the signals snapshot yet (older API response).
+    const verbose = isVerboseMode(args);
+    const diffNoChange = !hasUnexpectedDiff;
+    const prevSig = result?.preview?.signals || null;
+    const prodSig = result?.production?.signals || null;
+    // Brand header uses the production hostname (e.g. "quantapact.com")
+    // not the full Vercel preview URL, so the customer doesn't see
+    // "◆ Cipherwake — https://quantapact-k3y...vercel.app".
+    const headerDomain = result?.production?.hostname || result?.production?.domain || productionUrl;
+    // Synthesize a report-shaped object from the production-side signals
+    // snapshot so the existing trust-posture + verified-signals helpers
+    // (which read .score, .grade, .sectorRanking, .cookies, etc.) work
+    // without changes.
+    const reportLike = prodSig ? {
+      domain: headerDomain,
+      score: prodSig.score,
+      grade: prodSig.grade,
+      _meta: { lastChanged: prodSig.lastChanged },
+      sectorRanking: prodSig.sectorRanking,
+      publicDeps: prodSig.publicDeps ? { fetched: true, thirdParties: new Array(prodSig.publicDeps.thirdPartyCount || 0) } : null,
+      httpHeaders: prodSig.httpHeaders,
+      cookies: prodSig.cookies,
+      sourceMaps: prodSig.sourceMaps,
+      mixedContent: prodSig.mixedContent,
+      cert: prodSig.cert,
+      tlsVersion: prodSig.tlsVersion,
+      publicSurface: prodSig.publicSurface,
+      protectedPaths: prodSig.protectedPaths,
+    } : {
+      // Fallback: legacy server, only score/grade available.
+      domain: headerDomain,
+      score: prevScore,
+      grade: result?.preview?.grade,
+      _meta: { lastChanged: result?.production?.lastChanged },
+      sectorRanking: result?.production?.sectorRanking,
+    };
+    // Render top deltas as alert lines (1 per finding, max 3)
+    const deltaLines = summaryLines.filter((l) => !/no meaningful/i.test(l));
+
+    console.log("");
+    console.log(formatBrandHeader(headerDomain) + color("dim", "  (preview ↔ production)"));
+    console.log("");
+    console.log(formatDecisionPulse({ shipDecision, alertCount: deltaLines.length, unreachable: false, diffContext: true }));
+
+    if (deltaLines.length > 0) {
+      // v0.16.6 R78 — find the matching human-readable line for each tech
+      // line. summaryLinesHuman is parallel-indexed to summaryLines, so we
+      // re-derive the index from the original (unfiltered) summaryLines
+      // array.
+      for (const dl of deltaLines.slice(0, 3)) {
+        const sym = dl.startsWith("⛔") || dl.startsWith("-") ? "red" : dl.startsWith("⚠") || dl.startsWith("~") ? "yellow" : "dim";
+        console.log(color(sym, dl));
+        const idx = summaryLines.indexOf(dl);
+        const human = idx >= 0 ? summaryLinesHuman[idx] : null;
+        if (human) console.log(color("dim", `   → ${human}`));
+      }
+      if (deltaLines.length > 3) console.log(color("dim", `  +${deltaLines.length - 3} more (run with --verbose)`));
+    }
+    const tpl = formatTrustPostureLine(reportLike);
+    if (tpl) console.log(tpl);
+    const vsl = formatVerifiedSignalsLine(reportLike, { diffNoChange });
+    if (vsl) console.log(vsl);
+    // v0.16.3 — per-signal N vs N+1 comparison. Renders ALWAYS (default and
+    // --verbose), in different shapes:
+    //   - default: 1-line "9/9 signals match (preview ↔ production)" so the
+    //     customer sees the checks fired without scrolling
+    //   - --verbose: per-row table with both sides spelled out
+    const scriptDeltas = Array.isArray(result?.result?.application_surface?.scripts)
+      ? result.result.application_surface.scripts
+      : [];
+    const psl = formatPreviewDiffPerSignal(prevSig, prodSig, { verbose, scriptDeltas });
+    if (psl) console.log(psl);
+    if (!verbose) {
+      console.log(color("dim", "  Run with --verbose to see per-signal breakdown."));
+    }
+
+    // (Old banner + body removed in v0.16.2; new high-yield layout above
+    // replaces them. AI footer still lands below for downstream agents.)
+    if (verbose) {
+      console.log("");
+      console.log(formatAiBody({ topIssue, whyMatters, nextActions }));
+    }
+    console.log(formatAiFooterBlock({
+      status: shipDecision,
+      domain: result?.production?.domain || productionUrl,
+      kind: "preview-diff",
+      preview_url: previewUrl,
+      production_url: productionUrl,
+      verdict,
+      max_severity: maxSev,
+      delta_count: summaryLines.filter((l) => !/no meaningful/i.test(l)).length,
+      ship_decision: shipDecision,
+      preview_dbr: typeof prevScore === "number" ? prevScore.toFixed(1) : "",
+      production_dbr: typeof prodScore === "number" ? prodScore.toFixed(1) : "",
+      score_delta: scoreDelta !== null ? scoreDelta.toString() : "",
+      top_issue: firstDelta || "none",
+      scanned_at: new Date().toISOString(),
+      advisory_only: "true",
+    }));
+    console.log("");
+
+    // v0.16.4 — write the data the statusline needs to render its
+    // 4-line preview-diff state (brand header + decision pulse + trust
+    // posture + verified signals). For non-preview-diff kinds we keep
+    // the 1-line statusline; only preview-diff gets the bigger format.
+    const verifiedSignalCats = (() => {
+      try { return countVerifiedSignals(reportLike).categories; } catch { return null; }
+    })();
+    await writeLastScanFile({
+      domain: result?.production?.hostname || result?.production?.domain || productionUrl,
+      kind: "preview-diff",
+      preview_url: previewUrl,
+      production_url: productionUrl,
+      // v0.16.4 — score/grade come from the PRODUCTION side so the trust
+      // posture line reflects the live customer site, not the in-flight
+      // preview. (Was prevScore before — wrong reference.)
+      score: typeof prodSig?.score === "number" ? prodSig.score : (typeof prevScore === "number" ? prevScore : null),
+      grade: prodSig?.grade || null,
+      max_severity: maxSev,
+      ship_decision: shipDecision,
+      delta_count: summaryLines.filter((l) => !/no meaningful/i.test(l)).length,
+      diff_no_change: diffNoChange,
+      sector_ranking: prodSig?.sectorRanking || null,
+      verified_signal_categories: verifiedSignalCats,
+      last_changed: prodSig?.lastChanged || null,
+    });
+
+    process.exit(shipDecisionExitCode(shipDecision));
+  }
+
+  if (format === "json") {
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    console.log("");
+    console.log(`  ${color("bold", "Cipherwake Preview Trust Diff")}`);
+    console.log(`  ${color("dim", `preview=${previewUrl}`)}`);
+    console.log(`  ${color("dim", `production=${productionUrl}`)}`);
+    const prevScore = result?.preview?.score;
+    const prodScore = result?.production?.score;
+    if (typeof prevScore === "number" || typeof prodScore === "number") {
+      console.log(`  ${color("dim", `DBR: preview=${typeof prevScore === "number" ? prevScore.toFixed(1) : "—"} · production=${typeof prodScore === "number" ? prodScore.toFixed(1) : "—"}`)}`);
+    }
+    console.log("");
+    console.log(`  ${color("bold", "Application surface:")}`);
+    if (summaryLines.length === 0 || (summaryLines.length === 1 && /no meaningful/i.test(summaryLines[0]))) {
+      console.log(`    ${color("green", "✓ No meaningful application-surface changes detected.")}`);
+    } else {
+      // v0.16.6 R78 — pretty mode renders the tech line + dim layman sub-line.
+      for (let i = 0; i < summaryLines.length; i++) {
+        const line = summaryLines[i];
+        const human = summaryLinesHuman[i];
+        const c = line.startsWith("+") ? "yellow" : line.startsWith("-") ? "red" : "dim";
+        console.log(`    ${color(c, line)}`);
+        if (human) console.log(`      ${color("dim", "→ " + human)}`);
+      }
+    }
+    console.log("");
+    // v0.16.9 R80 — EXPERIMENTAL Site Guards rendering. Only shown when the
+    // server returned a non-empty site_guards array. Renders status tally
+    // (passed / failed / not_checked / probe_failed / not_applicable) then
+    // per-guard one-liners. Observe-mode failures are labeled "observation"
+    // so the customer reads them as informational. Active-mode failures use
+    // the same prefix as preview-diff findings.
+    const siteGuards = Array.isArray(result?.site_guards) ? result.site_guards : [];
+    if (siteGuards.length > 0) {
+      console.log(`  ${color("bold", "Site Guards")} ${color("yellow", "(BETA)")}`);
+      const tally = { pass: 0, fail: 0, not_checked: 0, probe_failed: 0, not_applicable: 0 };
+      for (const g of siteGuards) {
+        tally[g.status] = (tally[g.status] ?? 0) + 1;
+      }
+      const tallyParts = [];
+      if (tally.pass > 0) tallyParts.push(color("green", `${tally.pass} passed`));
+      if (tally.fail > 0) tallyParts.push(color("red", `${tally.fail} failed`));
+      if (tally.not_checked > 0) tallyParts.push(color("dim", `${tally.not_checked} disabled`));
+      if (tally.probe_failed > 0) tallyParts.push(color("yellow", `${tally.probe_failed} probe-failed`));
+      if (tally.not_applicable > 0) tallyParts.push(color("dim", `${tally.not_applicable} n/a`));
+      console.log(`    ${siteGuards.length} guards checked: ${tallyParts.join(color("dim", " · "))}`);
+      for (const g of siteGuards) {
+        const isFail = g.status === "fail";
+        const isPass = g.status === "pass";
+        const isObserve = g.mode === "observe";
+        const mark = isFail
+          ? (isObserve ? color("yellow", "◌") : color("red", "⛔"))
+          : isPass ? color("green", "✓")
+          : g.status === "probe_failed" ? color("yellow", "?")
+          : color("dim", "·");
+        const label = isFail && isObserve
+          ? color("dim", "observation:")
+          : isFail ? color("red", "fail:")
+          : color("dim", `${g.status}:`);
+        console.log(`    ${mark} ${color("bold", g.id)} ${label} ${g.message}`);
+        if (g.human) {
+          console.log(`      ${color("dim", "→ " + g.human)}`);
+        }
+      }
+      console.log("");
+    }
+    const transport = result?.result?.transport || {};
+    if (transport.preview_is_edge_hosted) {
+      console.log(`  ${color("dim", `Transport: preview is edge-hosted (${transport.preview_cert_issuer ?? "unknown"}) — informational only.`)}`);
+    } else if (transport.preview_cert_issuer && transport.preview_cert_issuer !== transport.production_cert_issuer) {
+      console.log(`  ${color("dim", `Transport: cert issuer differs (${transport.production_cert_issuer ?? "—"} → ${transport.preview_cert_issuer ?? "—"}).`)}`);
+    }
+    console.log("");
+    const verdictColor = verdict === "fail" ? "red" : verdict === "warn" ? "yellow" : "green";
+    console.log(`  Verdict: ${color(verdictColor, verdict.toUpperCase())} (max severity: ${result?.result?.max_severity || "info"})`);
+    console.log(`  Tier: ${result?.tier || "free"} · policy: ${result?.policy_mode_effective || "report"}`);
+    if (result.upgrade_hint) {
+      console.log("");
+      console.log(`  ${color("dim", "💡 " + result.upgrade_hint)}`);
+    }
+    console.log("");
+  }
+
   if (verdict === "fail") process.exit(2);
   if (verdict === "warn") process.exit(1);
   process.exit(0);
@@ -2267,7 +4161,7 @@ function computeLockDiff(oldLock, newLock) {
 
 // `pqcheck watch <domain>` — adds the given domain to the user's watched-
 // domain list via the authenticated /api/watched-domains POST. Requires
-// QUANTAPACT_API_KEY env var. Closes the CLI ↔ account loop: developers
+// CIPHERWAKE_API_KEY env var. Closes the CLI ↔ account loop: developers
 // who use the CLI can now opt into persistent monitoring from the same
 // surface without leaving the terminal.
 async function runWatchCommand(args) {
@@ -2547,7 +4441,7 @@ function renderReleaseChecklist(domain, opts = {}) {
 // `pqcheck init` — interactive workflow scaffold (habit-loop #4, locked 2026-05-16)
 // =============================================================================
 // Writes a ready-to-commit .github/workflows/cipherwake.yml that calls
-// cipherwakelabs/pqcheck@v3 in trust-diff mode. Zero copy-paste docs friction.
+// cipherwakelabs/pqcheck/action@v3 in trust-diff mode. Zero copy-paste docs friction.
 //
 // Flags:
 //   --domain <d>       Skip the domain prompt
@@ -2724,7 +4618,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Run Cipherwake Trust Diff
-        uses: cipherwakelabs/pqcheck@v3
+        uses: cipherwakelabs/pqcheck/action@v3
         with:
           mode: trust-diff
           domain: ${domain}
@@ -2732,7 +4626,7 @@ jobs:
           fail-on: ${failOn}
         # No env/secrets needed for Free tier — the action uses the
         # workflow's id-token: write permission to fetch a GitHub-signed
-        # OIDC token and meters per repo (30 calls/mo, no setup).
+        # OIDC token and meters per repo (100 calls/mo, no setup).
         # If you want higher limits, link this repo to a paid Cipherwake
         # account at https://cipherwake.io/account → Linked repos.
 `;
@@ -2779,9 +4673,10 @@ async function runDeployCheckCommand(args) {
   if (!args.includes("--fail-on")) forwarded.push("--fail-on", "high");
 
   // Pre-print a deploy-context header (only in text mode — JSON/SARIF users
-  // are scripting and don't want our preamble polluting their pipe).
+  // are scripting and don't want our preamble polluting their pipe; AI mode
+  // emits its own banner so don't double-up).
   const format = parseFormat(forwarded);
-  if (format === "text") {
+  if (format === "text" && !parseAiMode(forwarded)) {
     console.log("");
     console.log(`  ${color("bold", "🚀 Deploy gate")} ${color("dim", "— checking public trust posture vs last scan")}`);
     console.log("");
@@ -2889,7 +4784,7 @@ async function fetchVendorOrigins(domain) {
   try {
     resp = await fetch(`${API_BASE}/api/deps?domain=${encodeURIComponent(domain)}`, {
       method: "GET",
-      headers: apiHeaders({ "user-agent": `pqcheck-cli/${VERSION} (vendors)` }),
+      headers: apiHeaders({ "user-agent": `pqcheck-cli/${VERSION}${CI_ACTION_SUFFIX} (vendors)` }),
       signal: ac.signal,
     });
   } catch (err) {
@@ -2937,7 +4832,7 @@ function normalizeObservedOrigin(value) {
 function buildVendorLockfile(domain, origins) {
   return {
     schema_version: 1,
-    generator: `pqcheck-cli/${VERSION}`,
+    generator: `pqcheck-cli/${VERSION}${CI_ACTION_SUFFIX}`,
     domain,
     generated_at: new Date().toISOString(),
     approved_script_origins: origins,
@@ -3053,7 +4948,7 @@ async function runVendorsSync(domain, outPath) {
     resp = await fetch(`${API_BASE}/api/vendor-allowlist?domain=${encodeURIComponent(domain)}`, {
       method: "GET",
       headers: {
-        "user-agent": `pqcheck-cli/${VERSION} (vendors-sync)`,
+        "user-agent": `pqcheck-cli/${VERSION}${CI_ACTION_SUFFIX} (vendors-sync)`,
         "authorization": "Bearer " + QP_API_KEY,
       },
     });
@@ -3207,7 +5102,7 @@ async function runOnboardCommand(args) {
     try {
       const resp = await fetch(`${API_BASE}/api/scan?domain=${encodeURIComponent(domain)}&source=onboard`, {
         method: "GET",
-        headers: apiHeaders({ "user-agent": `pqcheck-cli/${VERSION} (onboard)` }),
+        headers: apiHeaders({ "user-agent": `pqcheck-cli/${VERSION}${CI_ACTION_SUFFIX} (onboard)` }),
       });
       if (resp.ok) {
         const report = await resp.json();
@@ -3397,6 +5292,1183 @@ async function tryOpenBrowser(url) {
       if (!settled) { settled = true; resolve(true); }
     }, 1000);
   });
+}
+
+// =============================================================================
+// `pqcheck guard --domain X -- <deploy command>` — wrapper command
+// =============================================================================
+// The strongest single artifact for terminal-first AI-coder workflows.
+// Runs deploy-check first, conditionally executes the wrapped deploy command
+// based on ship_decision. AI coders type ONE command; Cipherwake controls
+// whether the deploy actually runs.
+//
+// Usage:
+//   npx pqcheck guard --domain example.com -- vercel deploy --prod
+//   npx pqcheck guard --domain example.com --gate-mode strict -- bash deploy.sh
+//   npx pqcheck guard --domain example.com --bypass "shipping despite review" -- ...
+//
+// Exit codes:
+//   0 = deploy ran and succeeded (pre-check passed or user confirmed review)
+//   1 = pre-check returned review and user chose not to proceed
+//   2 = pre-check returned block and deploy was refused (use --bypass to override)
+//   3 = wrapper / deploy command itself errored
+// =============================================================================
+async function runGuardCommand(args) {
+  // Parse flags and the `--` separator.
+  const sepIdx = args.indexOf("--");
+  const ourArgs = sepIdx >= 0 ? args.slice(0, sepIdx) : args;
+  const deployCmd = sepIdx >= 0 ? args.slice(sepIdx + 1) : [];
+
+  const domain = parseFlag(ourArgs, "--domain");
+  const gateMode = parseFlag(ourArgs, "--gate-mode") || "balanced";
+  const bypassReason = parseFlag(ourArgs, "--bypass");
+  const noPostCheck = ourArgs.includes("--no-post-check");
+
+  if (!domain) {
+    console.error(color("red", "error: pqcheck guard requires --domain"));
+    console.error(color("dim", "Usage: npx pqcheck guard --domain example.com -- <deploy command>"));
+    console.error(color("dim", "Example: npx pqcheck guard --domain example.com -- vercel deploy --prod"));
+    process.exit(3);
+  }
+  if (deployCmd.length === 0) {
+    console.error(color("red", "error: pqcheck guard requires a deploy command after `--`"));
+    console.error(color("dim", "Usage: npx pqcheck guard --domain example.com -- vercel deploy --prod"));
+    process.exit(3);
+  }
+  if (!["balanced", "advisory", "strict"].includes(gateMode)) {
+    console.error(color("red", `error: --gate-mode must be one of: balanced, advisory, strict (got "${gateMode}")`));
+    process.exit(3);
+  }
+
+  const labelByMode = {
+    balanced: "Balanced (default — review on HIGH, block on CRITICAL)",
+    advisory: "Advisory (warnings only, deploy never blocked)",
+    strict: "Strict (block on any finding ≥ medium)",
+  };
+
+  console.log("");
+  console.log(`  ${color("bold", "◆ Cipherwake Deploy Guard")} ${color("dim", `· ${labelByMode[gateMode]}`)}`);
+  console.log(`  ${color("dim", `domain: ${domain}`)}`);
+  console.log(`  ${color("dim", `deploy: ${deployCmd.join(" ")}`)}`);
+  console.log("");
+
+  if (bypassReason) {
+    console.log(color("yellow", `  ⚠ --bypass set with reason: "${bypassReason}"`));
+    console.log(color("dim", "  The pre-deploy check will still run, but a review or block won't stop the deploy."));
+    console.log("");
+  }
+
+  // Run the pre-deploy check. We invoke ourselves (the CLI) as a subprocess
+  // rather than calling internal functions because the deploy-check exit
+  // code + ship_decision semantics are the contract; recreating that logic
+  // inline would risk drift.
+  const { spawn } = await import("node:child_process");
+
+  // Detect the right binary to invoke: if we're running via `npx pqcheck`
+  // we want to re-invoke pqcheck (process.argv[1]); if we're installed
+  // globally, same path.
+  const selfPath = process.argv[1];
+
+  console.log(color("dim", "  Running pre-deploy check ..."));
+  const checkArgs = ["deploy-check", domain, "--ai"];
+  // In advisory mode the deploy NEVER blocks — pass --fail-on none so the
+  // server returns findings but the verdict downgrades to report.
+  if (gateMode === "advisory") checkArgs.push("--fail-on", "none");
+  // In strict mode block on any finding ≥ medium.
+  if (gateMode === "strict") checkArgs.push("--fail-on", "medium");
+
+  let checkOutput = "";
+  const checkExitCode = await new Promise((resolve) => {
+    const child = spawn(process.execPath, [selfPath, ...checkArgs], {
+      stdio: ["ignore", "pipe", "inherit"],
+    });
+    child.stdout.on("data", (chunk) => {
+      const s = chunk.toString();
+      checkOutput += s;
+      process.stdout.write(s);
+    });
+    child.on("close", (code) => resolve(code ?? 3));
+    child.on("error", () => resolve(3));
+  });
+
+  // Parse the structured CIPHERWAKE_AI_GUARD_RESULT block to extract
+  // ship_decision (the contract field). If we can't find it, fail safe.
+  let shipDecision = "review";
+  const blockMatch = checkOutput.match(/CIPHERWAKE_AI_GUARD_RESULT\n([\s\S]*?)\nEND_CIPHERWAKE_AI_GUARD_RESULT/);
+  if (blockMatch) {
+    const sdLine = blockMatch[1].split("\n").find((l) => l.startsWith("ship_decision="));
+    if (sdLine) shipDecision = sdLine.split("=")[1].trim();
+  }
+
+  console.log("");
+  console.log(color("bold", `  Pre-deploy check returned: ship_decision=${shipDecision}`));
+
+  // Decide what to do.
+  if (shipDecision === "pass") {
+    console.log(color("green", "  ✓ Posture stable — running deploy command."));
+    console.log("");
+  } else if (shipDecision === "review") {
+    if (bypassReason) {
+      console.log(color("yellow", "  ⚠ Review-level finding(s) detected, but --bypass is set — proceeding."));
+    } else if (process.stdin.isTTY) {
+      const readline = await import("node:readline");
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      const answer = await new Promise((resolve) => {
+        rl.question(color("yellow", "\n  ⚠ Cipherwake flagged a review-level finding. Continue with deploy? [y/N]: "), (a) => {
+          rl.close();
+          resolve((a || "").trim().toLowerCase());
+        });
+      });
+      if (answer !== "y" && answer !== "yes") {
+        console.log(color("dim", "  Deploy cancelled by user."));
+        process.exit(1);
+      }
+    } else {
+      console.error(color("red", "  ✗ Review-level finding(s) and no interactive terminal — failing closed."));
+      console.error(color("dim", "  Re-run interactively, or pass --bypass \"<reason>\" to acknowledge."));
+      process.exit(1);
+    }
+  } else if (shipDecision === "block") {
+    if (bypassReason) {
+      console.log(color("red", "  ⚠ BLOCK-level finding, but --bypass is set with explicit reason — proceeding."));
+      console.log(color("dim", `  Logged bypass reason: "${bypassReason}"`));
+    } else {
+      console.error(color("red", "  ✗ Cipherwake returned BLOCK — refusing to run deploy command."));
+      console.error(color("dim", "  Investigate the finding above. To override, re-run with --bypass \"<your reason>\"."));
+      process.exit(2);
+    }
+  }
+
+  // Execute the wrapped deploy command.
+  console.log(color("dim", `  Executing: ${deployCmd.join(" ")}`));
+  console.log("");
+  const deployExitCode = await new Promise((resolve) => {
+    const child = spawn(deployCmd[0], deployCmd.slice(1), { stdio: "inherit" });
+    child.on("close", (code) => resolve(code ?? 3));
+    child.on("error", (err) => {
+      console.error(color("red", `  ✗ Deploy command failed to spawn: ${err.message}`));
+      resolve(3);
+    });
+  });
+
+  if (deployExitCode !== 0) {
+    console.error(color("red", `\n  ✗ Deploy command exited with code ${deployExitCode}.`));
+    process.exit(deployExitCode);
+  }
+
+  // Post-deploy check — useful for verifying the live URL after deploy.
+  if (!noPostCheck) {
+    console.log("");
+    console.log(color("dim", "  Running post-deploy check ..."));
+    const postExitCode = await new Promise((resolve) => {
+      const child = spawn(process.execPath, [selfPath, domain, "--ai", "--fresh"], { stdio: "inherit" });
+      child.on("close", (code) => resolve(code ?? 0));
+      child.on("error", () => resolve(0));
+    });
+    if (postExitCode !== 0) {
+      console.error(color("yellow", `\n  ⚠ Post-deploy check returned non-zero (${postExitCode}) — investigate before announcing.`));
+    }
+  }
+
+  console.log("");
+  console.log(color("green", "  ◆ Deploy guard complete."));
+  process.exit(0);
+}
+
+// =============================================================================
+// `pqcheck protocol install` — Rule 17 consent-flow installer for the AI Coder
+// Protocol.
+// =============================================================================
+// Detects ~/.claude/CLAUDE.md and ./.cursorrules, then asks ONE upfront question
+// (auto / manual / no) per Rule 17. Never silently writes user config.
+// =============================================================================
+const AI_CODER_PROTOCOL_TEXT = `
+## Pre-deploy verification with Cipherwake
+
+Before announcing any deploy of a public-facing site, you MUST run a
+Cipherwake deploy check and route on the result.
+
+1. Run:
+
+   npx pqcheck deploy-check <your-domain> --ai
+
+   (Or wrap your deploy command with: npx pqcheck guard --domain <your-domain> -- <deploy-cmd>)
+
+2. Parse the CIPHERWAKE_AI_GUARD_RESULT block at the end of stdout.
+   Extract the \`ship_decision\` field.
+
+3. Route on ship_decision:
+
+   • pass    — Public trust surface is stable. Safe to announce.
+
+   • review  — STOP. Surface the change to the user:
+
+               "Cipherwake flagged a change: <top_issue>. The public
+                trust surface drifted between baseline and now. Want me to:
+                  1) Ship anyway (you accept the change as intentional)
+                  2) Revert the deploy
+                  3) Investigate before deciding"
+
+               Wait for explicit user choice. Do NOT announce the deploy
+               until they confirm.
+
+   • block   — STOP. Surface to the user:
+
+               "Cipherwake flagged a CRITICAL change: <top_issue>.
+                I recommend not announcing this deploy until we investigate.
+                Want to revert and look, or override?"
+
+               Wait for explicit user override before announcing.
+
+4. Never claim a deploy is "done" or "shipped" until either:
+   • ship_decision was pass, OR
+   • the user explicitly confirmed they want to ship despite review/block.
+
+Reference: https://cipherwake.io/methodology/ai-coder-protocol
+`;
+
+async function runProtocolCommand(args) {
+  const sub = args[0];
+  if (sub !== "install") {
+    console.error(color("red", `error: unknown protocol subcommand "${sub || ""}"`));
+    console.error(color("dim", "Usage:"));
+    console.error(color("dim", "  Interactive:       npx pqcheck protocol install"));
+    console.error(color("dim", "  Auto (incl AI):    npx pqcheck protocol install --auto"));
+    console.error(color("dim", "  Print only:        npx pqcheck protocol install --manual"));
+    console.error(color("dim", "  Add audit metadata: --invoked-by=\"<name>\" --consent-phrase=\"<user words>\""));
+    process.exit(3);
+  }
+
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const fs = await import("node:fs/promises");
+  const readline = await import("node:readline");
+
+  // -------------------------------------------------------------------------
+  // Flag-driven setup mode (per CLAUDE.md Rule 17 — agent-invocation path).
+  //   --auto   → install to all detected files, no prompts. AI-agent-friendly.
+  //   --manual → print only, no install. Same as choosing [m] interactively.
+  //   (no flag, with TTY)  → interactive [a/m/n] prompt
+  //   (no flag, no TTY)    → bail with helpful error pointing at --auto/--manual
+  //
+  // Optional audit metadata (richer trail in install-prefs.json):
+  //   --invoked-by="<name>"      — who initiated the install (AI name+version, "human", etc.)
+  //   --consent-phrase="<words>" — the literal words that authorized this (free-form)
+  //
+  // The flag's presence IS the consent signal — Cipherwake doesn't second-guess
+  // a flag that's explicitly typed. The audit trail file captures who, when,
+  // and what for customer recourse if needed.
+  //
+  // Rule 17's spirit is "no surprises." A flag that was explicitly passed
+  // (by a human or by an AI on the human's behalf) is the opposite of a
+  // surprise — it's a recorded, intentional action.
+  // -------------------------------------------------------------------------
+  const autoFlag = args.includes("--auto");
+  const manualFlag = args.includes("--manual");
+  const invokedBy = parseFlag(args, "--invoked-by") || (autoFlag ? "unknown-agent-or-script" : null);
+  const consentPhrase = parseFlag(args, "--consent-phrase") || null;
+
+  if (autoFlag && manualFlag) {
+    console.error(color("red", "error: --auto and --manual are mutually exclusive"));
+    process.exit(3);
+  }
+
+  // Detect candidate files across major AI coders that:
+  //   (a) read an instructions file at session start, AND
+  //   (b) can run shell commands (so they can actually invoke pqcheck).
+  //
+  // Surfaces that ONLY do autocomplete (Copilot ghost text, basic Codeium,
+  // tab-only IDEs) are intentionally not here — the protocol can't apply to
+  // them; they need the GitHub Action PR-comment surface instead.
+  const candidates = [
+    { label: "Claude Code (global)", path: path.join(os.homedir(), ".claude", "CLAUDE.md") },
+    { label: "Claude Code (project)", path: path.join(process.cwd(), "CLAUDE.md") },
+    { label: "Cursor (project)", path: path.join(process.cwd(), ".cursorrules") },
+    { label: "Aider conf (project)", path: path.join(process.cwd(), ".aider.conf.yml") },
+    { label: "Aider conventions (project)", path: path.join(process.cwd(), "CONVENTIONS.md") },
+    { label: "GitHub Copilot Chat / Workspace (project)", path: path.join(process.cwd(), ".github", "copilot-instructions.md") },
+    { label: "Windsurf / Codeium (project)", path: path.join(process.cwd(), ".windsurfrules") },
+    { label: "Continue.dev (project)", path: path.join(process.cwd(), ".continuerules") },
+    { label: "Cline / Roo Cline (project)", path: path.join(process.cwd(), ".clinerules") },
+    { label: "AGENTS.md (cross-tool standard)", path: path.join(process.cwd(), "AGENTS.md") },
+  ];
+
+  const detected = [];
+  for (const c of candidates) {
+    try {
+      await fs.access(c.path);
+      detected.push(c);
+    } catch { /* file doesn't exist; that's OK */ }
+  }
+
+  console.log("");
+  console.log(color("bold", "◆ Cipherwake AI Coder Protocol — install"));
+  console.log("");
+  if (autoFlag || manualFlag) {
+    console.log(color("dim", `Mode: ${autoFlag ? "auto (--auto flag set)" : "print-only (--manual flag set)"}`));
+    if (invokedBy) console.log(color("dim", `Invoked by: ${invokedBy}`));
+    if (consentPhrase) console.log(color("dim", `Consent phrase: "${consentPhrase}"`));
+    console.log("");
+  }
+  console.log("Here's what would be added:");
+  console.log("");
+  if (detected.length === 0) {
+    console.log(color("dim", "  No existing CLAUDE.md / .cursorrules / .aider.conf.yml found."));
+    console.log(color("dim", "  Creating ~/.claude/CLAUDE.md with the protocol."));
+    detected.push({ label: "Claude Code (will create)", path: path.join(os.homedir(), ".claude", "CLAUDE.md") });
+  }
+  for (const d of detected) {
+    console.log(`  • Append a ~30-line "## Pre-deploy verification with Cipherwake" section to ${color("bold", d.path)}`);
+    console.log(`    ${color("dim", `(${d.label} — existing content preserved)`)}`);
+  }
+  console.log("");
+
+  // --manual → print only, no install
+  if (manualFlag) {
+    console.log(color("bold", "── Cipherwake AI Coder Protocol — paste this into your AI coder's instructions ──"));
+    console.log(AI_CODER_PROTOCOL_TEXT);
+    console.log(color("bold", "── End of protocol ──"));
+    console.log("");
+    console.log(color("dim", `For target files, see: ${detected.map(d => d.path).join(", ")}`));
+    process.exit(0);
+  }
+
+  // --auto → install to all detected files
+  if (autoFlag) {
+    console.log(color("dim", "Auto-install (--auto flag set). Writing audit trail to ~/.config/cipherwake/install-prefs.json."));
+    console.log("");
+    return await performAutoInstall(detected, {
+      mode: "auto-flag",
+      consent_phrase: consentPhrase,
+      invoked_by: invokedBy,
+      fs, path, os,
+    });
+  }
+
+  // Interactive (human-at-terminal) path.
+  console.log("Per CLAUDE.md Rule 17, Cipherwake never modifies your config without asking.");
+  console.log("");
+  console.log("  [a]uto    — I add the protocol to all detected files + show you a diff afterward");
+  console.log("  [m]anual  — Print the protocol so you can paste it yourself");
+  console.log("  [n]o      — Skip; you can re-run anytime with `npx pqcheck protocol install`");
+  console.log("");
+
+  if (!process.stdin.isTTY) {
+    console.error(color("red", "error: pqcheck protocol install requires an interactive terminal — OR an explicit --auto / --manual flag."));
+    console.error(color("dim", "Re-run in an interactive shell, OR pass one of:"));
+    console.error(color("dim", "  --auto    (install to all detected files; AI-friendly)"));
+    console.error(color("dim", "  --manual  (print protocol so you can paste it yourself; no install)"));
+    console.error(color("dim", "Optional audit metadata: --invoked-by=\"<name>\" --consent-phrase=\"<words>\""));
+    process.exit(3);
+  }
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const choice = await new Promise((resolve) => {
+    rl.question("Choose [a/m/n]: ", (a) => {
+      rl.close();
+      resolve((a || "").trim().toLowerCase());
+    });
+  });
+
+  if (choice === "n" || choice === "no") {
+    console.log("");
+    console.log(color("dim", "Skipped. Re-run anytime: npx pqcheck protocol install"));
+    process.exit(0);
+  }
+
+  if (choice === "m" || choice === "manual") {
+    console.log("");
+    console.log(color("bold", "── Cipherwake AI Coder Protocol — paste this into your AI coder's instructions ──"));
+    console.log(AI_CODER_PROTOCOL_TEXT);
+    console.log(color("bold", "── End of protocol ──"));
+    console.log("");
+    console.log(color("dim", `For target files, see: ${detected.map(d => d.path).join(", ")}`));
+    process.exit(0);
+  }
+
+  if (choice === "a" || choice === "auto") {
+    return await performAutoInstall(detected, {
+      mode: "interactive",
+      consent_phrase: "user typed [a] at the install prompt",
+      invoked_by: "human-at-terminal",
+      fs, path, os,
+    });
+  }
+
+  console.error(color("red", `Unknown choice "${choice}". Expected a / m / n.`));
+  process.exit(3);
+}
+
+// Shared install routine — used by both interactive and agent-invoked paths.
+// Writes the protocol to each detected file and records the audit trail.
+async function performAutoInstall(detected, opts) {
+  const { fs, path, os } = opts;
+  const results = [];
+  for (const d of detected) {
+    try {
+      await fs.mkdir(path.dirname(d.path), { recursive: true });
+      let existing = "";
+      try { existing = await fs.readFile(d.path, "utf8"); } catch { /* file may not exist yet */ }
+      if (existing.includes("## Pre-deploy verification with Cipherwake")) {
+        console.log(color("dim", `  ⊝ ${d.path} — already contains the protocol, skipping.`));
+        results.push({ path: d.path, label: d.label, status: "skipped-already-present" });
+        continue;
+      }
+      const newContent = existing + "\n" + AI_CODER_PROTOCOL_TEXT + "\n";
+      await fs.writeFile(d.path, newContent, "utf8");
+      console.log(color("green", `  ✓ ${d.path} — protocol appended (${AI_CODER_PROTOCOL_TEXT.split("\n").length} lines)`));
+      results.push({ path: d.path, label: d.label, status: "installed" });
+    } catch (err) {
+      console.log(color("red", `  ✗ ${d.path} — failed: ${err.message}`));
+      results.push({ path: d.path, label: d.label, status: "failed", error: String(err?.message || err) });
+    }
+  }
+
+  // Persist the audit trail to ~/.config/cipherwake/install-prefs.json.
+  // This is the customer's recourse if they ever dispute the install — the
+  // file shows who invoked it, when, and the exact consent phrase used.
+  try {
+    const prefsDir = path.join(os.homedir(), ".config", "cipherwake");
+    await fs.mkdir(prefsDir, { recursive: true });
+    const prefsPath = path.join(prefsDir, "install-prefs.json");
+    let prefs = { history: [] };
+    try {
+      const existing = await fs.readFile(prefsPath, "utf8");
+      prefs = JSON.parse(existing);
+      if (!Array.isArray(prefs.history)) prefs.history = [];
+    } catch { /* first run, file doesn't exist or is malformed */ }
+    prefs.history.push({
+      timestamp: new Date().toISOString(),
+      command: "protocol-install",
+      mode: opts.mode,
+      consent_phrase: opts.consent_phrase,
+      invoked_by: opts.invoked_by,
+      cwd: process.cwd(),
+      hostname: os.hostname(),
+      pqcheck_version: VERSION,
+      results,
+    });
+    await fs.writeFile(prefsPath, JSON.stringify(prefs, null, 2), "utf8");
+    console.log(color("dim", `  Audit trail: ${prefsPath}`));
+  } catch (err) {
+    console.log(color("dim", `  (audit trail write failed: ${err.message} — non-fatal)`));
+  }
+
+  console.log("");
+  console.log(color("green", "Done. Your AI coder will follow the protocol on its next deploy."));
+  console.log(color("dim", "Reference: https://cipherwake.io/methodology/ai-coder-protocol"));
+  process.exit(0);
+}
+
+// =============================================================================
+// `pqcheck setup --auto --domain <D>` — consolidated installer
+// =============================================================================
+// One command installs everything an AI-coder workflow needs:
+//   1. GitHub Action workflow file (CI hard gate)
+//   2. AI Coder Protocol across all detected rules files (CLAUDE.md /
+//      .cursorrules / .github/copilot-instructions.md / .aider.conf.yml /
+//      AGENTS.md / etc.) — multi-platform, defense-in-depth
+//   3. Git pre-push hook (catches manual git push origin main bypasses)
+//   4. Claude Code statusLine config in ~/.claude/settings.json (per-flag
+//      consent counts as Rule 17 consent; recorded in audit trail)
+//   5. VS Code extension via `code --install-extension` if `code` CLI on PATH
+//      (skipped silently if not available)
+//
+// The pinnedai-equivalent for Cipherwake. Launch story: "One command, every
+// AI coder ready."
+//
+// Usage:
+//   npx pqcheck setup --auto --domain cipherwake.io
+//   npx pqcheck setup --auto --domain cipherwake.io \\
+//     --invoked-by "Claude Code" --consent-phrase "the user said yes do B"
+// =============================================================================
+
+const GIT_PREPUSH_HOOK_SCRIPT = `#!/usr/bin/env bash
+# Cipherwake pre-push hook — installed by \`pqcheck setup --auto\`
+#
+# Runs deploy-check before pushes to deploy-triggering branches. Catches the
+# case where a human (or an AI that forgot the protocol) pushes directly to
+# main without running deploy-check first. Defense-in-depth alongside the
+# GitHub Action + the AI Coder Protocol.
+#
+# To bypass for a single push: CIPHERWAKE_HOOK_SKIP=1 git push
+# To uninstall: rm .git/hooks/pre-push (or pqcheck setup --uninstall — TBD)
+
+CIPHERWAKE_DOMAIN="\${CIPHERWAKE_DOMAIN:-DOMAIN_PLACEHOLDER}"
+DEPLOY_BRANCHES_REGEX="\${CIPHERWAKE_DEPLOY_BRANCHES:-^refs/heads/(main|master|production|deploy)$}"
+
+if [ "\$CIPHERWAKE_HOOK_SKIP" = "1" ]; then
+  echo "▶ Cipherwake hook: CIPHERWAKE_HOOK_SKIP=1 — bypassing"
+  exit 0
+fi
+
+# Read which refs are being pushed. We only act on pushes to deploy branches.
+SHOULD_RUN=0
+while read local_ref local_sha remote_ref remote_sha; do
+  if [[ "\$remote_ref" =~ \$DEPLOY_BRANCHES_REGEX ]]; then
+    SHOULD_RUN=1
+    break
+  fi
+done
+
+if [ "\$SHOULD_RUN" = "0" ]; then
+  exit 0
+fi
+
+echo "▶ Cipherwake pre-push: running deploy-check on \$CIPHERWAKE_DOMAIN..."
+
+# npx pqcheck deploy-check exits: 0=pass, 1=warn/review, 2=fail/block, 3=error
+npx --yes pqcheck deploy-check "\$CIPHERWAKE_DOMAIN" --ai
+RC=\$?
+
+case "\$RC" in
+  0)
+    echo "▶ Cipherwake: ship_decision=pass — proceeding with push"
+    exit 0
+    ;;
+  1)
+    echo ""
+    echo "▶ Cipherwake flagged a REVIEW-level finding (see output above)."
+    echo "▶ Push allowed — but please review the change before announcing the deploy."
+    echo "▶ To suppress this notice for one push: CIPHERWAKE_HOOK_SKIP=1 git push"
+    exit 0
+    ;;
+  2)
+    echo ""
+    echo "✗ Cipherwake returned BLOCK — refusing push."
+    echo "✗ Investigate the finding above before deploying."
+    echo "✗ To override (with explicit acknowledgement): CIPHERWAKE_HOOK_SKIP=1 git push"
+    exit 1
+    ;;
+  *)
+    echo "▶ Cipherwake pre-check errored (exit \$RC) — allowing push (fail-open)."
+    echo "▶ Set CIPHERWAKE_API_KEY if deploy-check is failing on auth."
+    exit 0
+    ;;
+esac
+`;
+
+const CLAUDE_STATUSLINE_CONFIG_SNIPPET = `
+  "statusLine": {
+    "type": "command",
+    "command": "npx --package=pqcheck@latest cipherwake-statusline"
+  }`;
+
+// R74-confirm SHIP #14-15 (GPT 2026-05-22): network connectivity diagnostic.
+// Customer runs this when "scan hung" or "command not found" to surface the
+// actual broken hop instead of guessing. Tests: DNS resolution → TCP → TLS
+// → HTTP for each upstream.
+async function runDebugNetworkCommand() {
+  console.log("");
+  console.log(color("bold", "◆ Cipherwake — network diagnostic"));
+  console.log(color("dim", "Probes every upstream the CLI depends on. Run this when scans hang or fail."));
+  console.log("");
+
+  const probes = [
+    { name: "cipherwake.io (API)", url: "https://cipherwake.io/api/scan?domain=cipherwake.io" },
+    { name: "cipherwake.io (homepage)", url: "https://cipherwake.io/" },
+    { name: "crt.sh (CT log upstream)", url: "https://crt.sh/?q=%25.cipherwake.io&output=json" },
+    { name: "Vercel direct (bypass Cloudflare)", url: "https://quantapact.vercel.app/" },
+  ];
+
+  let anyFailed = false;
+  for (const p of probes) {
+    const t0 = Date.now();
+    try {
+      const ctrl = new AbortController();
+      const tmr = setTimeout(() => ctrl.abort(), 10000);
+      const resp = await fetch(p.url, { method: "HEAD", signal: ctrl.signal });
+      clearTimeout(tmr);
+      const elapsed = Date.now() - t0;
+      const statusOk = resp.status >= 200 && resp.status < 500;
+      const marker = statusOk ? color("green", "✓") : color("yellow", "⚠");
+      console.log(`  ${marker} ${p.name.padEnd(38)} HTTP ${resp.status}  ${elapsed}ms`);
+      if (!statusOk) anyFailed = true;
+    } catch (err) {
+      anyFailed = true;
+      const elapsed = Date.now() - t0;
+      const msg = (err && err.message) || String(err);
+      const kind = err?.name === "AbortError" ? "timeout" : "error";
+      console.log(`  ${color("red", "✗")} ${p.name.padEnd(38)} ${kind.toUpperCase()}  ${elapsed}ms  ${msg.slice(0, 60)}`);
+    }
+  }
+
+  console.log("");
+  if (anyFailed) {
+    console.log(color("bold", "Possible causes (in order of likelihood):"));
+    console.log("  1. Corporate proxy / VPN blocking outbound HTTPS to public scanners.");
+    console.log("     → Try setting HTTPS_PROXY env var, or run from a non-corporate network.");
+    console.log("  2. Cloudflare WAF rate-limited your IP. Wait 5-15min and retry.");
+    console.log("     → Or switch networks (mobile hotspot bypasses your home IP).");
+    console.log("  3. DNS resolver doesn't resolve cipherwake.io.");
+    console.log("     → Test with: `dig cipherwake.io`. If it fails, your resolver is offline.");
+    console.log("  4. crt.sh is intermittently slow — that's the upstream we use for CT logs.");
+    console.log("     → Cipherwake degrades to a 14-day stale-cache fallback when crt.sh fails, so this");
+    console.log("       only matters on first scan of brand-new domains.");
+    console.log("");
+    console.log(color("dim", "If you're still blocked, file a bug at https://cipherwake.io/feedback"));
+    process.exit(1);
+  } else {
+    console.log(color("green", "  ✓ All upstreams reachable — Cipherwake should work for you."));
+    console.log("");
+  }
+}
+
+async function runSetupCommand(args) {
+  const autoFlag = args.includes("--auto");
+  const planFlag = args.includes("--plan");                              // R74-confirm BLOCKING #19 (GPT 2026-05-22)
+  const domain = parseFlag(args, "--domain");
+  const failOn = parseFlag(args, "--fail-on") || "high";
+  const baseline = parseFlag(args, "--baseline") || "last-scan";
+  const invokedBy = parseFlag(args, "--invoked-by") || (autoFlag ? "unknown-agent-or-script" : null);
+  const consentPhrase = parseFlag(args, "--consent-phrase") || null;
+  const skipWorkflow = args.includes("--skip-workflow");
+  const skipProtocol = args.includes("--skip-protocol");
+  const skipHook = args.includes("--skip-hook");
+  const skipStatusline = args.includes("--skip-statusline");
+  const skipVscode = args.includes("--skip-vscode");
+
+  if (!domain) {
+    console.error(color("red", "error: pqcheck setup requires --domain"));
+    console.error(color("dim", "Usage: npx pqcheck setup --auto --domain example.com"));
+    console.error(color("dim", "  --plan         Print the install plan without writing any files"));
+    console.error(color("dim", "  --invoked-by=\"<name>\" --consent-phrase=\"<words>\"   (audit trail)"));
+    console.error(color("dim", "Skip flags: --skip-workflow --skip-protocol --skip-hook --skip-statusline --skip-vscode"));
+    process.exit(3);
+  }
+  if (!autoFlag && !planFlag && !process.stdin.isTTY) {
+    console.error(color("red", "error: pqcheck setup requires --auto or --plan when stdin is not a TTY"));
+    console.error(color("dim", "Pass --auto explicitly (the flag IS the consent signal per CLAUDE.md Rule 17),"));
+    console.error(color("dim", "or --plan to see what would be installed without writing anything."));
+    process.exit(3);
+  }
+
+  // R74-confirm BLOCKING #19 (GPT 2026-05-22): --plan mode prints the
+  // intended changes without writing. Addresses GPT's "init modifies too
+  // much without a clear dry run" concern. Customer can run --plan first
+  // to inspect, then run --auto when they're comfortable. AI agents are
+  // encouraged (per the protocol page) to run --plan first when no recent
+  // user consent for --auto exists in the conversation.
+  if (planFlag) {
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const fs = await import("node:fs/promises");
+    console.log("");
+    console.log(color("bold", `◆ Cipherwake Setup — PLAN (dry run, no files will be written)`));
+    console.log(color("dim", `Domain target: ${domain}`));
+    console.log("");
+    console.log(color("bold", "Files this install would touch:"));
+    const planEntries = [];
+    if (!skipWorkflow) planEntries.push({ what: "GitHub Action workflow", to: path.join(process.cwd(), ".github", "workflows", "cipherwake.yml"), op: "create" });
+    if (!skipProtocol) {
+      const candidates = [
+        { label: "Claude Code (global)", path: path.join(os.homedir(), ".claude", "CLAUDE.md") },
+        { label: "Claude Code (project)", path: path.join(process.cwd(), "CLAUDE.md") },
+        { label: "Cursor", path: path.join(process.cwd(), ".cursorrules") },
+        { label: "GitHub Copilot", path: path.join(process.cwd(), ".github", "copilot-instructions.md") },
+        { label: "Aider", path: path.join(process.cwd(), ".aider.conf.yml") },
+        { label: "AGENTS.md", path: path.join(process.cwd(), "AGENTS.md") },
+      ];
+      for (const c of candidates) {
+        let exists = false;
+        try { await fs.access(c.path); exists = true; } catch { /* */ }
+        planEntries.push({ what: `AI Coder Protocol — ${c.label}`, to: c.path, op: exists ? "append-markered" : "skip (file not present)" });
+      }
+    }
+    if (!skipHook) planEntries.push({ what: "git pre-push hook", to: path.join(process.cwd(), ".git", "hooks", "pre-push"), op: "create (if git repo)" });
+    if (!skipStatusline) {
+      const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
+      let exists = false;
+      try { await fs.access(settingsPath); exists = true; } catch { /* */ }
+      planEntries.push({ what: "Claude Code statusLine", to: settingsPath, op: exists ? "deep-merge (backup first)" : "create" });
+      planEntries.push({ what: "Claude Code chat-hook (PostToolUse Bash)", to: settingsPath, op: exists ? "deep-merge into hooks.PostToolUse" : "create" });
+    }
+    if (!skipVscode) planEntries.push({ what: "VS Code / Cursor extension", to: "via `code --install-extension cipherwakelabs.cipherwake-statusbar`", op: "attempt (soft-fail if Marketplace listing missing)" });
+    for (const e of planEntries) {
+      console.log(`  ${color("dim", e.op.padEnd(28))} ${color("bold", e.what)}`);
+      console.log(`    ${color("dim", "→")} ${e.to}`);
+    }
+    console.log("");
+    console.log(color("bold", "To proceed:"));
+    console.log(`  npx pqcheck setup --auto --domain ${domain}${invokedBy ? ` --invoked-by "${invokedBy}"` : ""}${consentPhrase ? ` --consent-phrase "${consentPhrase}"` : ""}`);
+    console.log("");
+    console.log(color("dim", "Per Cipherwake Rule 17, --auto is the consent signal. Backups are taken before each settings.json write."));
+    console.log("");
+    return;
+  }
+
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const fs = await import("node:fs/promises");
+  const { spawn } = await import("node:child_process");
+
+  console.log("");
+  console.log(color("bold", `◆ Cipherwake Setup — ${domain}`));
+  console.log("");
+  if (autoFlag) {
+    console.log(color("dim", "Auto mode (--auto flag set). Per CLAUDE.md Rule 17, the flag is the consent signal."));
+    if (invokedBy) console.log(color("dim", `Invoked by: ${invokedBy}`));
+    if (consentPhrase) console.log(color("dim", `Consent phrase: "${consentPhrase}"`));
+    console.log("");
+  }
+
+  const installSummary = [];
+
+  // -------------------------------------------------------------------------
+  // Component 1: GitHub Action workflow (.github/workflows/cipherwake.yml)
+  // -------------------------------------------------------------------------
+  if (!skipWorkflow) {
+    const workflowPath = path.join(process.cwd(), ".github", "workflows", "cipherwake.yml");
+    try {
+      try {
+        await fs.access(workflowPath);
+        console.log(color("dim", `  ⊝ workflow at .github/workflows/cipherwake.yml already exists — skipping`));
+        installSummary.push({ component: "GitHub Action workflow", path: workflowPath, status: "skipped-already-present" });
+      } catch {
+        const workflowYaml = renderTrustDiffWorkflow({ domain, failOn, baseline });
+        await fs.mkdir(path.dirname(workflowPath), { recursive: true });
+        await fs.writeFile(workflowPath, workflowYaml, "utf8");
+        console.log(color("green", `  ✓ wrote .github/workflows/cipherwake.yml (CI hard-gate layer)`));
+        installSummary.push({ component: "GitHub Action workflow", path: workflowPath, status: "installed" });
+      }
+    } catch (err) {
+      console.log(color("red", `  ✗ workflow install failed: ${err.message}`));
+      installSummary.push({ component: "GitHub Action workflow", status: "failed", error: String(err?.message || err) });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Component 2: AI Coder Protocol across detected rules files
+  // -------------------------------------------------------------------------
+  if (!skipProtocol) {
+    const candidates = [
+      { label: "Claude Code (global)", path: path.join(os.homedir(), ".claude", "CLAUDE.md") },
+      { label: "Claude Code (project)", path: path.join(process.cwd(), "CLAUDE.md") },
+      { label: "Cursor (project)", path: path.join(process.cwd(), ".cursorrules") },
+      { label: "Aider conf (project)", path: path.join(process.cwd(), ".aider.conf.yml") },
+      { label: "Aider conventions (project)", path: path.join(process.cwd(), "CONVENTIONS.md") },
+      { label: "GitHub Copilot Chat / Workspace (project)", path: path.join(process.cwd(), ".github", "copilot-instructions.md") },
+      { label: "Windsurf / Codeium (project)", path: path.join(process.cwd(), ".windsurfrules") },
+      { label: "Continue.dev (project)", path: path.join(process.cwd(), ".continuerules") },
+      { label: "Cline / Roo Cline (project)", path: path.join(process.cwd(), ".clinerules") },
+      { label: "AGENTS.md (cross-tool standard)", path: path.join(process.cwd(), "AGENTS.md") },
+    ];
+    // Detect any existing files; auto-create the global Claude Code file so
+    // every install yields at least one rules-file landing site.
+    const protocolTargets = [];
+    for (const c of candidates) {
+      try {
+        await fs.access(c.path);
+        protocolTargets.push(c);
+      } catch { /* skip */ }
+    }
+    if (protocolTargets.length === 0) {
+      protocolTargets.push({ label: "Claude Code (created)", path: path.join(os.homedir(), ".claude", "CLAUDE.md") });
+    }
+    // R74-confirm BLOCKING #6 (GPT 2026-05-22): wrap the protocol section in
+    // fenced markers so future installs / updates / removals can locate and
+    // replace exactly this block without scanning for the heading. Idempotent:
+    // if markers exist, the block between them is replaced; if neither markers
+    // nor heading exist, the block is appended. Always preserves whatever the
+    // user has written outside the markers.
+    const START_MARKER = "<!-- CIPHERWAKE_AI_CODER_PROTOCOL_START — managed by pqcheck setup; safe to delete this section between markers but do not edit by hand -->";
+    const END_MARKER = "<!-- CIPHERWAKE_AI_CODER_PROTOCOL_END -->";
+    for (const t of protocolTargets) {
+      try {
+        await fs.mkdir(path.dirname(t.path), { recursive: true });
+        let existing = "";
+        try { existing = await fs.readFile(t.path, "utf8"); } catch { /* file may not exist */ }
+
+        const hasMarkers = existing.includes(START_MARKER) && existing.includes(END_MARKER);
+        const hasLegacyHeading = existing.includes("## Pre-deploy verification with Cipherwake");
+
+        if (hasMarkers) {
+          // Replace just the bounded section — leaves all other user content untouched.
+          const startIdx = existing.indexOf(START_MARKER);
+          const endIdx = existing.indexOf(END_MARKER) + END_MARKER.length;
+          const before = existing.slice(0, startIdx);
+          const after = existing.slice(endIdx);
+          const next = `${before.replace(/\n+$/, "")}\n\n${START_MARKER}\n${AI_CODER_PROTOCOL_TEXT}\n${END_MARKER}\n${after.replace(/^\n+/, "")}`;
+          if (next === existing) {
+            console.log(color("dim", `  ⊝ ${path.basename(t.path)} (${t.label}) — protocol already current`));
+            installSummary.push({ component: "AI Coder Protocol", path: t.path, label: t.label, status: "skipped-already-present" });
+            continue;
+          }
+          await fs.writeFile(t.path, next, "utf8");
+          console.log(color("green", `  ✓ refreshed protocol section → ${path.basename(t.path)} (${t.label})`));
+          installSummary.push({ component: "AI Coder Protocol", path: t.path, label: t.label, status: "installed-updated" });
+        } else if (hasLegacyHeading) {
+          // Old install lacks markers. Don't double-append; treat as already present.
+          // Note: customers can re-run `pqcheck protocol install --auto` to upgrade to the markered form.
+          console.log(color("dim", `  ⊝ ${path.basename(t.path)} (${t.label}) — legacy unmarkered protocol present (run \`pqcheck protocol install --auto\` to upgrade to markered form)`));
+          installSummary.push({ component: "AI Coder Protocol", path: t.path, label: t.label, status: "skipped-legacy-present" });
+        } else {
+          // Fresh install — append with fenced markers.
+          const sep = existing.length > 0 ? "\n\n" : "";
+          await fs.writeFile(t.path, `${existing}${sep}${START_MARKER}\n${AI_CODER_PROTOCOL_TEXT}\n${END_MARKER}\n`, "utf8");
+          console.log(color("green", `  ✓ appended protocol (markered) → ${path.basename(t.path)} (${t.label})`));
+          installSummary.push({ component: "AI Coder Protocol", path: t.path, label: t.label, status: "installed" });
+        }
+      } catch (err) {
+        console.log(color("red", `  ✗ ${t.path} — failed: ${err.message}`));
+        installSummary.push({ component: "AI Coder Protocol", path: t.path, status: "failed", error: String(err?.message || err) });
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Component 3: Git pre-push hook
+  // -------------------------------------------------------------------------
+  if (!skipHook) {
+    const gitDir = path.join(process.cwd(), ".git");
+    let isGitRepo = true;
+    try { await fs.access(gitDir); } catch { isGitRepo = false; }
+    if (!isGitRepo) {
+      console.log(color("dim", `  ⊝ git pre-push hook — skipped (not a git repo: no .git dir in ${process.cwd()})`));
+      installSummary.push({ component: "git pre-push hook", status: "skipped-not-git-repo" });
+    } else {
+      const hookPath = path.join(gitDir, "hooks", "pre-push");
+      try {
+        let existing = "";
+        try { existing = await fs.readFile(hookPath, "utf8"); } catch { /* file may not exist */ }
+        if (existing.includes("Cipherwake pre-push hook")) {
+          console.log(color("dim", `  ⊝ .git/hooks/pre-push already contains the Cipherwake hook — skipping`));
+          installSummary.push({ component: "git pre-push hook", path: hookPath, status: "skipped-already-present" });
+        } else if (existing.trim() && !existing.startsWith("#!/")) {
+          console.log(color("yellow", `  ⊝ .git/hooks/pre-push exists but doesn't look like our hook — skipped to avoid overwriting your script`));
+          installSummary.push({ component: "git pre-push hook", path: hookPath, status: "skipped-conflicts" });
+        } else {
+          const hookScript = GIT_PREPUSH_HOOK_SCRIPT.replace("DOMAIN_PLACEHOLDER", domain);
+          await fs.mkdir(path.dirname(hookPath), { recursive: true });
+          await fs.writeFile(hookPath, hookScript, { mode: 0o755 });
+          // Ensure executable bit set (writeFile mode is platform-dependent)
+          try { await fs.chmod(hookPath, 0o755); } catch { /* best effort */ }
+          console.log(color("green", `  ✓ installed .git/hooks/pre-push (catches manual \`git push origin main\` bypasses)`));
+          installSummary.push({ component: "git pre-push hook", path: hookPath, status: "installed" });
+        }
+      } catch (err) {
+        console.log(color("red", `  ✗ pre-push hook install failed: ${err.message}`));
+        installSummary.push({ component: "git pre-push hook", path: hookPath, status: "failed", error: String(err?.message || err) });
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Component 4: Claude Code statusLine config
+  // -------------------------------------------------------------------------
+  // R74-confirm BLOCKING #10 (GPT 2026-05-22): backup before any settings.json
+  // write. The user's ~/.claude/settings.json is theirs; we deep-merge our
+  // entries but if the merge is ever wrong (existing key shape we didn't
+  // anticipate), the backup gives them a one-second rollback path. The backup
+  // is also surfaced in the install summary so the audit trail captures it.
+  async function backupSettingsJson(settingsPath) {
+    try {
+      let raw;
+      try { raw = await fs.readFile(settingsPath, "utf8"); } catch { return null; }
+      const ts = new Date().toISOString().replace(/[:.]/g, "-");
+      const backupPath = `${settingsPath}.bak.${ts}`;
+      await fs.writeFile(backupPath, raw, "utf8");
+      return backupPath;
+    } catch (e) {
+      console.log(color("yellow", `  ⚠ settings.json backup failed (${(e && e.message || e)}); proceeding anyway`));
+      return null;
+    }
+  }
+
+  if (!skipStatusline) {
+    const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
+    try {
+      let settings = {};
+      let existed = false;
+      try {
+        const raw = await fs.readFile(settingsPath, "utf8");
+        settings = JSON.parse(raw);
+        existed = true;
+      } catch { /* will create */ }
+      if (existed && settings.statusLine && typeof settings.statusLine === "object") {
+        // Already has a statusLine config — don't overwrite.
+        console.log(color("dim", `  ⊝ ~/.claude/settings.json already has a statusLine entry — leaving alone`));
+        console.log(color("dim", `    To use the Cipherwake statusline instead, set: "command": "npx --package=pqcheck@latest cipherwake-statusline"`));
+        installSummary.push({ component: "Claude Code statusLine", path: settingsPath, status: "skipped-existing-config" });
+      } else {
+        const backupPath = existed ? await backupSettingsJson(settingsPath) : null;
+        if (backupPath) console.log(color("dim", `    backup: ${backupPath}`));
+        settings.statusLine = { type: "command", command: "npx --package=pqcheck@latest cipherwake-statusline" };
+        await fs.mkdir(path.dirname(settingsPath), { recursive: true });
+        await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf8");
+        console.log(color("green", `  ✓ added statusLine config → ~/.claude/settings.json`));
+        installSummary.push({ component: "Claude Code statusLine", path: settingsPath, status: existed ? "installed-updated" : "installed-created", backup: backupPath });
+      }
+    } catch (err) {
+      console.log(color("red", `  ✗ statusLine config install failed: ${err.message}`));
+      installSummary.push({ component: "Claude Code statusLine", path: settingsPath, status: "failed", error: String(err?.message || err) });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Component 4b: Claude Code chat-hook (PostToolUse on Bash → cipherwake-chat-hook)
+  // Pushes a live "◆ Cipherwake just caught X" message into the chat scrollback
+  // every time a pqcheck command runs. Merges with existing hook configs;
+  // doesn't clobber other hooks per CLAUDE.md Rule 17.
+  // -------------------------------------------------------------------------
+  if (!skipStatusline) {
+    const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
+    try {
+      let settings = {};
+      let existed = false;
+      try {
+        const raw = await fs.readFile(settingsPath, "utf8");
+        settings = JSON.parse(raw);
+        existed = true;
+      } catch { /* will create */ }
+      settings.hooks = settings.hooks || {};
+      settings.hooks.PostToolUse = settings.hooks.PostToolUse || [];
+
+      // Look for an existing matcher entry for Bash
+      let bashEntry = settings.hooks.PostToolUse.find((e) => e?.matcher === "Bash");
+      if (!bashEntry) {
+        bashEntry = { matcher: "Bash", hooks: [] };
+        settings.hooks.PostToolUse.push(bashEntry);
+      }
+      bashEntry.hooks = bashEntry.hooks || [];
+
+      const cipherwakeHookCmd = "npx --package=pqcheck@latest cipherwake-chat-hook";
+      const alreadyInstalled = bashEntry.hooks.some(
+        (h) => h?.type === "command" && typeof h?.command === "string" && h.command.includes("cipherwake-chat-hook"),
+      );
+
+      if (alreadyInstalled) {
+        console.log(color("dim", `  ⊝ chat-hook already configured in ~/.claude/settings.json PostToolUse — skipping`));
+        installSummary.push({ component: "Claude Code chat-hook", path: settingsPath, status: "skipped-already-present" });
+      } else {
+        const backupPath = existed ? await backupSettingsJson(settingsPath) : null;
+        if (backupPath) console.log(color("dim", `    backup: ${backupPath}`));
+        bashEntry.hooks.push({ type: "command", command: cipherwakeHookCmd });
+        await fs.mkdir(path.dirname(settingsPath), { recursive: true });
+        await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf8");
+        console.log(color("green", `  ✓ added chat-hook (PostToolUse Bash) → ~/.claude/settings.json`));
+        console.log(color("dim", `    Every \`pqcheck\` run will now push a live status message into Claude Code chat`));
+        installSummary.push({ component: "Claude Code chat-hook", path: settingsPath, status: existed ? "installed-updated" : "installed-created", backup: backupPath });
+      }
+    } catch (err) {
+      console.log(color("red", `  ✗ chat-hook install failed: ${err.message}`));
+      installSummary.push({ component: "Claude Code chat-hook", status: "failed", error: String(err?.message || err) });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Component 4c: Claude Code prompt-hook (UserPromptSubmit → cipherwake-prompt-hook)
+  // v0.15.1 — pinnedai-parity item. Injects ship_decision into Claude's
+  // context BEFORE Claude responds to every user prompt. Different timing
+  // from 4b: chat-hook fires AFTER a tool ran (reactive), prompt-hook fires
+  // BEFORE Claude responds (proactive). Silent when state is missing / stale
+  // / ship_decision=pass (no spam).
+  // -------------------------------------------------------------------------
+  if (!skipStatusline) {
+    const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
+    try {
+      let settings = {};
+      let existed = false;
+      try {
+        const raw = await fs.readFile(settingsPath, "utf8");
+        settings = JSON.parse(raw);
+        existed = true;
+      } catch { /* will create */ }
+      settings.hooks = settings.hooks || {};
+      settings.hooks.UserPromptSubmit = settings.hooks.UserPromptSubmit || [];
+
+      const cipherwakeHookCmd = "npx --package=pqcheck@latest cipherwake-prompt-hook";
+      const alreadyInstalled = settings.hooks.UserPromptSubmit.some(
+        (entry) => Array.isArray(entry?.hooks) && entry.hooks.some(
+          (h) => h?.type === "command" && typeof h?.command === "string" && h.command.includes("cipherwake-prompt-hook"),
+        ),
+      );
+
+      if (alreadyInstalled) {
+        console.log(color("dim", `  ⊝ prompt-hook already configured in ~/.claude/settings.json UserPromptSubmit — skipping`));
+        installSummary.push({ component: "Claude Code prompt-hook", path: settingsPath, status: "skipped-already-present" });
+      } else {
+        const backupPath = existed ? await backupSettingsJson(settingsPath) : null;
+        if (backupPath) console.log(color("dim", `    backup: ${backupPath}`));
+        settings.hooks.UserPromptSubmit.push({ hooks: [{ type: "command", command: cipherwakeHookCmd }] });
+        await fs.mkdir(path.dirname(settingsPath), { recursive: true });
+        await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf8");
+        console.log(color("green", `  ✓ added prompt-hook (UserPromptSubmit) → ~/.claude/settings.json`));
+        console.log(color("dim", `    Claude will see latest ship_decision in context on every prompt (when REVIEW/BLOCK)`));
+        installSummary.push({ component: "Claude Code prompt-hook", path: settingsPath, status: existed ? "installed-updated" : "installed-created", backup: backupPath });
+      }
+    } catch (err) {
+      console.log(color("red", `  ✗ prompt-hook install failed: ${err.message}`));
+      installSummary.push({ component: "Claude Code prompt-hook", status: "failed", error: String(err?.message || err) });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Component 4d: Per-repo state directory (.cipherwake/) for Cursor / Copilot
+  // v0.15.1 — pinnedai-parity item. Cursor/Copilot/Continue/Cline read repo
+  // state for context. Creating .cipherwake/ in the repo gives them a
+  // read-on-demand surface that subsequent `pqcheck` runs (via the
+  // writeLastScanFile path) populate with the latest scan state. Also adds
+  // .cipherwake/ to .gitignore if not already there — per-developer state,
+  // not committable.
+  // -------------------------------------------------------------------------
+  if (!skipStatusline) {
+    try {
+      const repoStateDir = path.join(process.cwd(), ".cipherwake");
+      await fs.mkdir(repoStateDir, { recursive: true });
+      // Write an initial placeholder so the file exists immediately. Subsequent
+      // scans via writeLastScanFile will overwrite with real data.
+      const placeholderPath = path.join(repoStateDir, "last-status.json");
+      try {
+        await fs.access(placeholderPath);
+        // Already exists — preserve it.
+      } catch {
+        await fs.writeFile(placeholderPath, JSON.stringify({
+          domain,
+          ship_decision: "unknown",
+          note: "Initial placeholder — run `npx pqcheck deploy-check " + domain + " --ai` to populate",
+          written_at: new Date().toISOString(),
+        }, null, 2));
+      }
+      // Add .cipherwake/ to .gitignore if missing (don't commit per-developer state).
+      const gitignorePath = path.join(process.cwd(), ".gitignore");
+      let gitignore = "";
+      try { gitignore = await fs.readFile(gitignorePath, "utf8"); } catch { /* may not exist */ }
+      if (!/^\.cipherwake\/?\s*$/m.test(gitignore)) {
+        const appended = gitignore + (gitignore.endsWith("\n") || gitignore.length === 0 ? "" : "\n") + "\n# Cipherwake per-developer scan state (read-on-demand by AI coders)\n.cipherwake/\n";
+        await fs.writeFile(gitignorePath, appended);
+      }
+      console.log(color("green", `  ✓ created .cipherwake/last-status.json (Cursor/Copilot/Continue read this for context)`));
+      installSummary.push({ component: "Per-repo state file", path: placeholderPath, status: "installed" });
+    } catch (err) {
+      console.log(color("red", `  ✗ per-repo state install failed: ${err.message}`));
+      installSummary.push({ component: "Per-repo state file", status: "failed", error: String(err?.message || err) });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Component 5: VS Code / Cursor extension (via `code` CLI if available)
+  // -------------------------------------------------------------------------
+  if (!skipVscode) {
+    // Check if `code` CLI is on PATH
+    const codeAvailable = await new Promise((resolve) => {
+      const child = spawn("code", ["--version"], { stdio: ["ignore", "ignore", "ignore"] });
+      child.on("error", () => resolve(false));
+      child.on("close", (rc) => resolve(rc === 0));
+    });
+    if (!codeAvailable) {
+      console.log(color("dim", `  ⊝ VS Code extension — \`code\` CLI not on PATH. Install from Marketplace: search "Cipherwake Trust Status Bar"`));
+      installSummary.push({ component: "VS Code / Cursor extension", status: "skipped-code-cli-not-available" });
+    } else {
+      // Note: until the extension is published to Marketplace, `code --install-extension cipherwakelabs.cipherwake-statusbar`
+      // won't resolve. We attempt the install and treat failure as a soft skip.
+      const installResult = await new Promise((resolve) => {
+        const child = spawn("code", ["--install-extension", "cipherwakelabs.cipherwake-statusbar"], { stdio: ["ignore", "pipe", "pipe"] });
+        let out = "";
+        child.stdout?.on("data", (d) => out += d.toString());
+        child.stderr?.on("data", (d) => out += d.toString());
+        child.on("close", (rc) => resolve({ rc, out }));
+        child.on("error", (err) => resolve({ rc: -1, out: err.message }));
+      });
+      if (installResult.rc === 0) {
+        console.log(color("green", `  ✓ installed VS Code extension: cipherwakelabs.cipherwake-statusbar`));
+        installSummary.push({ component: "VS Code / Cursor extension", status: "installed" });
+      } else {
+        console.log(color("dim", `  ⊝ VS Code extension install attempted but not on Marketplace yet. Awaiting publish.`));
+        installSummary.push({ component: "VS Code / Cursor extension", status: "skipped-not-on-marketplace-yet", attempted: true });
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Audit trail
+  // -------------------------------------------------------------------------
+  try {
+    const prefsDir = path.join(os.homedir(), ".config", "cipherwake");
+    await fs.mkdir(prefsDir, { recursive: true });
+    const prefsPath = path.join(prefsDir, "install-prefs.json");
+    let prefs = { history: [] };
+    try {
+      const existing = await fs.readFile(prefsPath, "utf8");
+      prefs = JSON.parse(existing);
+      if (!Array.isArray(prefs.history)) prefs.history = [];
+    } catch { /* first run */ }
+    prefs.history.push({
+      timestamp: new Date().toISOString(),
+      command: "setup",
+      mode: autoFlag ? "auto-flag" : "interactive",
+      domain,
+      consent_phrase: consentPhrase,
+      invoked_by: invokedBy,
+      cwd: process.cwd(),
+      hostname: os.hostname(),
+      pqcheck_version: VERSION,
+      summary: installSummary,
+    });
+    await fs.writeFile(prefsPath, JSON.stringify(prefs, null, 2), "utf8");
+    console.log("");
+    console.log(color("dim", `  Audit trail: ${prefsPath}`));
+  } catch (err) {
+    console.log(color("dim", `  (audit trail write failed: ${err.message} — non-fatal)`));
+  }
+
+  // R74-confirm BLOCKING #16 (GPT 2026-05-22): write an install manifest so
+  // a Ctrl-C'd or partially-failed install can be diagnosed + resumed. The
+  // manifest is the "what got done" record, separate from install-prefs.json
+  // (which is the "who/why" audit trail). A future `pqcheck doctor --repair`
+  // command will use this to skip already-completed steps. For now the file
+  // is the artifact you can `cat` to see exactly what got written.
+  try {
+    const manifestPath = path.join(os.homedir(), ".config", "cipherwake", "install-manifest.json");
+    let manifestList = [];
+    try {
+      manifestList = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+      if (!Array.isArray(manifestList)) manifestList = [];
+    } catch { /* new file */ }
+    manifestList.unshift({
+      run_at: new Date().toISOString(),
+      domain,
+      auto_flag: autoFlag,
+      invoked_by: invokedBy || null,
+      consent_phrase: consentPhrase || null,
+      cwd: process.cwd(),
+      cli_version: VERSION,
+      install_summary: installSummary,
+      // Surface the backup paths separately so `pqcheck doctor --repair --rollback` can find them
+      backups: installSummary.filter((s) => s.backup).map((s) => ({ component: s.component, backup: s.backup })),
+    });
+    // Keep last 20 install runs for forensics
+    manifestList = manifestList.slice(0, 20);
+    await fs.mkdir(path.dirname(manifestPath), { recursive: true });
+    await fs.writeFile(manifestPath, JSON.stringify(manifestList, null, 2), "utf8");
+    console.log(color("dim", `  Install manifest: ${manifestPath}`));
+  } catch (err) {
+    console.log(color("dim", `  (manifest write failed: ${err.message} — non-fatal)`));
+  }
+
+  // -------------------------------------------------------------------------
+  // Summary table
+  // -------------------------------------------------------------------------
+  console.log("");
+  console.log(color("bold", "◆ Setup complete — summary:"));
+  console.log("");
+  for (const s of installSummary) {
+    const icon = s.status === "installed" || s.status === "installed-created" || s.status === "installed-updated"
+      ? color("green", "✓")
+      : s.status?.startsWith("skipped")
+        ? color("dim", "⊝")
+        : color("red", "✗");
+    const label = s.component;
+    const detail = s.status === "installed" || s.status === "installed-created" || s.status === "installed-updated"
+      ? color("dim", `installed${s.path ? " → " + s.path.replace(os.homedir(), "~") : ""}`)
+      : color("dim", s.status?.replace(/-/g, " "));
+    console.log(`  ${icon} ${label.padEnd(34, " ")} ${detail}`);
+  }
+  console.log("");
+  console.log(color("dim", `Reference: https://cipherwake.io/methodology/ai-coder-protocol`));
+  console.log("");
+
+  process.exit(0);
 }
 
 main().catch((err) => {
