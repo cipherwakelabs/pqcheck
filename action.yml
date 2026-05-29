@@ -1,5 +1,5 @@
 name: 'pqcheck'
-description: 'Quantum-decryption risk gate. Fails the build when the public-surface Decryption Blast Radius score for a domain meets or exceeds a threshold.'
+description: 'AI-coder deploy gate. Fails CI when your domain''s public trust posture drifts — new vendor scripts, headers, cert rot.'
 author: 'Cipherwake'
 branding:
   icon: 'shield'
