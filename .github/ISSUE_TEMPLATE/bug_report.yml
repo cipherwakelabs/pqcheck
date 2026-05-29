@@ -1,0 +1,101 @@
+name: 🐛 Bug report
+description: Something doesn't work the way the docs (or your gut) say it should.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. **The more specific your repro, the faster this gets fixed.**
+        If you can paste a 3-line shell command that reproduces it, that's gold.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Concise description of the bug — one paragraph max.
+      placeholder: e.g. "pqcheck deploy-check stripe.com --ai exited 0 with no CIPHERWAKE_AI_GUARD_RESULT block in the output."
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+      placeholder: e.g. "Either a valid result block with ship_decision=pass|review|block, or a clear error if the API was unreachable."
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Shell commands ideal. The more deterministic, the better.
+      placeholder: |
+        ```bash
+        npx pqcheck@latest deploy-check example.com --ai
+        ```
+      render: bash
+    validations:
+      required: true
+
+  - type: textarea
+    id: error-output
+    attributes:
+      label: Error output (paste the full stack trace or terminal output)
+      render: shell
+    validations:
+      required: false
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface?
+      description: Where did you encounter the bug?
+      options:
+        - CLI (npx pqcheck / npm pqcheck)
+        - VS Code / Cursor status-bar extension (cipherwake-statusbar)
+        - Browser extension (Chrome / Edge — Cipherwake)
+        - GitHub Action (cipherwakelabs/pqcheck@v4)
+        - MCP server (cipherwake-mcp)
+        - cipherwake.io website / web scan / report page
+        - API (/api/scan, /api/trust-diff, /api/preview-diff, etc.)
+        - AI Coder Protocol install (pqcheck protocol install)
+        - Other (please describe in "What happened")
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: pqcheck / extension / Action version
+      description: Output of `npx pqcheck --version` (CLI), or extension version from your editor, or the `@v4`/`@v3` ref you used.
+      placeholder: e.g. "pqcheck 0.16.15" or "cipherwake-statusbar 0.16.4" or "action @v4"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS + Node version (CLI/Action) or browser (extension/web)
+      description: Output of `node --version && uname -a` for CLI/Action bugs, OR your browser + OS for extension/web bugs.
+      placeholder: e.g. "Node 20.18.0, macOS 15.5, arm64" or "Chrome 130, Windows 11"
+    validations:
+      required: true
+
+  - type: input
+    id: domain
+    attributes:
+      label: Domain involved (if applicable)
+      description: If the bug is tied to scanning a specific domain, naming it helps us reproduce. Public domains only — please don't include private/internal hostnames.
+      placeholder: e.g. "stripe.com" or "n/a"
+    validations:
+      required: false
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: Any workaround you found?
+      description: If you got past it somehow, knowing how helps prioritize.
+    validations:
+      required: false

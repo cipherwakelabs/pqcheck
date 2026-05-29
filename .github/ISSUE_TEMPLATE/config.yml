@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📖 Methodology pages
+    url: https://cipherwake.io/methodology
+    about: How every score component / probe / detector works, what we measure, and what we explicitly do NOT claim. Check here before filing a "score is wrong" bug.
+  - name: 🤖 AI Coder Protocol
+    url: https://cipherwake.io/methodology/ai-coder-protocol
+    about: How to wire Cipherwake into Cursor / Claude Code / Copilot / Cline so deploys route through ship_decision=pass|review|block.
+  - name: 🌐 cipherwake.io
+    url: https://cipherwake.io
+    about: Public scanner, monitoring, badges. Anonymous scans are free + unlimited.
+  - name: 🔐 Security report (private)
+    url: https://cipherwake.io/feedback?topic=security
+    about: For security vulnerabilities — use the private feedback form, NOT a public issue.

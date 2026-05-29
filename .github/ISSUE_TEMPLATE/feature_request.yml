@@ -1,0 +1,67 @@
+name: 💡 Feature request
+description: Suggest a new detector, methodology improvement, integration, or workflow.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Feature ideas are very welcome. **Concrete proposals beat abstract ones.**
+        If you can describe a real risk Cipherwake should have caught but didn't, that's the strongest kind of feature request.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe the failure case, gap, or workflow friction. Avoid solution-language here — focus on the pain.
+      placeholder: e.g. "My AI coder removed the CSP header from next.config.js and Cipherwake's preview-diff didn't flag it because the change was inside an exported function rather than a literal."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach (optional)
+      description: How would you imagine Cipherwake solving this? Skip if unsure — describing the problem clearly is enough.
+      placeholder: e.g. "A vendor-config detector that resolves the exported headers() function via static analysis before diffing."
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What have you tried instead?
+      description: Other tools, workarounds, manual checks, etc.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Which part of Cipherwake?
+      options:
+        - New detector / methodology (what we measure)
+        - New AI-coder integration (Cursor / Claude Code / Cline / Continue / Copilot)
+        - CLI command / flag
+        - MCP server tool
+        - VS Code / Open VSX status-bar extension
+        - Browser extension (Chrome / Edge popup)
+        - GitHub Action
+        - Public API endpoint
+        - Reporting / dashboard / methodology page
+        - Documentation
+        - Other (describe above)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: tier
+    attributes:
+      label: Tier expectation
+      description: Where should this live in the free/paid split? (See https://cipherwake.io/pricing)
+      options:
+        - Should be free (public utility — same shape as the existing public scanner)
+        - Should be paid (Founder Pro — monitoring/automation/alerts shape)
+        - No opinion — defer to founder
+    validations:
+      required: false
