@@ -1,0 +1,47 @@
+{
+  "name": "cipherwake-mcp",
+  "version": "0.1.1",
+  "description": "MCP server exposing Cipherwake's deploy-check + scan + preview-diff + trust-diff tools to Claude Desktop / Claude Code / Cursor / Cline / any MCP-compatible AI coder. Lets the agent gate deploys, surface HTTPS posture, and compare preview vs production directly — no npx step.",
+  "type": "module",
+  "bin": {
+    "cipherwake-mcp": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "README.md"
+  ],
+  "main": "./index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cipherwakelabs/pqcheck.git",
+    "directory": "mcp-server"
+  },
+  "homepage": "https://cipherwake.io/methodology/ai-coder-protocol",
+  "bugs": "https://github.com/cipherwakelabs/pqcheck/issues",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "anthropic",
+    "claude",
+    "claude-code",
+    "cursor",
+    "cline",
+    "ai-coder",
+    "deploy-gate",
+    "deploy-check",
+    "ship-decision",
+    "cipherwake",
+    "pqcheck",
+    "https",
+    "security",
+    "post-quantum",
+    "hndl"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  }
+}
