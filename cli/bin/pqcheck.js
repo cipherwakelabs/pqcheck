@@ -3051,12 +3051,51 @@ async function runScanBasedDeployCheck(domain, args) {
   try {
     resp = await fetch(`${API_BASE}/api/scan?domain=${encodeURIComponent(domain)}`, { headers });
   } catch (err) {
+    // v0.16.17 — the v0.16.13 fail-loud AI guard fix was applied to the main
+    // trust-diff deploy-check path but missed THIS fallback path (no-baseline
+    // first-deploy), so a network blip on the very first `pqcheck deploy-check
+    // <new-domain> --ai` exited 3 with no CIPHERWAKE_AI_GUARD_RESULT block.
+    // The calling AI agent then had no ship_decision to route on and could
+    // silently continue shipping — exactly the failure mode the protocol
+    // exists to prevent. Same emit-block-and-exit pattern as trust-diff.
     console.error(color("red", `error: network failure calling /api/scan: ${err.message}`));
-    process.exit(3);
+    return emitAiGuardReviewAndExit(args, {
+      code: "deploy_check_fetch_failed",
+      message: `Network failure calling /api/scan: ${err?.message || "fetch failed"}`,
+      exitCode: 3,
+    });
   }
   if (!resp.ok) {
-    console.error(color("red", `error: /api/scan returned ${resp.status}`));
-    process.exit(3);
+    // v0.16.17 — same fix as above for the HTTP-non-OK path. The 429 case
+    // is especially load-bearing: a brand new AI-coder workflow trying its
+    // first deploy-check on a fresh project will commonly hit per-IP rate
+    // limits, get a bare `error: /api/scan returned 429`, and exit 3 with no
+    // guard block. The AI agent then has nothing to parse. Emitting a
+    // ship_decision=review block with a quota-specific error code lets the
+    // agent surface the rate-limit problem to the user instead of silently
+    // continuing. Surface the body message + auth hint when available so
+    // the user knows whether to wait or get an API key.
+    const body = await safeJSON(resp);
+    const statusLabel = resp.status === 429
+      ? "rate-limited"
+      : resp.status === 401 || resp.status === 403
+        ? "auth failed"
+        : `${resp.status}`;
+    console.error(color("red", `error: /api/scan returned ${resp.status} (${statusLabel})`));
+    if (body?.message) console.error(color("dim", body.message));
+    if (body?.hint) console.error(color("dim", body.hint));
+    if (resp.status === 429) {
+      console.error(color("dim", "Higher quota via free API key (no card): https://cipherwake.io/account#api-keys"));
+    }
+    const code = resp.status === 429
+      ? "deploy_check_rate_limited"
+      : resp.status === 401 || resp.status === 403
+        ? "deploy_check_auth_failed"
+        : "deploy_check_scan_failed";
+    const message = resp.status === 429
+      ? (body?.message || "Per-IP rate limit hit on /api/scan. Wait ~1 minute or use an API key for higher quota.")
+      : body?.message || `Cipherwake /api/scan returned ${resp.status}.`;
+    return emitAiGuardReviewAndExit(args, { code, message, exitCode: 3 });
   }
   const report = await resp.json();
   const findings = Array.isArray(report.findings) ? report.findings : [];

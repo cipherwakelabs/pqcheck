@@ -4,6 +4,23 @@ All notable changes to `pqcheck` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.17] — 2026-06-02
+
+### Fixed — fail-loud AI guard now covers the first-deploy fallback (429 / network failure)
+
+The v0.16.13 fail-loud guard was applied to the main `pqcheck deploy-check --ai` path but missed the **no-baseline first-deploy fallback** (`runScanBasedDeployCheck`). When a brand-new AI-coder workflow ran `pqcheck deploy-check <new-domain> --ai` against a domain Cipherwake had never seen, the trust-diff endpoint correctly returned 404 → the CLI fell through to `/api/scan` for the first scan — and if that fetch hit a network blip OR returned 429 (per-IP rate limit on the very first invocation), the CLI exited 3 with `error: /api/scan returned 429` and NO `CIPHERWAKE_AI_GUARD_RESULT` block.
+
+That's exactly the failure mode the AI Coder Protocol is supposed to prevent: missing guard block → calling agent has no `ship_decision` to parse → agent treats it as "no signal" and may silently continue announcing the deploy.
+
+Now: both the network-failure path and every HTTP-non-OK status (including 429) in `runScanBasedDeployCheck` emit a `ship_decision=review` block with a status-specific `top_issue` code so the agent has something concrete to route on:
+
+- 429 → `top_issue=deploy_check_rate_limited` + actionable message pointing at the free API-key page
+- 401/403 → `top_issue=deploy_check_auth_failed`
+- Other non-OK → `top_issue=deploy_check_scan_failed`
+- Network failure → `top_issue=deploy_check_fetch_failed`
+
+Discovered when a sister-project AI session reported the bare 429 with no guard block on its first deploy-check.
+
 ## [0.16.16] — 2026-06-02
 
 ### Changed — `pqcheck setup` defaults to per-project install of Claude Code hooks
