@@ -8,7 +8,7 @@
 [![npm downloads](https://img.shields.io/npm/dm/pqcheck.svg?style=flat-square&color=06b6d4)](https://www.npmjs.com/package/pqcheck)
 [![license](https://img.shields.io/npm/l/pqcheck.svg?style=flat-square&color=06b6d4)](./LICENSE)
 
-> **Latest: v0.16.12** — ⚠️ **Existing GitHub Action users:** one-line fix required in `.github/workflows/cipherwake.yml` (`uses: cipherwakelabs/pqcheck@v3` → `cipherwakelabs/pqcheck/action@v3`). The old ref was broken since v0.15 and silently failed every CI run; today's end-to-end test caught it. Re-running `pqcheck onboard` also regenerates the workflow correctly. Plus: README rewritten to advertise both `pqcheck <domain>` and `pqcheck deploy-check --ai` equally, rate limits corrected. [Full changelog →](./CHANGELOG.md)
+> **Latest: v0.16.16** — `pqcheck setup` now defaults to per-project install of the Claude Code statusLine + hooks (`./.claude/settings.json` instead of `~/.claude/settings.json`). The Cipherwake badge will only fire in projects where you ran setup, not across every Claude Code session on the machine. Pass `--scope global` to opt back into machine-wide install. [Full changelog →](./CHANGELOG.md)
 
 ## Two ways to use it
 

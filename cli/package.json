@@ -1,6 +1,6 @@
 {
   "name": "pqcheck",
-  "version": "0.16.15",
+  "version": "0.16.16",
   "description": "Deploy gate for AI-coded web apps. `pqcheck deploy-check --ai` returns ship_decision=pass|review|block for Claude Code / Cursor / Copilot / Aider to gate deploys before they ship. Anonymous, no signup, free for first use.",
   "keywords": [
     "ai-coder",

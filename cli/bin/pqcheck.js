@@ -4441,7 +4441,7 @@ function renderReleaseChecklist(domain, opts = {}) {
 // `pqcheck init` — interactive workflow scaffold (habit-loop #4, locked 2026-05-16)
 // =============================================================================
 // Writes a ready-to-commit .github/workflows/cipherwake.yml that calls
-// cipherwakelabs/pqcheck/action@v3 in trust-diff mode. Zero copy-paste docs friction.
+// cipherwakelabs/pqcheck@v4 in trust-diff mode. Zero copy-paste docs friction.
 //
 // Flags:
 //   --domain <d>       Skip the domain prompt
@@ -4618,7 +4618,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Run Cipherwake Trust Diff
-        uses: cipherwakelabs/pqcheck/action@v3
+        uses: cipherwakelabs/pqcheck@v4
         with:
           mode: trust-diff
           domain: ${domain}
@@ -5613,9 +5613,23 @@ async function runProtocolCommand(args) {
   console.log("Here's what would be added:");
   console.log("");
   if (detected.length === 0) {
+    // Default to creating project-local ./CLAUDE.md rather than global
+    // ~/.claude/CLAUDE.md. Mirrors the cli/setup --scope=project default
+    // (commit 4450e77): don't pollute global config when no signal exists
+    // that the user wants machine-wide installation. Pass --scope=global
+    // to override and create ~/.claude/CLAUDE.md instead.
+    const scopeRaw = (parseFlag(args, "--scope") || "project").toLowerCase();
+    const useGlobal = scopeRaw === "global";
+    const fallbackPath = useGlobal
+      ? path.join(os.homedir(), ".claude", "CLAUDE.md")
+      : path.join(process.cwd(), "CLAUDE.md");
+    const fallbackDisplay = fallbackPath.replace(os.homedir(), "~");
     console.log(color("dim", "  No existing CLAUDE.md / .cursorrules / .aider.conf.yml found."));
-    console.log(color("dim", "  Creating ~/.claude/CLAUDE.md with the protocol."));
-    detected.push({ label: "Claude Code (will create)", path: path.join(os.homedir(), ".claude", "CLAUDE.md") });
+    console.log(color("dim", `  Creating ${fallbackDisplay} with the protocol.`));
+    if (!useGlobal) {
+      console.log(color("dim", "  (pass --scope global to create ~/.claude/CLAUDE.md instead)"));
+    }
+    detected.push({ label: useGlobal ? "Claude Code (will create global)" : "Claude Code (will create project)", path: fallbackPath });
   }
   for (const d of detected) {
     console.log(`  • Append a ~30-line "## Pre-deploy verification with Cipherwake" section to ${color("bold", d.path)}`);
@@ -5927,11 +5941,21 @@ async function runSetupCommand(args) {
   const skipHook = args.includes("--skip-hook");
   const skipStatusline = args.includes("--skip-statusline");
   const skipVscode = args.includes("--skip-vscode");
+  // Where to install Claude Code statusLine + hooks. Default 'project' keeps
+  // Cipherwake scoped to the current repo (avoids the "Cipherwake badge
+  // follows me into unrelated projects" UX bug). 'global' is opt-in for
+  // power users who want one canonical domain badge across every project.
+  const settingsScope = (parseFlag(args, "--scope") || "project").toLowerCase();
+  if (!["project", "global"].includes(settingsScope)) {
+    console.error(color("red", `error: --scope must be 'project' or 'global' (got '${settingsScope}')`));
+    process.exit(3);
+  }
 
   if (!domain) {
     console.error(color("red", "error: pqcheck setup requires --domain"));
     console.error(color("dim", "Usage: npx pqcheck setup --auto --domain example.com"));
-    console.error(color("dim", "  --plan         Print the install plan without writing any files"));
+    console.error(color("dim", "  --plan                     Print the install plan without writing any files"));
+    console.error(color("dim", "  --scope project|global     Where to install Claude Code hooks (default: project — this repo only)"));
     console.error(color("dim", "  --invoked-by=\"<name>\" --consent-phrase=\"<words>\"   (audit trail)"));
     console.error(color("dim", "Skip flags: --skip-workflow --skip-protocol --skip-hook --skip-statusline --skip-vscode"));
     process.exit(3);
@@ -5977,11 +6001,17 @@ async function runSetupCommand(args) {
     }
     if (!skipHook) planEntries.push({ what: "git pre-push hook", to: path.join(process.cwd(), ".git", "hooks", "pre-push"), op: "create (if git repo)" });
     if (!skipStatusline) {
-      const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
+      const settingsPath = settingsScope === "global"
+        ? path.join(os.homedir(), ".claude", "settings.json")
+        : path.join(process.cwd(), ".claude", "settings.json");
       let exists = false;
       try { await fs.access(settingsPath); exists = true; } catch { /* */ }
-      planEntries.push({ what: "Claude Code statusLine", to: settingsPath, op: exists ? "deep-merge (backup first)" : "create" });
+      const scopeNote = settingsScope === "global"
+        ? " [GLOBAL — fires in every project on this machine]"
+        : " [PROJECT-LOCAL — fires only when Claude Code runs in this directory]";
+      planEntries.push({ what: `Claude Code statusLine${scopeNote}`, to: settingsPath, op: exists ? "deep-merge (backup first)" : "create" });
       planEntries.push({ what: "Claude Code chat-hook (PostToolUse Bash)", to: settingsPath, op: exists ? "deep-merge into hooks.PostToolUse" : "create" });
+      planEntries.push({ what: "Claude Code prompt-hook (UserPromptSubmit)", to: settingsPath, op: exists ? "deep-merge into hooks.UserPromptSubmit" : "create" });
     }
     if (!skipVscode) planEntries.push({ what: "VS Code / Cursor extension", to: "via `code --install-extension cipherwakelabs.cipherwake-statusbar`", op: "attempt (soft-fail if Marketplace listing missing)" });
     for (const e of planEntries) {
@@ -6010,6 +6040,48 @@ async function runSetupCommand(args) {
     if (invokedBy) console.log(color("dim", `Invoked by: ${invokedBy}`));
     if (consentPhrase) console.log(color("dim", `Consent phrase: "${consentPhrase}"`));
     console.log("");
+  }
+
+  // Resolve where to write Claude Code statusLine + hook entries.
+  // Default 'project' = ./.claude/settings.json (this repo only). 'global' = ~/.claude/settings.json
+  // (fires in every Claude Code session on this machine). Project-local is the right default for
+  // anyone with multiple projects; global is the legacy behavior and now an opt-in for the
+  // "one canonical domain across everything" use case.
+  const claudeSettingsPath = settingsScope === "global"
+    ? path.join(os.homedir(), ".claude", "settings.json")
+    : path.join(process.cwd(), ".claude", "settings.json");
+
+  if (!skipStatusline) {
+    const displayPath = claudeSettingsPath.replace(os.homedir(), "~");
+    const scopeLabel = settingsScope === "global"
+      ? `global (${displayPath} — fires in EVERY project on this machine)`
+      : `project (${displayPath} — fires only when Claude Code runs in this directory)`;
+    console.log(color("dim", `Settings scope: ${scopeLabel}`));
+    console.log(color("dim", settingsScope === "global"
+      ? `  (omit --scope or pass --scope project to install for this repo only)`
+      : `  (pass --scope global to install for every project on this machine)`));
+    console.log("");
+
+    // Detect existing GLOBAL Cipherwake install while doing a project install.
+    // Warn so the user doesn't end up with two layers firing on top of each other.
+    if (settingsScope === "project") {
+      try {
+        const globalPath = path.join(os.homedir(), ".claude", "settings.json");
+        const raw = await fs.readFile(globalPath, "utf8");
+        const parsed = JSON.parse(raw);
+        const hasGlobalCipherwake =
+          (parsed.statusLine?.command && String(parsed.statusLine.command).includes("cipherwake")) ||
+          JSON.stringify(parsed.hooks || {}).includes("cipherwake");
+        if (hasGlobalCipherwake) {
+          console.log(color("yellow", `  ⚠ A GLOBAL Cipherwake install already exists at ~/.claude/settings.json`));
+          console.log(color("dim", `    It will continue firing across every project. To remove the global install,`));
+          console.log(color("dim", `    edit ~/.claude/settings.json and delete the statusLine entry and the`));
+          console.log(color("dim", `    cipherwake-chat-hook / cipherwake-prompt-hook commands. Backups are taken`));
+          console.log(color("dim", `    automatically before any write, so changes are reversible.`));
+          console.log("");
+        }
+      } catch { /* no global install — fine */ }
+    }
   }
 
   const installSummary = [];
@@ -6176,7 +6248,8 @@ async function runSetupCommand(args) {
   }
 
   if (!skipStatusline) {
-    const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
+    const settingsPath = claudeSettingsPath;
+    const displayPath = settingsPath.replace(os.homedir(), "~");
     try {
       let settings = {};
       let existed = false;
@@ -6187,7 +6260,7 @@ async function runSetupCommand(args) {
       } catch { /* will create */ }
       if (existed && settings.statusLine && typeof settings.statusLine === "object") {
         // Already has a statusLine config — don't overwrite.
-        console.log(color("dim", `  ⊝ ~/.claude/settings.json already has a statusLine entry — leaving alone`));
+        console.log(color("dim", `  ⊝ ${displayPath} already has a statusLine entry — leaving alone`));
         console.log(color("dim", `    To use the Cipherwake statusline instead, set: "command": "npx --package=pqcheck@latest cipherwake-statusline"`));
         installSummary.push({ component: "Claude Code statusLine", path: settingsPath, status: "skipped-existing-config" });
       } else {
@@ -6196,7 +6269,7 @@ async function runSetupCommand(args) {
         settings.statusLine = { type: "command", command: "npx --package=pqcheck@latest cipherwake-statusline" };
         await fs.mkdir(path.dirname(settingsPath), { recursive: true });
         await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf8");
-        console.log(color("green", `  ✓ added statusLine config → ~/.claude/settings.json`));
+        console.log(color("green", `  ✓ added statusLine config → ${displayPath}`));
         installSummary.push({ component: "Claude Code statusLine", path: settingsPath, status: existed ? "installed-updated" : "installed-created", backup: backupPath });
       }
     } catch (err) {
@@ -6212,7 +6285,8 @@ async function runSetupCommand(args) {
   // doesn't clobber other hooks per CLAUDE.md Rule 17.
   // -------------------------------------------------------------------------
   if (!skipStatusline) {
-    const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
+    const settingsPath = claudeSettingsPath;
+    const displayPath = settingsPath.replace(os.homedir(), "~");
     try {
       let settings = {};
       let existed = false;
@@ -6238,7 +6312,7 @@ async function runSetupCommand(args) {
       );
 
       if (alreadyInstalled) {
-        console.log(color("dim", `  ⊝ chat-hook already configured in ~/.claude/settings.json PostToolUse — skipping`));
+        console.log(color("dim", `  ⊝ chat-hook already configured in ${displayPath} PostToolUse — skipping`));
         installSummary.push({ component: "Claude Code chat-hook", path: settingsPath, status: "skipped-already-present" });
       } else {
         const backupPath = existed ? await backupSettingsJson(settingsPath) : null;
@@ -6246,7 +6320,7 @@ async function runSetupCommand(args) {
         bashEntry.hooks.push({ type: "command", command: cipherwakeHookCmd });
         await fs.mkdir(path.dirname(settingsPath), { recursive: true });
         await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf8");
-        console.log(color("green", `  ✓ added chat-hook (PostToolUse Bash) → ~/.claude/settings.json`));
+        console.log(color("green", `  ✓ added chat-hook (PostToolUse Bash) → ${displayPath}`));
         console.log(color("dim", `    Every \`pqcheck\` run will now push a live status message into Claude Code chat`));
         installSummary.push({ component: "Claude Code chat-hook", path: settingsPath, status: existed ? "installed-updated" : "installed-created", backup: backupPath });
       }
@@ -6265,7 +6339,8 @@ async function runSetupCommand(args) {
   // / ship_decision=pass (no spam).
   // -------------------------------------------------------------------------
   if (!skipStatusline) {
-    const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
+    const settingsPath = claudeSettingsPath;
+    const displayPath = settingsPath.replace(os.homedir(), "~");
     try {
       let settings = {};
       let existed = false;
@@ -6285,7 +6360,7 @@ async function runSetupCommand(args) {
       );
 
       if (alreadyInstalled) {
-        console.log(color("dim", `  ⊝ prompt-hook already configured in ~/.claude/settings.json UserPromptSubmit — skipping`));
+        console.log(color("dim", `  ⊝ prompt-hook already configured in ${displayPath} UserPromptSubmit — skipping`));
         installSummary.push({ component: "Claude Code prompt-hook", path: settingsPath, status: "skipped-already-present" });
       } else {
         const backupPath = existed ? await backupSettingsJson(settingsPath) : null;
@@ -6293,7 +6368,7 @@ async function runSetupCommand(args) {
         settings.hooks.UserPromptSubmit.push({ hooks: [{ type: "command", command: cipherwakeHookCmd }] });
         await fs.mkdir(path.dirname(settingsPath), { recursive: true });
         await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf8");
-        console.log(color("green", `  ✓ added prompt-hook (UserPromptSubmit) → ~/.claude/settings.json`));
+        console.log(color("green", `  ✓ added prompt-hook (UserPromptSubmit) → ${displayPath}`));
         console.log(color("dim", `    Claude will see latest ship_decision in context on every prompt (when REVIEW/BLOCK)`));
         installSummary.push({ component: "Claude Code prompt-hook", path: settingsPath, status: existed ? "installed-updated" : "installed-created", backup: backupPath });
       }

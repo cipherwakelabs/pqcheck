@@ -4,6 +4,23 @@ All notable changes to `pqcheck` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.16] — 2026-06-02
+
+### Changed — `pqcheck setup` defaults to per-project install of Claude Code hooks
+
+Before: `pqcheck setup --auto --domain X` wrote the statusLine + PostToolUse chat-hook + UserPromptSubmit prompt-hook to `~/.claude/settings.json` (global). This caused Cipherwake's status badge to fire in every Claude Code session on the machine — including unrelated projects where the configured domain has nothing to do with what the user is working on. Wrong default for the multi-project majority (a developer working on Project B should not see Project A's domain status).
+
+Now: default writes to `<cwd>/.claude/settings.json` (project-local). The badge only fires when Claude Code runs inside the repo where `pqcheck setup` was executed. Pass `--scope global` to opt back into machine-wide install for the "one canonical domain across everything" use case.
+
+Adds:
+- `--scope project|global` flag on `pqcheck setup` (default: `project`)
+- Scope banner at install time showing resolved path
+- Yellow warning when project-local install is detected alongside an existing global install, so users don't end up with two layers firing on top of each other
+- `--plan` output now lists all 3 hooks (was 2) and shows the scope-resolved path
+- Same fallback fix on `pqcheck protocol install` — when no existing `CLAUDE.md` / `.cursorrules` is found, defaults to creating `./CLAUDE.md` (project) instead of `~/.claude/CLAUDE.md` (global)
+
+Existing global installs continue working — no auto-migration. To migrate yourself: remove the `cipherwake-statusline` / `cipherwake-chat-hook` / `cipherwake-prompt-hook` entries from `~/.claude/settings.json`, then run `pqcheck setup --auto --domain <X> --skip-workflow --skip-protocol --skip-hook --skip-vscode` from the project root you want to monitor.
+
 ## [0.16.15] — 2026-05-29
 
 ### Added — attribution for CI-run invocations
