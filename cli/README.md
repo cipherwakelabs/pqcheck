@@ -8,7 +8,7 @@
 [![npm downloads](https://img.shields.io/npm/dm/pqcheck.svg?style=flat-square&color=06b6d4)](https://www.npmjs.com/package/pqcheck)
 [![license](https://img.shields.io/npm/l/pqcheck.svg?style=flat-square&color=06b6d4)](./LICENSE)
 
-> **Latest: v0.16.18** — `--version` now reads dynamically from `package.json` instead of a hardcoded constant. Prior releases (0.16.16, 0.16.17) shipped with the constant left at `0.16.15`, so AI agents citing "I ran pqcheck X.Y.Z" were citing the wrong version. Single source of truth from here on; locked by a unit test against future drift. [Full changelog →](./CHANGELOG.md)
+> **Latest: v0.16.19** — `pqcheck setup` now COMPOSES with an existing Claude Code `statusLine.command` (e.g., PinnedAI's) via a new `--prepend=<cmd>` flag on `cipherwake-statusline`. Both tools' badges render in the single statusLine slot. Previously, Cipherwake politely skipped if any prior statusLine existed — which meant you'd only ever see one tool's badge. Now: composed wrap with 5s timeout + graceful degradation on prepend failure + idempotent re-runs. [Full changelog →](./CHANGELOG.md)
 
 ## Two ways to use it
 

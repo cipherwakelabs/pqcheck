@@ -21,9 +21,55 @@
 import { readFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
+import { execSync } from "node:child_process";
 
 const GLOBAL_STATE_FILE = join(homedir(), ".config", "cipherwake", "last-scan.json");
 const STALE_THRESHOLD_HOURS = 24;
+
+// v0.16.19 — `--prepend=<command>` flag for statusLine composition. Claude
+// Code's `statusLine.command` only supports ONE command, which means two
+// tools (e.g. Cipherwake + PinnedAI) both writing their own statusLine
+// silently clobber each other depending on install order. When a customer
+// runs both, they only see whichever installed last. With --prepend, the
+// Cipherwake binary runs the other tool's command first, joins its output
+// with a separator, and renders Cipherwake's own line after. Result:
+// `[pinned output] · ◆ Cipherwake · domain ✓ PASS · 5m ago` — both
+// surfaces visible in the single statusLine slot.
+//
+// pqcheck setup detects an existing statusLine.command at install time
+// and writes the wrapper form automatically:
+//   "command": "npx --package=pqcheck@latest cipherwake-statusline --prepend='<prior-command>'"
+//
+// If the prior command errors (or the tool was uninstalled), this binary
+// swallows the failure and just renders Cipherwake's part — never causes
+// the whole statusLine to break.
+const PREPEND_SEPARATOR = " · ";
+const prependArg = process.argv.find((a) => a.startsWith("--prepend="));
+if (prependArg) {
+  const prependCmd = prependArg.slice("--prepend=".length);
+  if (prependCmd) {
+    try {
+      // 5s soft timeout — statusLine rendering must stay snappy. If the
+      // other tool hangs, we cut it off and continue with Cipherwake's part.
+      // stdio: ignore on stderr so a noisy prior tool doesn't pollute the
+      // bar; we want only its rendered stdout output.
+      const out = execSync(prependCmd, {
+        encoding: "utf8",
+        timeout: 5_000,
+        stdio: ["ignore", "pipe", "ignore"],
+        env: process.env,
+      }).trim();
+      if (out) {
+        process.stdout.write(out);
+        process.stdout.write(PREPEND_SEPARATOR);
+      }
+    } catch {
+      // Prepend command failed (uninstalled, timeout, errored). Skip
+      // silently — never break the whole statusLine because of a
+      // composition partner.
+    }
+  }
+}
 
 // v0.16.6 — project-aware state lookup. Walk up from CWD looking for a
 // repo-local `.cipherwake/last-scan.json`. This way each project shows

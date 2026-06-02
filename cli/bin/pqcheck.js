@@ -6317,19 +6317,54 @@ async function runSetupCommand(args) {
         settings = JSON.parse(raw);
         existed = true;
       } catch { /* will create */ }
-      if (existed && settings.statusLine && typeof settings.statusLine === "object") {
-        // Already has a statusLine config — don't overwrite.
-        console.log(color("dim", `  ⊝ ${displayPath} already has a statusLine entry — leaving alone`));
-        console.log(color("dim", `    To use the Cipherwake statusline instead, set: "command": "npx --package=pqcheck@latest cipherwake-statusline"`));
-        installSummary.push({ component: "Claude Code statusLine", path: settingsPath, status: "skipped-existing-config" });
+      // v0.16.19 — statusLine composition. Previous behavior was: if any
+      // statusLine.command already existed, SKIP. That was safe (never
+      // clobbered other tools) but invisible — a user with PinnedAI's
+      // statusline installed would never see Cipherwake's after running
+      // `pqcheck setup`. Now: detect the prior command and wrap it via
+      // `cipherwake-statusline --prepend=<prior>` so both render in the
+      // single statusLine slot. The prepend logic in cipherwake-statusline.js
+      // swallows prepend-command failures silently, so this composition
+      // survives the user later uninstalling the partner tool.
+      //
+      // Skip the wrap when the existing command IS already our wrapper
+      // (idempotent re-install — don't recursively nest).
+      const CIPHERWAKE_CMD_PREFIX = "npx --package=pqcheck@latest cipherwake-statusline";
+      const priorCmd = (existed && settings.statusLine && typeof settings.statusLine === "object")
+        ? String(settings.statusLine.command || "").trim()
+        : "";
+      const priorIsOurs = priorCmd.startsWith("npx --package=pqcheck") && priorCmd.includes("cipherwake-statusline");
+
+      if (priorIsOurs) {
+        console.log(color("dim", `  ⊝ ${displayPath} statusLine already points at cipherwake-statusline — leaving alone`));
+        installSummary.push({ component: "Claude Code statusLine", path: settingsPath, status: "skipped-already-ours" });
       } else {
         const backupPath = existed ? await backupSettingsJson(settingsPath) : null;
         if (backupPath) console.log(color("dim", `    backup: ${backupPath}`));
-        settings.statusLine = { type: "command", command: "npx --package=pqcheck@latest cipherwake-statusline" };
+        let command;
+        if (priorCmd) {
+          // Compose: wrap the existing command via --prepend.
+          // Single-quote the prior command + escape any single quotes
+          // (rare in practice but defensive).
+          const safe = priorCmd.replace(/'/g, `'\\''`);
+          command = `${CIPHERWAKE_CMD_PREFIX} --prepend='${safe}'`;
+          console.log(color("green", `  ✓ composed statusLine: existing command wrapped via --prepend → ${displayPath}`));
+          console.log(color("dim", `    prior command: ${priorCmd.slice(0, 80)}${priorCmd.length > 80 ? "..." : ""}`));
+          console.log(color("dim", `    both surfaces now render in the single statusLine slot`));
+        } else {
+          // Fresh install — no prior command to compose with.
+          command = CIPHERWAKE_CMD_PREFIX;
+          console.log(color("green", `  ✓ added statusLine config → ${displayPath}`));
+        }
+        settings.statusLine = { type: "command", command };
         await fs.mkdir(path.dirname(settingsPath), { recursive: true });
         await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf8");
-        console.log(color("green", `  ✓ added statusLine config → ${displayPath}`));
-        installSummary.push({ component: "Claude Code statusLine", path: settingsPath, status: existed ? "installed-updated" : "installed-created", backup: backupPath });
+        installSummary.push({
+          component: "Claude Code statusLine",
+          path: settingsPath,
+          status: existed && priorCmd ? "installed-composed" : (existed ? "installed-updated" : "installed-created"),
+          backup: backupPath,
+        });
       }
     } catch (err) {
       console.log(color("red", `  ✗ statusLine config install failed: ${err.message}`));

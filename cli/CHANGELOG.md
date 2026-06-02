@@ -4,6 +4,33 @@ All notable changes to `pqcheck` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.19] — 2026-06-02
+
+### Changed — `pqcheck setup` now COMPOSES with existing statusLine instead of skipping
+
+Before: if your Claude Code `statusLine.command` was already set (e.g., you'd installed PinnedAI's status line first), `pqcheck setup` would print "leaving alone" and skip — meaning you'd only ever see the OTHER tool's badge, never Cipherwake's. The asymmetry was: every tool that ships a statusLine clobbers the previous one on install, so whichever runs last wins. Cipherwake chose to be polite and skip — but the result was that running both tools meant seeing only one.
+
+Now: when `pqcheck setup` detects an existing `statusLine.command`, it WRAPS it via a new `--prepend=<command>` flag on the Cipherwake statusline binary. The wrapper:
+
+1. Runs the prior command (5-second timeout, stderr suppressed)
+2. Captures its stdout
+3. Prepends it to Cipherwake's own output with a `·` separator
+4. Renders both in the single statusLine slot Claude Code provides
+
+Example: a `pqcheck setup` run on a repo where PinnedAI's setup ran first will produce:
+
+```
+ℹ Pinned: 6 regressions caught in 24h · ◆ Cipherwake · acme.com ✓ PASS · DBR 8.4 A · 5m ago
+```
+
+Both surfaces visible. Survives the prepend command erroring, exiting non-zero, being uninstalled, or hanging (5s timeout). Idempotent — re-running `pqcheck setup` detects an already-Cipherwake-wrapped statusLine and does NOT double-wrap.
+
+### Limit
+
+This change fixes one direction. If you install Cipherwake FIRST and another tool LATER, the other tool's setup may still clobber Cipherwake (just as Cipherwake used to). Full bidirectional safety requires every participating tool to implement the same detect-and-compose pattern. Workaround: re-run `pqcheck setup` after the partner tool installs — Cipherwake re-detects and re-composes.
+
+The root cause is the Claude Code spec: `statusLine.command` is a single string, not an array of commands. Composition via wrapper-and-prepend is the best available unilateral fix until Claude Code supports composition natively.
+
 ## [0.16.18] — 2026-06-02
 
 ### Fixed — `--version` now reads dynamically from package.json (no more hardcode drift)
