@@ -33,7 +33,25 @@ import {
 
 const API_BASE = process.env.CIPHERWAKE_API_BASE || "https://cipherwake.io";
 const API_KEY = process.env.CIPHERWAKE_API_KEY || null;
-const PKG_VERSION = "0.1.0";
+
+// v0.1.2 — read PKG_VERSION dynamically from package.json so it can never
+// drift from the published npm version again. Prior to this, the constant
+// was hardcoded as "0.1.0" and the 0.1.1 publish shipped with the constant
+// left at 0.1.0 — so cipherwake-mcp's User-Agent header and its MCP
+// `server` registration block both reported the wrong version. AI agents
+// citing "I ran cipherwake-mcp X.Y.Z" were unintentionally lying about
+// which build they were using. Mirror of the pqcheck CLI 0.16.18 fix.
+const PKG_VERSION = await (async () => {
+  try {
+    const { readFileSync } = await import("node:fs");
+    const { join, dirname } = await import("node:path");
+    const { fileURLToPath } = await import("node:url");
+    const here = dirname(fileURLToPath(import.meta.url));
+    return JSON.parse(readFileSync(join(here, "package.json"), "utf8")).version || "unknown";
+  } catch {
+    return "unknown";
+  }
+})();
 
 // -----------------------------------------------------------------------------
 // Tool definitions

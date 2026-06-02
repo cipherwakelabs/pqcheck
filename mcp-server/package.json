@@ -1,6 +1,6 @@
 {
   "name": "cipherwake-mcp",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "MCP server exposing Cipherwake's deploy-check + scan + preview-diff + trust-diff tools to Claude Desktop / Claude Code / Cursor / Cline / any MCP-compatible AI coder. Lets the agent gate deploys, surface HTTPS posture, and compare preview vs production directly — no npx step.",
   "type": "module",
   "bin": {
