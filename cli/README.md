@@ -8,7 +8,7 @@
 [![npm downloads](https://img.shields.io/npm/dm/pqcheck.svg?style=flat-square&color=06b6d4)](https://www.npmjs.com/package/pqcheck)
 [![license](https://img.shields.io/npm/l/pqcheck.svg?style=flat-square&color=06b6d4)](./LICENSE)
 
-> **Latest: v0.16.17** — fail-loud AI guard now covers the no-baseline first-deploy fallback. `pqcheck deploy-check <new-domain> --ai` previously exited 3 with bare `error: /api/scan returned 429` if the very first scan got rate-limited — no `CIPHERWAKE_AI_GUARD_RESULT` block, leaving the calling AI agent with no `ship_decision` to route on. Now every error path in that fallback emits a `ship_decision=review` block with a status-specific `top_issue` code. [Full changelog →](./CHANGELOG.md)
+> **Latest: v0.16.18** — `--version` now reads dynamically from `package.json` instead of a hardcoded constant. Prior releases (0.16.16, 0.16.17) shipped with the constant left at `0.16.15`, so AI agents citing "I ran pqcheck X.Y.Z" were citing the wrong version. Single source of truth from here on; locked by a unit test against future drift. [Full changelog →](./CHANGELOG.md)
 
 ## Two ways to use it
 

@@ -4,6 +4,14 @@ All notable changes to `pqcheck` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.18] — 2026-06-02
+
+### Fixed — `--version` now reads dynamically from package.json (no more hardcode drift)
+
+Before: the `VERSION` constant in `cli/bin/pqcheck.js` was hardcoded as a literal string and had to be hand-edited on every release. 0.16.16 and 0.16.17 both shipped with `VERSION = "0.16.15"` — the bump was forgotten when the package.json version moved. So `npx pqcheck --version` reported `0.16.15` even when the binary was the latest published code, and AI agents citing "I ran pqcheck 0.16.15" as evidence were unintentionally lying about which build they were using.
+
+Now: reads `version` from `package.json` at startup via `await import("node:fs")`. ~1ms cost, single source of truth, can't drift. The package manifest is the only authority on version going forward. A new test (`tests/lib/cli-version.test.ts`) asserts the dynamic read matches the manifest, so any future regression to a hardcoded literal fails CI.
+
 ## [0.16.17] — 2026-06-02
 
 ### Fixed — fail-loud AI guard now covers the first-deploy fallback (429 / network failure)

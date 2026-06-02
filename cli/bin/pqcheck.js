@@ -24,7 +24,27 @@
 })();
 
 const API_BASE = process.env.PQCHECK_API_BASE || "https://cipherwake.io";
-const VERSION = "0.16.15";
+
+// v0.16.18 — read VERSION dynamically from package.json so it can never
+// drift from the published npm version again. Prior to this, the constant
+// was hardcoded and required a manual edit on every release — and the
+// 0.16.16/0.16.17 publishes shipped with VERSION="0.16.15" because the
+// hardcode bump was forgotten. AI agents reporting "I ran pqcheck X.Y.Z"
+// were citing the wrong version. Now: single source of truth = package.json.
+// Uses createRequire so the JSON load is synchronous; ~1ms at startup,
+// negligible vs first network call. Falls back to "unknown" on file-read
+// failure (should never happen in production install layout).
+const VERSION = await (async () => {
+  try {
+    const { readFileSync } = await import("node:fs");
+    const { join, dirname } = await import("node:path");
+    const { fileURLToPath } = await import("node:url");
+    const here = dirname(fileURLToPath(import.meta.url));
+    return JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8")).version || "unknown";
+  } catch {
+    return "unknown";
+  }
+})();
 
 // v0.16.15 — attribution suffix. When the CLI runs inside GitHub Actions
 // (GH sets GITHUB_ACTIONS=true automatically in every step) we append
