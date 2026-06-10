@@ -81,6 +81,27 @@ function apiHeaders(extra = {}) {
   return h;
 }
 
+// R96 — fetch with a hard timeout for the core API calls (/api/scan,
+// /api/trust-diff, /api/preview-diff). Without it, a hung request stalled
+// CI indefinitely; vendors/debug-network already had AbortController
+// timeouts but the three load-bearing calls did not. 90s covers the
+// worst server-side path (fresh full scan, maxDuration 60s) with margin.
+const API_FETCH_TIMEOUT_MS = 90_000;
+async function fetchWithTimeout(url, opts = {}, timeoutMs = API_FETCH_TIMEOUT_MS) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...opts, signal: ctrl.signal });
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      throw new Error(`request timed out after ${Math.round(timeoutMs / 1000)}s: ${url}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // Helpful messaging when the server tells us auth/quota failed.
 async function handleAuthError(resp) {
   if (resp.status === 401) {
@@ -188,8 +209,26 @@ async function main() {
   if (args[0] === "init") {
     return runInitCommand(args.slice(1));
   }
+  // R89.LOCAL — local-only stats commands. Read/write .cipherwake/stats.json
+  // in the repo root. ZERO network requests. Privacy-by-design.
+  if (args[0] === "stats") {
+    return runStatsCommand(args.slice(1));
+  }
+  if (args[0] === "dismiss") {
+    return runDismissCommand(args.slice(1));
+  }
+  if (args[0] === "confirm") {
+    return runConfirmCommand(args.slice(1));
+  }
   if (args[0] === "deploy-check") {
     return runDeployCheckCommand(args.slice(1));
+  }
+  if (args[0] === "last") {
+    // R96 feedback #3 — `pqcheck last [domain] [--remote]` reuses a recent
+    // verdict (local state file or GitHub Actions CI run) instead of
+    // forcing a duplicate live deploy-check. Advisory-only: exit 3 means
+    // "no reusable signal, run deploy-check".
+    return runLastCommand(args.slice(1));
   }
   if (args[0] === "vendors") {
     return runVendorsCommand(args.slice(1));
@@ -248,6 +287,14 @@ async function main() {
     }
   }
 
+  // R86.7 — reject unknown flags loudly. Catches typo'd safety-critical
+  // flags like `--strict` (was intended --strict-posture) that previously
+  // silently no-op'd, leaving customers with a false sense of security.
+  const unknown = assertKnownFlags(args, "pqcheck <domain>");
+  if (unknown) {
+    process.exit(3);
+  }
+
   const positional = args.filter((a) => !a.startsWith("-") && !isFlagValue(args, a));
   const domains = [...positional, ...fileDomains]
     .map((a) => normalizeDomain(a))
@@ -290,17 +337,29 @@ async function main() {
   const fresh = args.includes("--fresh") || args.includes("--force");
   const aiMode = parseAiMode(args);
   const verbose = isVerboseMode(args);  // v0.16.0 — opt-in detailed panel
+  // R86.4 (2026-06-03) — strict-posture opt-in. Default ship_decision is
+  // drift-only (per-deploy regression gate); --strict-posture folds the
+  // absolute posture grade into ship_decision. Recommended ONLY after a
+  // site reaches A/B posture — opting in earlier produces cry-wolf gating
+  // on every deploy since most AI-coded sites grade D/F out of the box.
+  // Accept both `--strict-posture` (explicit) and `--strict` (short alias).
+  // Audit caught a footgun where customers typed `--strict` expecting the
+  // posture gate to fire and got silent drift-only mode instead. The
+  // `onboard` subcommand uses `--strict` for a different purpose (gate exit
+  // code on step failure) but that's a separate command — the alias is
+  // scoped to scan / deploy-check / trust-diff only.
+  const strictPosture = args.includes("--strict-posture") || args.includes("--strict");
 
   // One-shot scan(s)
   let worstExit = 0;
   for (const domain of domains) {
-    const exit = await runOneScan({ domain, format, quiet, threshold, webhookUrl, multi: domains.length > 1, fresh, aiMode, verbose });
+    const exit = await runOneScan({ domain, format, quiet, threshold, webhookUrl, multi: domains.length > 1, fresh, aiMode, verbose, strictPosture });
     if (exit > worstExit) worstExit = exit;
   }
   process.exit(worstExit);
 }
 
-async function runOneScan({ domain, format, quiet, threshold, webhookUrl, multi, fresh, aiMode, verbose }) {
+async function runOneScan({ domain, format, quiet, threshold, webhookUrl, multi, fresh, aiMode, verbose, strictPosture }) {
   if (!quiet && format === "text") process.stderr.write(color("dim", `Scanning ${domain}${fresh ? " (forcing fresh)" : ""} ...`));
   let report;
   try {
@@ -310,7 +369,7 @@ async function runOneScan({ domain, format, quiet, threshold, webhookUrl, multi,
     // the server side; if exceeded, the server silently downgrades to a
     // cached scan and returns that instead of erroring.
     const qs = fresh ? `?domain=${encodeURIComponent(domain)}&force=1` : `?domain=${encodeURIComponent(domain)}`;
-    const resp = await fetch(`${API_BASE}/api/scan${qs}`, {
+    const resp = await fetchWithTimeout(`${API_BASE}/api/scan${qs}`, {
       method: "GET",
       headers: apiHeaders({ "user-agent": `pqcheck-cli/${VERSION}${CI_ACTION_SUFFIX} (scan)` }),
     });
@@ -410,13 +469,21 @@ async function runOneScan({ domain, format, quiet, threshold, webhookUrl, multi,
   // extension / AI banner) display the "UNREACHABLE" label when
   // unreachable=true instead of the generic "BLOCK" — more informative,
   // same protocol routing.
+  // R96 — the state file used to record the pre-posture drift decision
+  // while the AI footer + exit code used effectiveShip (worst-of with
+  // posture under --strict-posture), so statusline / prompt-hook could
+  // disagree with the actual gate. Compute once, record the same value
+  // everywhere.
+  const posture = report.posture || null;
+  const effectiveShip = combineShipDecision(shipDecision, posture?.decision, { strict: strictPosture });
+
   await writeLastScanFile({
     domain,
     kind: "scan",
     score: typeof report.score === "number" ? report.score : null,
     grade: report.grade || null,
     max_severity: maxSev,
-    ship_decision: shipDecision,
+    ship_decision: effectiveShip,
     unreachable: unreachable || false,
     top_issue: topFinding?.id || topFinding?.title || null,
   });
@@ -495,21 +562,51 @@ async function runOneScan({ domain, format, quiet, threshold, webhookUrl, multi,
       }
     }
 
+    // R86 — surface absolute posture grade + remediation alongside drift verdict.
+    // The grade= field carries DBR grade; posture_grade= is the new absolute
+    // posture (A+/A/B/C/D/F based on header presence/strength).
+    // posture_decision separates the absolute-state routing signal from the
+    // drift-based ship_decision so a weak-but-unchanged site gets a review
+    // nudge distinct from drift.
+    const postureFields = posture ? {
+      posture_grade: posture.grade,
+      posture_score: posture.score,
+      posture_decision: posture.decision,
+      posture_missing: (posture.missing || []).join(",") || "none",
+      posture_leaks: (posture.info_leaks || []).join("; ") || "none",
+      posture_findings_count: (posture.findings || []).length,
+      posture_fixes_count: (posture.fixes || []).length,
+    } : {};
+    // R86.5 — surface posture advisory line so D/F posture is never silently
+    // blessed under the drift-only default.
+    const postureAdvisory = formatPostureAdvisoryLine(posture, strictPosture);
+    if (postureAdvisory) console.log(postureAdvisory);
     console.log(formatAiFooterBlock({
-      status: shipDecision,
+      status: effectiveShip,
       domain,
       kind: "scan",
-      dbr: typeof report.score === "number" ? report.score.toFixed(1) : "",
-      grade: report.grade || "",
+      dbr: typeof report.score === "number" ? report.score.toFixed(1) : undefined,
+      grade: report.grade || undefined,
       max_severity: maxSev,
-      ship_decision: shipDecision,
+      ship_decision: effectiveShip,
+      ship_decision_drift: shipDecision,
+      ship_decision_posture: posture?.decision,
+      ship_decision_mode: strictPosture ? "strict_posture" : "drift_only",
       unreachable: unreachable ? "true" : "false",
       top_issue: topFinding?.id || topFinding?.title || "none",
       findings_high: findings.filter((f) => severityRank(f.severity) === 3).length,
       findings_critical: findings.filter((f) => severityRank(f.severity) === 4).length,
       scanned_at: new Date().toISOString(),
       advisory_only: "true",
+      scope: strictPosture ? "trust_surface_drift_plus_absolute_posture" : "trust_surface_drift",
+      scope_note: strictPosture
+        ? "ship_decision = worst-of(drift, absolute posture) because --strict-posture is set. pass means BOTH no drift AND posture grade A+/A. ship_decision_drift and ship_decision_posture expose the two inputs separately. Cipherwake does NOT verify app functionality — pair with Playwright e2e for full deploy safety."
+        : "ship_decision reflects DRIFT only by default (per-deploy regression gate). Posture grade is surfaced via posture_decision / ship_decision_posture as advisory — D/F posture does NOT auto-block. Once your site reaches A/B posture, pass --strict-posture to lock that in. Cipherwake does NOT verify app functionality.",
+      ...postureFields,
     }));
+    if (posture && Array.isArray(posture.fixes) && posture.fixes.length > 0) {
+      console.log(formatPostureFixesBlock(posture.fixes));
+    }
     console.log("");
 
     // Threshold check still applies under --ai (script-pipeable). Otherwise
@@ -517,7 +614,7 @@ async function runOneScan({ domain, format, quiet, threshold, webhookUrl, multi,
     if (threshold !== null && typeof report.score === "number" && report.score >= threshold) {
       return 2;
     }
-    return shipDecisionExitCode(shipDecision);
+    return shipDecisionExitCode(effectiveShip);
   }
 
   // Output dispatch
@@ -535,9 +632,6 @@ async function runOneScan({ domain, format, quiet, threshold, webhookUrl, multi,
       console.log(JSON.stringify(report, null, 2));
     }
   } else if (format === "csv") {
-    if (multi && this && !this.csvHeaderPrinted) {
-      // Header only once, before first row
-    }
     printCsvRow(report);
   } else if (format === "markdown") {
     printMarkdown(report, multi);
@@ -548,6 +642,14 @@ async function runOneScan({ domain, format, quiet, threshold, webhookUrl, multi,
   } else {
     if (multi) console.log(color("dim", `\n──── ${domain} ────`));
     printReport(report);
+    // R86.5 — posture advisory line so D/F posture is never silently blessed
+    // in human output either. Posture is advisory, not gating.
+    const postureAdvisory = formatPostureAdvisoryLine(report.posture, strictPosture);
+    if (postureAdvisory) {
+      console.log("");
+      console.log(postureAdvisory);
+      console.log(color("dim", "  See /methodology/posture-grading for the rubric + fix snippets."));
+    }
   }
 
   if (threshold !== null && typeof report.score === "number" && report.score >= threshold) {
@@ -634,12 +736,20 @@ function isFlagValue(args, val) {
   const idx = args.indexOf(val);
   if (idx <= 0) return false;
   const prev = args[idx - 1];
-  return prev === "--threshold" || prev === "--format" || prev === "--watch" || prev === "--webhook" || prev === "--file" || prev === "-o" || prev === "--allowlist";
+  // R96 — added --baseline/--fail-on: without them, `trust-diff acme.com
+  // --baseline last-week` misparsed "last-week" as the domain positional.
+  return prev === "--threshold" || prev === "--format" || prev === "--watch" || prev === "--webhook" || prev === "--file" || prev === "-o" || prev === "--allowlist" || prev === "--baseline" || prev === "--fail-on" || prev === "--max-age";
 }
 
 function parseFormat(args) {
   if (args.includes("--json")) return "json"; // back-compat alias
   if (args.includes("--gh-action")) return "gh-action"; // GitHub Actions annotation format
+  // R96 — these were whitelisted in KNOWN_FLAGS but parsed by nothing,
+  // so `pqcheck acme.com --csv` was a silent no-op (the exact footgun
+  // class R86.7 exists to prevent). Wire them as aliases like --json.
+  if (args.includes("--csv")) return "csv";
+  if (args.includes("--markdown")) return "markdown";
+  if (args.includes("--sarif")) return "sarif";
   const i = args.indexOf("--format");
   if (i === -1) return "text";
   const v = (args[i + 1] || "").toLowerCase();
@@ -699,6 +809,101 @@ function parseAiMode(args) {
   return args.includes("--ai") || args.includes("--agent");
 }
 
+// R86.7 (2026-06-04) — close the "silent no-op on unrecognized flag" class
+// of footguns. Audit caught --strict (intended --strict-posture) silently
+// degrading to drift-only mode without warning — the user believed they had
+// the hard posture gate on. Same family as false-green pins: looks like it's
+// doing something, silently isn't. The fix: validate every --foo token in
+// args against a known-flags whitelist and reject loudly on unknown flags
+// with a closest-match suggestion. For a security gate, "unknown flag →
+// silently proceed with weaker behaviour" must never happen.
+//
+// Scope: universal whitelist applied at scan / deploy-check / trust-diff /
+// preview-diff entry points. False acceptance of cross-command flags (e.g.
+// passing --preview to deploy-check) is the SAME failure mode as today
+// (silent ignore) — typo detection is the win. Per-command whitelists
+// would be more correct but the universal list covers the audit footgun.
+const KNOWN_FLAGS = new Set([
+  // Global / output mode
+  "--ai", "--agent", "--verbose", "--quiet", "--help", "--version", "--debug-network",
+  // Multi-domain
+  "--file", "--watch",
+  // Scan behaviour
+  "--fresh", "--force", "--threshold", "--webhook", "--json", "--csv", "--markdown",
+  "--sarif", "--gh-action", "--lock", "--explain", "--plan", "--stdout",
+  // Posture gating (the audit catch)
+  "--strict", "--strict-posture",
+  // Format / output format
+  "--format",
+  // Trust-diff / deploy-check / preview-diff
+  "--baseline", "--fail-on", "--fail-on-new", "--guards", "--compare-transport",
+  "--write-baseline", "--preview", "--production",
+  "--protected-path", "--first-party-host",
+  // Setup / onboard / install consent
+  "--auto", "--manual", "--yes", "--no-open", "--domain", "--invoked-by",
+  "--consent-phrase", "--scope",
+  "--skip-checklist", "--skip-hook", "--skip-protocol", "--skip-scan",
+  "--skip-statusline", "--skip-vendors", "--skip-vscode", "--skip-workflow",
+]);
+
+function levenshtein(a, b) {
+  if (a === b) return 0;
+  const m = a.length, n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  const row = new Array(m + 1);
+  for (let i = 0; i <= m; i++) row[i] = i;
+  for (let j = 1; j <= n; j++) {
+    let prev = row[0];
+    row[0] = j;
+    for (let i = 1; i <= m; i++) {
+      const tmp = row[i];
+      row[i] = a[i - 1] === b[j - 1]
+        ? prev
+        : 1 + Math.min(prev, row[i], row[i - 1]);
+      prev = tmp;
+    }
+  }
+  return row[m];
+}
+
+function suggestFlag(unknown) {
+  let best = null, bestDist = Infinity;
+  for (const known of KNOWN_FLAGS) {
+    const d = levenshtein(unknown, known);
+    if (d < bestDist) { bestDist = d; best = known; }
+  }
+  // Only suggest if reasonably close (≤ 3 edits or ≤ half the unknown's length)
+  const threshold = Math.max(3, Math.floor(unknown.length / 2));
+  return bestDist <= threshold ? best : null;
+}
+
+function assertKnownFlags(args, cmdName) {
+  const unknown = [];
+  for (const tok of args) {
+    if (typeof tok !== "string" || !tok.startsWith("--") || tok === "--") continue;
+    // Strip `--foo=bar` → `--foo` so equals-value forms validate against the bare flag
+    const flag = tok.includes("=") ? tok.slice(0, tok.indexOf("=")) : tok;
+    if (!KNOWN_FLAGS.has(flag)) unknown.push(flag);
+  }
+  if (unknown.length === 0) return null;
+  // Emit error to stderr with closest-match suggestion, return non-null
+  // sentinel so the caller can exit non-zero. We do NOT process.exit here
+  // because the AI-mode caller needs to emit a structured guard block
+  // before exiting (so AI agents parsing the block don't see a missing
+  // CIPHERWAKE_AI_GUARD_RESULT and fall through to a different error path).
+  for (const u of unknown) {
+    const sug = suggestFlag(u);
+    process.stderr.write(color("red", `error: unknown flag ${u} for ${cmdName}\n`));
+    if (sug) {
+      process.stderr.write(color("yellow", `       did you mean ${sug}?\n`));
+    } else {
+      process.stderr.write(color("dim", `       run \`npx pqcheck --help\` for the flag list.\n`));
+    }
+  }
+  return unknown;
+}
+
 function severityRank(s) {
   const map = { critical: 4, high: 3, medium: 2, low: 1, info: 0, none: -1 };
   return map[String(s || "none").toLowerCase()] ?? 0;
@@ -711,6 +916,405 @@ function highestSeverity(findings) {
     if (severityRank(f.severity) > severityRank(best)) best = f.severity;
   }
   return best;
+}
+
+// R86.5 (2026-06-03) — posture advisory line. Posture is a STANDING property,
+// not a per-deploy regression signal, so gating every deploy on it is cry-wolf
+// by construction. The drift-only ship_decision is the right default gate
+// (fires on regression). This helper surfaces posture grade + a one-line fix
+// nudge alongside the gate result — customer sees the grade, sees the fix
+// path, is NOT blocked on every deploy. Only customers who have reached A/B
+// posture opt into --strict-posture to lock that in.
+function formatPostureAdvisoryLine(posture, strictPosture) {
+  if (!posture) return "";
+  if (strictPosture) return ""; // strict mode already gates; redundant
+  const decision = posture.decision;
+  if (decision !== "block" && decision !== "review") return ""; // A+/A — no advisory
+  const grade = posture.grade || "?";
+  const score = typeof posture.score === "number" ? posture.score : "?";
+  const fixCount = Array.isArray(posture.fixes) ? posture.fixes.length : 0;
+  const colorName = decision === "block" ? "red" : "yellow";
+  const icon = decision === "block" ? "●" : "○";
+  const nudge = fixCount > 0
+    ? `${fixCount} ready-to-paste fix${fixCount === 1 ? "" : "es"} in CIPHERWAKE_POSTURE_FIXES`
+    : "see /methodology/posture-grading";
+  return color(colorName, `  ${icon} Posture: ${grade} (score ${score}) — advisory, not gating. ${nudge}.`);
+}
+
+// R86.2 / R86.4 (2026-06-03) — combine drift + posture into ship_decision.
+// Default (strict=false): drift only. Posture grade is surfaced via separate
+// fields and the advisory line but does NOT promote drift's decision —
+// because most AI-coded sites grade D/F out of the box, making posture-gating
+// the default would cry-wolf on every deploy of every header-less site,
+// training people to ignore the gate. --strict-posture opts in for teams
+// who've already fixed posture and want to prevent backsliding.
+const SHIP_DECISION_RANK = { pass: 0, review: 1, block: 2 };
+function combineShipDecision(driftDecision, postureDecision, { strict = false } = {}) {
+  if (!postureDecision || !strict) return driftDecision;
+  const a = SHIP_DECISION_RANK[driftDecision] ?? 0;
+  const b = SHIP_DECISION_RANK[postureDecision] ?? 0;
+  return a >= b ? driftDecision : postureDecision;
+}
+
+// R87 (2026-06-05) — read .cipherwake.json from cwd OR a path the customer
+// pointed us at. Returns the parsed routeAssertions config or null.
+//
+// Customer-declared assertions are the wedge that makes Cipherwake fire on
+// EVERY deploy of a backend/admin-heavy app — even when the public landing
+// page doesn't drift. The CLI reads this file once + forwards it as the
+// `routeAssertionsConfig` field in the trust-diff/scan request body.
+//
+// We DO NOT read credentials or sensitive headers from this file. Just
+// route paths + expected classification. See /methodology/route-assertions
+// for the schema + /methodology/why-not-authenticated-crawling for the
+// strategic reasoning behind keeping this credential-free.
+// R87.4 (2026-06-05) — surface a clear warning when .cipherwake.json has
+// malformed JSON, an invalid shape, or an obviously-wrong path declaration.
+// Without these warnings, the CLI silently dropped the config and the user
+// saw `sources_customer=0` with no explanation. Wrong-shape configs are
+// the second-most-common UX failure after typo'd flags.
+function _warnConfigIssue(msg) {
+  process.stderr.write(color("yellow", `⚠ .cipherwake.json: ${msg}\n`));
+}
+
+async function readRouteAssertionsConfig() {
+  try {
+    const { readFileSync, existsSync } = await import("node:fs");
+    const { join, dirname } = await import("node:path");
+    const cwd = process.cwd();
+    // Walk up from cwd looking for .cipherwake.json — supports running
+    // from any subdirectory of the repo. Cap at 5 levels to bound IO.
+    let dir = cwd;
+    for (let i = 0; i < 5; i++) {
+      const candidate = join(dir, ".cipherwake.json");
+      if (existsSync(candidate)) {
+        const body = readFileSync(candidate, "utf8");
+        let parsed;
+        try {
+          parsed = JSON.parse(body);
+        } catch (e) {
+          _warnConfigIssue(`malformed JSON in ${candidate} (${e.message}). Customer assertions will not be sent.`);
+          return null;
+        }
+        // Tolerant shape: either { routeAssertions: {...} } or { assertions: [...] }
+        // at the top level. Both forms are documented in the methodology page.
+        const cfg = parsed?.routeAssertions || (Array.isArray(parsed?.assertions) ? { assertions: parsed.assertions, replace_defaults: parsed.replace_defaults } : null);
+        if (!cfg) {
+          // R96 — a domain-only config (written by `pqcheck setup`/`init` for
+          // the deploy-check domain default) is a legitimate shape; don't
+          // warn about missing assertions on it.
+          if (typeof parsed?.domain === "string" && parsed.domain.trim()) return null;
+          _warnConfigIssue(`${candidate} found but missing required field "routeAssertions.assertions" (or top-level "assertions" array). See https://cipherwake.io/methodology/route-assertions for the schema.`);
+          return null;
+        }
+        if (!Array.isArray(cfg.assertions)) {
+          _warnConfigIssue(`"assertions" must be an array of {path, expect, ...} objects.`);
+          return null;
+        }
+        // R87.4 — normalize + validate each assertion. Catch common typos:
+        // missing leading slash, unknown `expect` value, duplicate paths.
+        const seen = new Set();
+        const cleaned = [];
+        for (let idx = 0; idx < cfg.assertions.length; idx++) {
+          const a = cfg.assertions[idx];
+          if (!a || typeof a !== "object") {
+            _warnConfigIssue(`assertion #${idx + 1} is not an object — skipped.`);
+            continue;
+          }
+          if (typeof a.path !== "string" || !a.path) {
+            _warnConfigIssue(`assertion #${idx + 1} missing "path" field — skipped.`);
+            continue;
+          }
+          // Normalize leading slash
+          let normPath = a.path.trim();
+          if (!normPath.startsWith("/")) {
+            _warnConfigIssue(`assertion path "${a.path}" missing leading "/" — auto-normalized to "/${normPath}".`);
+            normPath = "/" + normPath;
+          }
+          if (normPath.includes("?")) {
+            _warnConfigIssue(`assertion path "${normPath}" contains "?" — query strings are not supported in route assertions. Path probed without query.`);
+            normPath = normPath.split("?")[0];
+          }
+          const validExpects = ["protected", "exposed", "missing"];
+          if (!validExpects.includes(a.expect)) {
+            _warnConfigIssue(`assertion #${idx + 1} (path "${normPath}") has invalid "expect": ${JSON.stringify(a.expect)}. Must be one of: ${validExpects.join(", ")}. Skipped.`);
+            continue;
+          }
+          if (seen.has(normPath)) {
+            _warnConfigIssue(`duplicate path "${normPath}" in assertions — second occurrence ignored.`);
+            continue;
+          }
+          // R87.6 — validate bodyContains / bodyAbsent if present.
+          if (a.bodyContains !== undefined && typeof a.bodyContains !== "string" && !(Array.isArray(a.bodyContains) && a.bodyContains.every((s) => typeof s === "string"))) {
+            _warnConfigIssue(`assertion #${idx + 1} (path "${normPath}") has invalid "bodyContains" — must be a string or array of strings. Body check disabled for this assertion.`);
+            delete a.bodyContains;
+          }
+          if (a.bodyAbsent !== undefined && typeof a.bodyAbsent !== "string" && !(Array.isArray(a.bodyAbsent) && a.bodyAbsent.every((s) => typeof s === "string"))) {
+            _warnConfigIssue(`assertion #${idx + 1} (path "${normPath}") has invalid "bodyAbsent" — must be a string or array of strings. Body check disabled for this assertion.`);
+            delete a.bodyAbsent;
+          }
+          if ((a.bodyContains !== undefined || a.bodyAbsent !== undefined) && a.expect !== "protected") {
+            _warnConfigIssue(`assertion #${idx + 1} (path "${normPath}") has body assertions but expect=${JSON.stringify(a.expect)}. Body checks only run on expect=protected.`);
+          }
+          seen.add(normPath);
+          cleaned.push({ ...a, path: normPath });
+        }
+        if (cleaned.length === 0) {
+          _warnConfigIssue(`no valid assertions found after validation — customer config will not be sent.`);
+          return null;
+        }
+        return { ...cfg, assertions: cleaned };
+      }
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    return null;
+  } catch (e) {
+    _warnConfigIssue(`unexpected error reading config: ${e.message}`);
+    return null;
+  }
+}
+
+// R96 (dogfood feedback #2) — `pqcheck setup`/`init` persist the monitored
+// domain into .cipherwake.json so `deploy-check` / `guard` can omit the
+// domain argument on subsequent runs. Same 5-level walk-up as
+// readRouteAssertionsConfig. Returns a validated hostname or null. Malformed
+// JSON returns null silently — readRouteAssertionsConfig already warns on it.
+async function readCipherwakeConfigDomain() {
+  try {
+    const { readFileSync, existsSync } = await import("node:fs");
+    const { join, dirname } = await import("node:path");
+    let dir = process.cwd();
+    for (let i = 0; i < 5; i++) {
+      const candidate = join(dir, ".cipherwake.json");
+      if (existsSync(candidate)) {
+        try {
+          const parsed = JSON.parse(readFileSync(candidate, "utf8"));
+          if (typeof parsed?.domain !== "string" || !parsed.domain.trim()) return null;
+          const d = normalizeDomain(parsed.domain.trim());
+          return isValidDomain(d) ? d : null;
+        } catch {
+          return null;
+        }
+      }
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// R96 — merge {"domain": <D>} into ./.cipherwake.json (cwd, where setup/init
+// run). Never clobbers a malformed or unexpected-shape file: the same file
+// carries customer route assertions, and destroying those to save a domain
+// field would be a terrible trade.
+async function writeDomainToCipherwakeConfig(domain) {
+  const fs = await import("node:fs/promises");
+  const path = await import("node:path");
+  const cfgPath = path.join(process.cwd(), ".cipherwake.json");
+  let parsed = {};
+  let existed = false;
+  try {
+    const raw = await fs.readFile(cfgPath, "utf8");
+    existed = true;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return { status: "skipped-malformed", path: cfgPath };
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { status: "skipped-unexpected-shape", path: cfgPath };
+    }
+  } catch { /* file doesn't exist — will create */ }
+  if (parsed.domain === domain) return { status: "already-set", path: cfgPath };
+  const prior = typeof parsed.domain === "string" ? parsed.domain : null;
+  parsed.domain = domain;
+  await fs.writeFile(cfgPath, JSON.stringify(parsed, null, 2) + "\n", "utf8");
+  return { status: existed ? (prior ? "updated" : "merged") : "created", prior, path: cfgPath };
+}
+
+// R87 — fold customer route-assertion failures into ship_decision. Any
+// CRITICAL failure (declared `protected` route that is now `exposed`) blocks
+// the deploy unconditionally — this is the catastrophic "admin became
+// public" case the feature exists to catch. High/medium failures promote
+// to `review`.
+// R89.G (2026-06-05) — narrative line for every scan. The reason "drift-only"
+// feels not-worth-paying-for is the silent-on-pass UX. A one-liner narrative
+// on every scan ("Public surface since last deploy: 0 routes changed, 0
+// headers regressed, deploy healthy") makes the gate FEEL alive even when
+// it's green. The AI coder reads this in the response and can surface it
+// to the user in plain English.
+function buildTrustDiffNarrative({ deltaCount, assertionsFailedCount, assertionsCriticalCount, deployStatus, secretsCriticalCount, secretsFindingsTotal, cookieFailedCount, headerFailedCount, posture }) {
+  const bits = [];
+  // Lead with the catastrophic items first
+  if (secretsCriticalCount > 0) bits.push(`${secretsCriticalCount} leaked secret${secretsCriticalCount === 1 ? "" : "s"} in JS bundle`);
+  if (deployStatus && deployStatus !== "healthy" && deployStatus !== "unreachable") {
+    bits.push(`deploy ${deployStatus.replace(/_/g, " ")}`);
+  }
+  if (assertionsCriticalCount > 0) bits.push(`${assertionsCriticalCount} declared route${assertionsCriticalCount === 1 ? "" : "s"} regressed`);
+  if (cookieFailedCount > 0) bits.push(`${cookieFailedCount} cookie flag${cookieFailedCount === 1 ? "" : "s"} weakened`);
+  if (headerFailedCount > 0) bits.push(`${headerFailedCount} required header${headerFailedCount === 1 ? "" : "s"} missing`);
+  if (deltaCount > 0) bits.push(`${deltaCount} trust-surface change${deltaCount === 1 ? "" : "s"} since baseline`);
+  if (assertionsFailedCount > 0 && assertionsCriticalCount === 0) bits.push(`${assertionsFailedCount} route assertion${assertionsFailedCount === 1 ? "" : "s"} for review`);
+  if (secretsFindingsTotal > secretsCriticalCount) bits.push(`${secretsFindingsTotal - secretsCriticalCount} non-critical secret finding${(secretsFindingsTotal - secretsCriticalCount) === 1 ? "" : "s"}`);
+  if (bits.length === 0) {
+    return `Public surface since last deploy: no drift, all declared invariants pass${deployStatus === "healthy" ? ", deploy healthy" : ""}${posture ? `, posture ${posture}` : ""}.`;
+  }
+  return `Public surface since last deploy: ${bits.join("; ")}${deployStatus === "healthy" ? " (homepage healthy)" : ""}.`;
+}
+
+function shipDecisionFromAssertions(summary) {
+  if (!summary) return null;
+  // R89/R88 wave 2 + R90 — fold in deploy health + secrets + cookies + headers + TLS.
+  // Critical case auto-blocks; any non-critical failure promotes to review.
+  // R94.3 — waf_blocked is advisory (customer's own WAF blocked the scanner
+  // UA, deploy most likely healthy) so it must not flip the gate to block,
+  // matching the ship_decision_health field's treatment.
+  const deployBroken = summary.deployHealth
+    && summary.deployHealth.status !== "healthy"
+    && summary.deployHealth.status !== "unreachable"
+    && summary.deployHealth.status !== "waf_blocked";
+  const secretsLeaked = summary.secrets && summary.secrets.criticalCount > 0;
+  const cookieCritical = (summary.cookieCriticalFailures || 0) > 0;
+  const tlsCritical = summary.tlsExpiry && !summary.tlsExpiry.passed && summary.tlsExpiry.severity === "critical";
+  if ((summary.criticalFailures && summary.criticalFailures.length > 0) ||
+      (summary.headerCriticalFailures && summary.headerCriticalFailures.length > 0) ||
+      deployBroken || secretsLeaked || cookieCritical || tlsCritical) {
+    return "block";
+  }
+  const headerFailed = (summary.headerResults || []).filter((r) => !r.passed).length;
+  const cookieFailed = (summary.cookieResults || []).filter((r) => !r.passed).length;
+  const secretsFound = summary.secrets && summary.secrets.findings && summary.secrets.findings.length > 0;
+  const tlsFailed = summary.tlsExpiry && !summary.tlsExpiry.passed;
+  if (summary.failed > 0 || headerFailed > 0 || cookieFailed > 0 || secretsFound || tlsFailed) return "review";
+  return "pass";
+}
+
+// R87 — emit per-assertion outcomes in a parseable block. Stable format so
+// AI coders can route on the data; one line per assertion with
+// expected/actual + path so failures are obvious at a glance.
+function formatRouteAssertionsBlock(summary) {
+  if (!summary || !Array.isArray(summary.results) || summary.results.length === 0) return "";
+  const lines = ["", "CIPHERWAKE_ROUTE_ASSERTIONS"];
+  lines.push(`total=${summary.total}`);
+  lines.push(`passed=${summary.passed}`);
+  lines.push(`failed=${summary.failed}`);
+  lines.push(`critical_failures=${summary.criticalFailures.length}`);
+  lines.push(`sources_customer=${summary.sources.customer}`);
+  lines.push(`sources_default=${summary.sources.default}`);
+  lines.push(`sources_auto=${summary.sources.auto}`);
+  lines.push(`sources_auto_suppressed=${summary.sources.autoSuppressed || 0}`);
+  lines.push(`sources_dismissed=${summary.sources.dismissed || 0}`);
+  // R88 — header invariants block alongside route assertions
+  if (Array.isArray(summary.headerResults) && summary.headerResults.length > 0) {
+    lines.push("--- HEADER INVARIANTS ---");
+    lines.push(`header_total=${summary.headerResults.length}`);
+    lines.push(`header_passed=${summary.headerResults.filter((r) => r.passed).length}`);
+    lines.push(`header_failed=${summary.headerResults.filter((r) => !r.passed).length}`);
+    lines.push(`header_critical_failures=${(summary.headerCriticalFailures || []).length}`);
+    for (const h of summary.headerResults) {
+      const status = h.passed ? "PASS" : "FAIL";
+      const sev = h.passed ? "info" : h.severity;
+      const wantVal = h.expectedValue ? `="${h.expectedValue}"` : "";
+      const gotVal = h.actualValue !== null && h.actualValue !== undefined ? `, got "${String(h.actualValue).slice(0, 80)}"` : ", got <absent>";
+      const why = h.why ? ` — ${h.why}` : "";
+      lines.push(`${status} [${sev}] header:${h.header} expect=${h.expect}${wantVal}${gotVal}${why}`);
+    }
+  }
+  // R89 — deploy-health check
+  if (summary.deployHealth) {
+    const dh = summary.deployHealth;
+    lines.push("--- DEPLOY HEALTH ---");
+    lines.push(`deploy_status=${dh.status}`);
+    lines.push(`deploy_http_status=${dh.httpStatus === null ? "?" : dh.httpStatus}`);
+    lines.push(`deploy_body_bytes=${dh.bodyBytes}`);
+    if (dh.matchedErrorMarker) lines.push(`deploy_matched_error_marker=${dh.matchedErrorMarker}`);
+    if (dh.missingLandmark) lines.push(`deploy_missing_landmark=${dh.missingLandmark}`);
+    if (dh.errorReason) lines.push(`deploy_error_reason=${dh.errorReason}`);
+    lines.push(`deploy_summary=${dh.summary}`);
+  }
+  // R88 wave 2 — secret scanner
+  if (summary.secrets) {
+    const s = summary.secrets;
+    lines.push("--- SECRET SCAN ---");
+    lines.push(`secrets_scanned=${s.scanned}`);
+    lines.push(`secrets_bundles_fetched=${s.bundlesFetched}`);
+    lines.push(`secrets_findings_total=${s.findings.length}`);
+    lines.push(`secrets_critical_count=${s.criticalCount}`);
+    for (const f of s.findings) {
+      lines.push(`FAIL [${f.severity}] secret:${f.patternId} source=${f.source} redacted=${f.redactedSample} — ${f.name}`);
+    }
+  }
+  // R90 — TLS cert expiry invariant
+  if (summary.tlsExpiry) {
+    const t = summary.tlsExpiry;
+    lines.push("--- TLS EXPIRY ---");
+    lines.push(`tls_checked=${t.checked}`);
+    lines.push(`tls_days_remaining=${t.daysRemaining === null ? "?" : t.daysRemaining}`);
+    lines.push(`tls_min_required=${t.minRequired}`);
+    lines.push(`tls_passed=${t.passed}`);
+    lines.push(`tls_summary=${t.summary}`);
+  }
+  // R88 wave 2 — cookie invariants
+  if (Array.isArray(summary.cookieResults) && summary.cookieResults.length > 0) {
+    lines.push("--- COOKIE INVARIANTS ---");
+    lines.push(`cookie_total=${summary.cookieResults.length}`);
+    lines.push(`cookie_passed=${summary.cookieResults.filter((r) => r.passed).length}`);
+    lines.push(`cookie_failed=${summary.cookieResults.filter((r) => !r.passed).length}`);
+    lines.push(`cookie_critical_failures=${summary.cookieCriticalFailures || 0}`);
+    for (const c of summary.cookieResults) {
+      const status = c.passed ? "PASS" : "FAIL";
+      const sev = c.passed ? "info" : c.severity;
+      const matched = c.matchedCookies.length > 0 ? c.matchedCookies.join(",") : "<no matching cookies>";
+      const why = c.why ? ` — ${c.why}` : "";
+      if (c.failures.length === 0) {
+        lines.push(`${status} [${sev}] cookie:${c.namePattern} matched=${matched}${why}`);
+      } else {
+        for (const f of c.failures) {
+          lines.push(`FAIL [${sev}] cookie:${c.namePattern} cookie=${f.cookieName} reason=${f.reason}${why}`);
+        }
+      }
+    }
+  }
+  for (const r of summary.results) {
+    const status = r.passed ? "PASS" : "FAIL";
+    const sev = r.passed ? "info" : r.severity;
+    const why = r.why ? ` — ${r.why}` : "";
+    const errReason = r.errorReason ? ` reason=${r.errorReason}` : "";
+    const bodyTag = r.bodyCheck && r.bodyCheck !== "body_check_skipped" ? ` body=${r.bodyCheck}` : "";
+    lines.push(`${status} [${sev}] ${r.source}:${r.path} expected=${r.expected} actual=${r.actual} status=${r.status === null ? "?" : r.status}${errReason}${bodyTag}${why}`);
+  }
+  lines.push("END_CIPHERWAKE_ROUTE_ASSERTIONS");
+  return color("dim", lines.join("\n"));
+}
+
+// R86.3 (2026-06-03) — emit per-finding fix snippets in a separate parseable
+// block after the AI guard block. The guard block stays compact key=value;
+// fixes are multi-line code so they get their own block with explicit
+// start/end markers + per-fix delimiters. Agents parse + apply without
+// round-tripping to JSON.
+function formatPostureFixesBlock(fixes) {
+  if (!Array.isArray(fixes) || fixes.length === 0) return "";
+  const lines = ["", "CIPHERWAKE_POSTURE_FIXES"];
+  for (let i = 0; i < fixes.length; i++) {
+    const f = fixes[i] || {};
+    lines.push(`--- FIX ${i + 1} ---`);
+    lines.push(`finding_id=${String(f.finding_id || "").replace(/[\r\n]+/g, " ")}`);
+    lines.push(`title=${String(f.title || "").replace(/[\r\n]+/g, " ")}`);
+    lines.push(`framework=${String(f.framework || "").replace(/[\r\n]+/g, " ")}`);
+    lines.push(`file_target=${String(f.file_target || "").replace(/[\r\n]+/g, " ")}`);
+    lines.push("snippet:");
+    const snippet = String(f.snippet || "");
+    for (const line of snippet.split(/\r?\n/)) {
+      lines.push(line);
+    }
+  }
+  lines.push("END_CIPHERWAKE_POSTURE_FIXES");
+  return color("dim", lines.join("\n"));
 }
 
 // Compute ship_decision: pass | review | block.
@@ -804,7 +1408,10 @@ function formatAiFooterBlock(fields) {
     lines.push(`${safeK}=${safeV}`);
   }
   lines.push("END_CIPHERWAKE_AI_GUARD_RESULT");
-  return color("dim", lines.join("\n"));
+  // R96 — never colorize the machine block. On a TTY, color("dim", ...)
+  // wrapped the END marker in ANSI escapes, breaking strict line-match
+  // parsers in pty-based agents. The block is a wire format, not UI.
+  return lines.join("\n");
 }
 
 // v0.16.13 — fail-loud AI guard for fetch/quota/server errors during
@@ -816,7 +1423,9 @@ function formatAiFooterBlock(fields) {
 // the agent can route on. Behaviour in non-AI text mode is unchanged.
 function emitAiGuardReviewAndExit(args, errorDetail) {
   if (parseAiMode(args)) {
-    const positional = args.filter((a) => !a.startsWith("-"));
+    // R96 — exclude flag VALUES, not just flags: `--baseline last-week
+    // acme.com` used to label domain="last-week" in the error block.
+    const positional = args.filter((a) => !a.startsWith("-") && !isFlagValue(args, a));
     const domain = positional[0] || "";
     const baseline = parseFlag(args, "--baseline") || "last-scan";
     try {
@@ -860,6 +1469,37 @@ function emitAiGuardReviewAndExit(args, errorDetail) {
         top_issue: errorDetail.code,
         error: errorDetail.code,
       }).catch(() => { /* best-effort */ });
+    } catch {
+      // even error path must not throw — fall through to exit
+    }
+  }
+  process.exit(errorDetail.exitCode ?? 3);
+}
+
+// Same fail-loud contract for preview-diff --ai (v0.16.13 fixed this for
+// trust-diff only; preview-diff error paths previously exited 3 with no
+// block, so agents parsing for CIPHERWAKE_AI_GUARD_RESULT saw "no signal").
+function emitPreviewDiffAiGuardReviewAndExit(args, previewUrl, productionUrl, errorDetail) {
+  if (parseAiMode(args)) {
+    try {
+      console.log("");
+      console.log(color("yellow", "  ⚠ REVIEW — Cipherwake preview-diff could not complete"));
+      console.log(color("dim",    `  ${errorDetail.message}`));
+      console.log(color("dim",    "  Treating as REVIEW per fail-safe policy. Do NOT announce the deploy until you manually verify or rerun the check successfully."));
+      console.log(formatAiFooterBlock({
+        status: "review",
+        kind: "preview-diff",
+        preview_url: previewUrl || "",
+        production_url: productionUrl || "",
+        verdict: "review",
+        ship_decision: "review",
+        top_issue: errorDetail.code,
+        top_issue_title: errorDetail.message,
+        scanned_at: new Date().toISOString(),
+        advisory_only: "true",
+        error: errorDetail.code,
+      }));
+      console.log("");
     } catch {
       // even error path must not throw — fall through to exit
     }
@@ -1703,6 +2343,7 @@ ${color("bold", "Commands:")}
   npx pqcheck init                              Interactive scaffold for .github/workflows/cipherwake.yml
   npx pqcheck deploy-check <domain>             Pre-deploy trust gate (Trust Diff vs last scan; deploy-friendly framing) — see also: AI Coder Protocol at https://cipherwake.io/methodology/ai-coder-protocol
   npx pqcheck guard --domain <D> -- <cmd>       NEW: wrap any deploy command. Runs deploy-check first; conditionally runs <cmd> based on ship_decision. The strongest single artifact for AI-coder workflows.
+  npx pqcheck last [domain]                     NEW: reuse a recent deploy-check verdict instead of re-scanning (local state; --remote checks your GitHub Actions CI run; --max-age <min> freshness window, default 60)
   npx pqcheck protocol install                  NEW: install the AI Coder Protocol into your CLAUDE.md / .cursorrules (Rule 17 consent flow)
   npx pqcheck guards <init|list|run>            EXPERIMENTAL (BETA): manage Site Guards (.cipherwake/guards.json) — runtime policies for source-maps / mixed-content / approved-hosts / protected-paths / cookie-flags / link-integrity. See: https://cipherwake.io/methodology/site-guards
   npx pqcheck release-checklist [domain]        Print a pre-release trust checklist (markdown, offline)
@@ -3069,7 +3710,7 @@ async function runScanBasedDeployCheck(domain, args) {
 
   let resp;
   try {
-    resp = await fetch(`${API_BASE}/api/scan?domain=${encodeURIComponent(domain)}`, { headers });
+    resp = await fetchWithTimeout(`${API_BASE}/api/scan?domain=${encodeURIComponent(domain)}`, { headers });
   } catch (err) {
     // v0.16.17 — the v0.16.13 fail-loud AI guard fix was applied to the main
     // trust-diff deploy-check path but missed THIS fallback path (no-baseline
@@ -3221,9 +3862,12 @@ async function runScanBasedDeployCheck(domain, args) {
     max_severity: maxSev,
     ship_decision: shipDecision,
     unreachable: unreachable ? "true" : "false",
+    // R96 — bare ids, matching the main scan path (which emits
+    // `topFinding?.id` without a `findings.` prefix). Parsers shouldn't
+    // need two formats for the same field.
     top_issue: unreachable
-      ? "findings.reachability.unreachable"
-      : (topFinding ? `findings.${topFinding.id || "unknown"}` : "none"),
+      ? "reachability.unreachable"
+      : (topFinding?.id || topFinding?.title || "none"),
     findings_high: findings.filter((f) => severityRank(f.severity) >= severityRank("high")).length,
     findings_critical: findings.filter((f) => severityRank(f.severity) >= severityRank("critical")).length,
     scanned_at: new Date().toISOString(),
@@ -3242,22 +3886,30 @@ async function runScanBasedDeployCheck(domain, args) {
     ship_decision: shipDecision,
     unreachable: unreachable || false,
     top_issue: unreachable
-      ? "findings.reachability.unreachable"
+      ? "reachability.unreachable"
       : (topFinding?.id || topFinding?.title || null),
     note: unreachable
       ? "domain unreachable on port 443; deploy may have failed or DNS not propagated"
       : "first-deploy: no baseline yet, scored on current state",
   });
 
-  // Exit code: 0 on pass, non-zero on review/block (matches deploy-check contract)
-  process.exit(shipDecision === "pass" ? 0 : 1);
+  // Exit code: 0=pass, 1=review, 2=block (matches the deploy-check AI
+  // contract). R96 — this previously exited 1 for block too, so the
+  // pre-push hook (which refuses only on RC=2) would allow a blocked push.
+  process.exit(shipDecision === "block" ? 2 : shipDecision === "pass" ? 0 : 1);
 }
 
-async function runTrustDiffCommand(args) {
+async function runTrustDiffCommand(args, opts = {}) {
+  // R86.7 — reject unknown flags before any other parsing. Same rationale
+  // as the bare-scan path: typo'd safety-critical flags must fail loud,
+  // not silently degrade.
+  if (assertKnownFlags(args, "pqcheck trust-diff")) {
+    process.exit(3);
+  }
   const positional = args.filter((a) => !a.startsWith("-") && !isFlagValue(args, a));
   if (positional.length === 0) {
     console.error(color("red", "error: pqcheck trust-diff requires a domain"));
-    console.error(color("dim", "Usage: npx pqcheck trust-diff <domain> [--baseline last-week] [--fail-on high] [--format pretty|json|sarif|github]"));
+    console.error(color("dim", "Usage: npx pqcheck trust-diff <domain> [--baseline last-week] [--fail-on high] [--format pretty|json|sarif|github] [--strict-posture]"));
     process.exit(3);
   }
   const domain = normalizeDomain(positional[0]);
@@ -3269,6 +3921,23 @@ async function runTrustDiffCommand(args) {
   const baseline = parseFlag(args, "--baseline") || "last-week";
   const failOn = parseFlag(args, "--fail-on") || "high";
   const format = parseFlag(args, "--format") || "pretty";
+  // R92 (2026-06-06) — --fresh + --verbose were silently dropped by the
+  // CLI before R92. The result: `pqcheck deploy-check <D> --fresh` ran but
+  // returned stale posture from scan_cache. After R92 they're plumbed
+  // through to /api/trust-diff body so the server can act on them.
+  const fresh = args.includes("--fresh") || args.includes("--force");
+  const verbose = args.includes("--verbose");
+  // R86.4 (2026-06-03) — see runOneScan for rationale. Default ship_decision
+  // is drift-only (per-deploy regression gate); --strict-posture opts into
+  // worst-of(drift, posture). Recommended only after a site reaches A/B
+  // posture to lock that in.
+  // Accept both `--strict-posture` (explicit) and `--strict` (short alias).
+  // Audit caught a footgun where customers typed `--strict` expecting the
+  // posture gate to fire and got silent drift-only mode instead. The
+  // `onboard` subcommand uses `--strict` for a different purpose (gate exit
+  // code on step failure) but that's a separate command — the alias is
+  // scoped to scan / deploy-check / trust-diff only.
+  const strictPosture = args.includes("--strict-posture") || args.includes("--strict");
 
   // Build headers conditionally — Authorization is set ONLY if the user has
   // an API key. Without it, the server's applyRepoQuota falls through to the
@@ -3283,10 +3952,21 @@ async function runTrustDiffCommand(args) {
 
   let resp;
   try {
-    resp = await fetch(`${API_BASE}/api/trust-diff`, {
+    const _routeCfg = await readRouteAssertionsConfig();
+    resp = await fetchWithTimeout(`${API_BASE}/api/trust-diff`, {
       method: "POST",
       headers,
-      body: JSON.stringify({ domain, baseline, fail_on: failOn }),
+      body: JSON.stringify({
+        domain,
+        baseline,
+        fail_on: failOn,
+        routeAssertionsConfig: _routeCfg,
+        // R92 (2026-06-06) — pass --fresh + --verbose through to server.
+        // Server returns `fresh_status` so caller can route on
+        // applied | rate_limited | unauthenticated | unavailable | not_requested.
+        fresh,
+        verbose,
+      }),
     });
   } catch (err) {
     console.error(color("red", `error: network failure calling /api/trust-diff: ${err.message}`));
@@ -3325,7 +4005,10 @@ async function runTrustDiffCommand(args) {
   // through to /api/scan, populate the cache, and emit ship_decision based
   // on the scan's current absolute state. Subsequent deploy-checks will
   // have a baseline and produce a real drift verdict.
-  if (resp.status === 404 && parseAiMode(args)) {
+  // R96 — README documents this fallback for deploy-check unconditionally,
+  // but it used to fire only with --ai; a non-AI first run errored instead.
+  // Now: any deploy-check invocation falls through, plus any --ai caller.
+  if (resp.status === 404 && (opts.deployCheck || parseAiMode(args))) {
     return await runScanBasedDeployCheck(domain, args);
   }
   if (!resp.ok) {
@@ -3343,6 +4026,45 @@ async function runTrustDiffCommand(args) {
   const result = await resp.json();
   const verdict = result.verdict || "pass";
   const deltas = Array.isArray(result.deltas) ? result.deltas : [];
+  // R92 (2026-06-06) — surface non-applied fresh status BEFORE any verdict
+  // rendering so the customer sees the staleness warning at the top, not
+  // after the (potentially stale) grade. Three failure modes get their own
+  // explanation since they imply different next actions.
+  const freshStatus = typeof result.fresh_status === "string" ? result.fresh_status : "not_requested";
+  if (fresh && freshStatus !== "applied" && freshStatus !== "not_requested") {
+    const why = freshStatus === "rate_limited"
+      ? "fresh-scan cap reached (20/hr per API key). The posture below is from the last cached scan — re-run after the cap window, or accept the cached read for now."
+      : freshStatus === "unauthenticated"
+        ? "fresh-scan requires an API key (free tier inclusive). Set CIPHERWAKE_API_KEY; without it, --fresh silently downgrades to cached. Get a key at https://cipherwake.io/account#api-keys"
+        : freshStatus === "unavailable"
+          ? "fresh-scan path failed mid-run. The posture below is from the last cached scan — re-run to retry."
+          : `fresh request returned status=${freshStatus}.`;
+    console.error("");
+    console.error(color("yellow", `⚠ --fresh requested but NOT applied: ${why}`));
+    console.error("");
+  }
+  // R92 — scanner_observed (verbose mode). Surfaces the actual headers /
+  // final URL / status that Cipherwake's posture grade was computed from,
+  // so a customer can diff against `curl -I` and catch a stale or
+  // wrong-target read instantly.
+  if (verbose && result.scanner_observed) {
+    const obs = result.scanner_observed;
+    console.log("");
+    console.log(color("dim", "CIPHERWAKE_SCANNER_OBSERVED"));
+    console.log(color("dim", `final_url=${obs.final_url ?? "<unknown>"}`));
+    console.log(color("dim", `final_status=${obs.final_status ?? "<unknown>"}`));
+    console.log(color("dim", `fetched_at=${obs.fetched_at}`));
+    if (obs.headers && typeof obs.headers === "object") {
+      const headerKeys = Object.keys(obs.headers).sort();
+      for (const k of headerKeys) {
+        const v = obs.headers[k];
+        const val = Array.isArray(v) ? v.join(", ") : (v == null ? "" : String(v));
+        console.log(color("dim", `header.${k}=${val}`));
+      }
+    }
+    console.log(color("dim", "END_CIPHERWAKE_SCANNER_OBSERVED"));
+    console.log("");
+  }
 
   // AI Coder Mode — three-layer output (banner / body / structured block).
   if (parseAiMode(args)) {
@@ -3400,24 +4122,184 @@ async function runTrustDiffCommand(args) {
       console.log(color("dim", "  Run with --verbose to see all verified signals."));
     }
 
+    // R86 — posture grade + remediation alongside drift. trust-diff API returns
+    // result.current_report which contains the full scan; if so, read posture
+    // from it. Otherwise gracefully omit (older API responses without posture).
+    const currentReport = result.current_report || result.report || null;
+    const posture = currentReport?.posture || null;
+    const postureFields = posture ? {
+      posture_grade: posture.grade,
+      posture_score: posture.score,
+      posture_decision: posture.decision,
+      posture_missing: (posture.missing || []).join(",") || "none",
+      posture_leaks: (posture.info_leaks || []).join("; ") || "none",
+      posture_findings_count: (posture.findings || []).length,
+      posture_fixes_count: (posture.fixes || []).length,
+    } : {};
+    // R86.2 / R86.4 — see combineShipDecision: posture is advisory by default,
+    // gated only when --strict-posture is passed.
+    const effectiveShip = combineShipDecision(shipDecision, posture?.decision, { strict: strictPosture });
+    // R86.5 — surface posture advisory line in default (non-strict) mode.
+    const postureAdvisory = formatPostureAdvisoryLine(posture, strictPosture);
+    if (postureAdvisory) console.log(postureAdvisory);
+    // R87 (2026-06-05) — fold route-assertion failures into ship_decision.
+    // Customer-declared assertions are surfaced regardless; their critical
+    // failures (declared `protected` route that's now `exposed`) ALWAYS
+    // promote ship_decision to block — this is the catastrophic case the
+    // feature exists to catch ("admin went public") and it does not require
+    // --strict-posture or any opt-in. Default + auto-detected assertions
+    // follow the same gating rules.
+    const routeAssertions = currentReport?.routeAssertions || null;
+    const assertionShipImpact = shipDecisionFromAssertions(routeAssertions);
+    const effectiveShipWithAssertions = assertionShipImpact
+      ? (SHIP_DECISION_RANK[assertionShipImpact] > SHIP_DECISION_RANK[effectiveShip] ? assertionShipImpact : effectiveShip)
+      : effectiveShip;
+    // R88 wave 2 + R89 — fold in deploy health, secrets, cookies.
+    const dh = routeAssertions?.deployHealth || null;
+    const sc = routeAssertions?.secrets || null;
+    const cr2 = routeAssertions?.cookieResults || null;
+    const assertionFields = routeAssertions ? {
+      assertions_total: routeAssertions.total,
+      assertions_passed: routeAssertions.passed,
+      assertions_failed: routeAssertions.failed,
+      assertions_critical_failures: routeAssertions.criticalFailures.length,
+      assertions_sources: `customer=${routeAssertions.sources.customer},default=${routeAssertions.sources.default},auto=${routeAssertions.sources.auto},auto_suppressed=${routeAssertions.sources.autoSuppressed || 0},dismissed=${routeAssertions.sources.dismissed || 0}`,
+      assertion_top_failure: routeAssertions.criticalFailures[0]
+        ? `${routeAssertions.criticalFailures[0].path}: expected ${routeAssertions.criticalFailures[0].expected}, got ${routeAssertions.criticalFailures[0].actual}`
+        : undefined,
+      // Deploy health
+      deploy_status: dh?.status,
+      deploy_http_status: dh?.httpStatus,
+      deploy_summary: dh?.summary?.slice(0, 200),
+      // R94.3 — waf_blocked is advisory, not blocking. The deploy is most
+      // likely healthy; the customer's WAF blocked our scanner UA. Same
+      // class as R90.1 (WAF false-positive on route assertions). Treat
+      // unreachable + waf_blocked as "review" rather than "block" so the
+      // customer isn't gated by their own bot-protection.
+      ship_decision_health: dh && dh.status !== "healthy" && dh.status !== "unreachable" && dh.status !== "waf_blocked" ? "block" : (dh ? "pass" : undefined),
+      // Secret scanner
+      secrets_scanned: sc?.scanned,
+      secrets_findings_total: sc?.findings?.length,
+      secrets_critical_count: sc?.criticalCount,
+      ship_decision_secrets: sc && sc.criticalCount > 0 ? "block" : (sc && sc.findings.length > 0 ? "review" : (sc ? "pass" : undefined)),
+      // Cookie invariants
+      cookie_failed: cr2 ? cr2.filter((c) => !c.passed).length : undefined,
+      cookie_critical_failures: routeAssertions.cookieCriticalFailures || 0,
+      ship_decision_cookies: cr2 && cr2.length > 0
+        ? (routeAssertions.cookieCriticalFailures > 0 ? "block" : (cr2.filter((c) => !c.passed).length > 0 ? "review" : "pass"))
+        : undefined,
+      // R90 — TLS expiry
+      tls_days_remaining: routeAssertions.tlsExpiry?.daysRemaining,
+      tls_passed: routeAssertions.tlsExpiry?.passed,
+      ship_decision_tls: routeAssertions.tlsExpiry?.checked
+        ? (routeAssertions.tlsExpiry.passed ? "pass" : (routeAssertions.tlsExpiry.severity === "critical" ? "block" : "review"))
+        : undefined,
+    } : {};
+
+    // R96 feedback #4 — flake context: is the failing check a chronic flake /
+    // previously-dismissed state or a first-ever failure? Sourced from local
+    // .cipherwake/stats.json history; {} (silent) when nothing is failing or
+    // there is no history for the failing check.
+    const flakeFields = await buildFlakeContextFields(routeAssertions);
+
     console.log(formatAiFooterBlock({
-      status: shipDecision,
+      status: effectiveShipWithAssertions,
       domain,
       kind: "trust-diff",
       baseline,
       verdict,
       delta_count: deltas.length,
       max_severity: maxSev,
-      ship_decision: shipDecision,
+      ship_decision: effectiveShipWithAssertions,
+      ship_decision_drift: shipDecision,
+      ship_decision_posture: posture?.decision,
+      ship_decision_assertions: assertionShipImpact,
+      ship_decision_mode: strictPosture ? "strict_posture" : "drift_only",
       top_issue: topDelta?.id || topDelta?.type || "none",
-      top_issue_title: topDelta?.title || "",
-      dbr: typeof result.current_score === "number" ? result.current_score.toFixed(1) : "",
-      grade: result.current_grade || "",
-      quota_used: result.quota?.used_this_month ?? "",
-      quota_limit: result.quota?.monthly_limit ?? "",
+      top_issue_title: topDelta?.title || undefined,
+      dbr: typeof result.current_score === "number" ? result.current_score.toFixed(1) : undefined,
+      grade: result.current_grade || undefined,
+      quota_used: result.quota?.used_this_month ?? undefined,
+      quota_limit: result.quota?.monthly_limit ?? undefined,
       scanned_at: new Date().toISOString(),
       advisory_only: "true",
+      scope: strictPosture ? "trust_surface_drift_plus_absolute_posture_plus_route_assertions_plus_health" : "trust_surface_drift_plus_route_assertions_plus_health",
+      scope_note: "ship_decision = worst-of(drift, route_assertions, deploy_health, secret_scan, cookie_invariants" + (strictPosture ? ", absolute_posture)" : ")") + ". `pass` means: trust/crypto posture stable + declared assertions hold + homepage healthy + no leaked secrets found + declared sensitive paths still gated. `pass` does NOT mean: every public-route inventory is current, nor that no content/authorization leak exists outside the assertion set. Surface-diff additions (new routes / scripts) emit at info severity for human review — they never gate. To make a route class gate, declare a glob assertion (e.g. `/preview/* expect:missing`). Cipherwake does NOT verify app functionality.",
+      narrative: routeAssertions
+        ? buildTrustDiffNarrative({
+            deltaCount: deltas.length,
+            assertionsFailedCount: routeAssertions.failed,
+            assertionsCriticalCount: routeAssertions.criticalFailures.length,
+            deployStatus: routeAssertions.deployHealth?.status,
+            secretsCriticalCount: routeAssertions.secrets?.criticalCount || 0,
+            secretsFindingsTotal: routeAssertions.secrets?.findings?.length || 0,
+            cookieFailedCount: (routeAssertions.cookieResults || []).filter((c) => !c.passed).length,
+            headerFailedCount: (routeAssertions.headerResults || []).filter((r) => !r.passed).length,
+            posture: posture?.grade,
+          })
+        : undefined,
+      ...assertionFields,
+      ...flakeFields,
+      ...postureFields,
+      // R92 — every CIPHERWAKE_AI_GUARD_RESULT block now carries fresh_status
+      // so MCP servers / Aider / Cursor / Claude Code can route programmatically:
+      //   applied → safe to interpret the posture as current
+      //   rate_limited / unauthenticated / unavailable → posture below is from cache,
+      //     do not interpret as a fresh measurement (the customer asked but didn't get it)
+      //   not_requested → caller didn't ask for fresh; cached is by design
+      fresh_status: freshStatus,
     }));
+    if (routeAssertions) {
+      console.log(formatRouteAssertionsBlock(routeAssertions));
+      // R89.LOCAL — persist local stats. ZERO network requests.
+      // R90 — also record surface snapshot for B/C (new-routes / new-scripts diff)
+      try {
+        const { recordResults, recordSurfaceSnapshot } = await import(new URL("./statsTracker.js", import.meta.url).href);
+        await recordResults(extractStatsEntries(routeAssertions));
+        // Extract publicRoutes + thirdPartyHosts from the report for snapshot
+        // R91 (2026-06-06) — broader discovery: merge common-public probe
+        // results with sitemap + homepage-anchor discovered routes so the
+        // surface-diff catches NEW marketing/preview routes (the seatcheck
+        // case from external dogfood feedback).
+        const probedPublic = Array.isArray(currentReport?.publicRoutes?.paths)
+          ? currentReport.publicRoutes.paths.filter((p) => p.classification === "public").map((p) => p.path)
+          : [];
+        const discovered = Array.isArray(routeAssertions?.discoveredRoutes)
+          ? routeAssertions.discoveredRoutes
+          : [];
+        const publicRoutes = [...new Set([...probedPublic, ...discovered])].sort();
+        const thirdPartyHosts = Array.isArray(currentReport?.publicDeps?.thirdParties)
+          ? [...new Set(currentReport.publicDeps.thirdParties.map((t) => t.host).filter(Boolean))]
+          : [];
+        const certDaysToExpiry = typeof currentReport?.publicSurface?.daysUntilCertExpiry === "number"
+          ? currentReport.publicSurface.daysUntilCertExpiry
+          : null;
+        const surfaceDiff = await recordSurfaceSnapshot({ domain, publicRoutes, thirdPartyHosts, certDaysToExpiry });
+        if (surfaceDiff && (surfaceDiff.newRoutes.length > 0 || surfaceDiff.newHosts.length > 0 || surfaceDiff.removedRoutes.length > 0 || surfaceDiff.removedHosts.length > 0)) {
+          console.log("");
+          console.log(color("dim", "CIPHERWAKE_SURFACE_DIFF"));
+          console.log(color("dim", `prev_snapshot_at=${surfaceDiff.prevSnapshotAt}`));
+          for (const r of surfaceDiff.newRoutes) {
+            console.log(color("yellow", `NEW_PUBLIC_ROUTE: ${r}  — was not publicly reachable in last deploy. Review intent.`));
+          }
+          for (const r of surfaceDiff.removedRoutes) {
+            console.log(color("dim", `REMOVED_PUBLIC_ROUTE: ${r}  — was publicly reachable in last deploy.`));
+          }
+          for (const h of surfaceDiff.newHosts) {
+            console.log(color("red", `NEW_THIRD_PARTY_SCRIPT: ${h}  — supply-chain alert: a new third-party script appeared on your homepage since last deploy. Verify intent (vendor add) or investigate (injection / compromise).`));
+          }
+          for (const h of surfaceDiff.removedHosts) {
+            console.log(color("dim", `REMOVED_THIRD_PARTY_SCRIPT: ${h}  — third-party script removed since last deploy.`));
+          }
+          console.log(color("dim", "END_CIPHERWAKE_SURFACE_DIFF"));
+        }
+      } catch {
+        // never block on stats failures
+      }
+    }
+    if (posture && Array.isArray(posture.fixes) && posture.fixes.length > 0) {
+      console.log(formatPostureFixesBlock(posture.fixes));
+    }
     console.log("");
 
     await writeLastScanFile({
@@ -3426,13 +4308,13 @@ async function runTrustDiffCommand(args) {
       score: typeof result.current_score === "number" ? result.current_score : null,
       grade: result.current_grade || null,
       max_severity: maxSev,
-      ship_decision: shipDecision,
+      ship_decision: effectiveShipWithAssertions,
       baseline,
       delta_count: deltas.length,
       top_issue: topDelta?.id || topDelta?.title || null,
     });
 
-    process.exit(shipDecisionExitCode(shipDecision));
+    process.exit(shipDecisionExitCode(effectiveShipWithAssertions));
   }
 
   // Format output
@@ -3734,6 +4616,11 @@ async function runGuardsRunCommand(args) {
 }
 
 async function runPreviewDiffCommand(args) {
+  // R86.7 — reject unknown flags before parsing. Closes the silent-no-op
+  // class of footguns for the preview-diff command too.
+  if (assertKnownFlags(args, "pqcheck preview-diff")) {
+    process.exit(3);
+  }
   const previewUrl = parseFlag(args, "--preview");
   const productionUrl = parseFlag(args, "--production");
   if (!previewUrl || !productionUrl) {
@@ -3781,7 +4668,7 @@ async function runPreviewDiffCommand(args) {
 
   let resp;
   try {
-    resp = await fetch(`${API_BASE}/api/preview-diff`, {
+    resp = await fetchWithTimeout(`${API_BASE}/api/preview-diff`, {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -3797,18 +4684,30 @@ async function runPreviewDiffCommand(args) {
     });
   } catch (err) {
     console.error(color("red", `error: network failure calling /api/preview-diff: ${err.message}`));
-    process.exit(3);
+    emitPreviewDiffAiGuardReviewAndExit(args, previewUrl, productionUrl, {
+      code: "network_failure",
+      message: `network failure calling /api/preview-diff: ${err.message}`,
+      exitCode: 3,
+    });
   }
 
   if (resp.status === 401 || resp.status === 403) {
     await handleAuthError(resp);
-    process.exit(3);
+    emitPreviewDiffAiGuardReviewAndExit(args, previewUrl, productionUrl, {
+      code: "auth_error",
+      message: `authentication failed (${resp.status}) calling /api/preview-diff`,
+      exitCode: 3,
+    });
   }
   if (resp.status === 429) {
     const body = await safeJSON(resp);
     console.error(color("red", "error: Preview Diff API quota exceeded for this month"));
     if (body?.message) console.error(color("dim", body.message));
-    process.exit(3);
+    emitPreviewDiffAiGuardReviewAndExit(args, previewUrl, productionUrl, {
+      code: "quota_exceeded",
+      message: body?.message || "Preview Diff API quota exceeded for this month",
+      exitCode: 3,
+    });
   }
   if (!resp.ok) {
     const body = await safeJSON(resp);
@@ -3818,7 +4717,11 @@ async function runPreviewDiffCommand(args) {
     // / private-IP URLs surface the tunnel-options hint). Print it so the
     // user knows what to do next instead of just seeing the rejection.
     if (body?.hint) console.error(color("dim", body.hint));
-    process.exit(3);
+    emitPreviewDiffAiGuardReviewAndExit(args, previewUrl, productionUrl, {
+      code: `server_error_${resp.status}`,
+      message: body?.message || `/api/preview-diff returned ${resp.status}`,
+      exitCode: 3,
+    });
   }
 
   const result = await resp.json();
@@ -4117,6 +5020,15 @@ function trustDiffToSarif(result) {
 }
 
 function parseFlag(args, name) {
+  // Supports both `--flag value` and `--flag=value` forms. The README
+  // documents the equals form (e.g. `--trigger=deployment-status`), and
+  // assertKnownFlags already validates it — so the parser must accept it
+  // too or the flag silently no-ops (the R86.7 footgun class).
+  for (const tok of args) {
+    if (typeof tok === "string" && tok.startsWith(`${name}=`)) {
+      return tok.slice(name.length + 1) || null;
+    }
+  }
   const idx = args.indexOf(name);
   if (idx === -1 || idx === args.length - 1) return null;
   return args[idx + 1];
@@ -4477,7 +5389,7 @@ function renderReleaseChecklist(domain, opts = {}) {
     `### How to verify`,
     ``,
     `\`\`\`bash`,
-    `# Trust posture vs last successful deploy (Free: 30 calls/mo)`,
+    `# Trust posture vs last successful deploy (Free: 100 calls/mo)`,
     `npx pqcheck trust-diff ${domain} --baseline last-week --fail-on high`,
     ``,
     `# Third-party origins on the page (vendor scripts)`,
@@ -4510,12 +5422,198 @@ function renderReleaseChecklist(domain, opts = {}) {
 //   --force            Overwrite an existing workflow file without prompting
 //   --stdout           Print the workflow to stdout instead of writing files
 //
-// Free tier: no API call made by init itself. The generated workflow runs
-// against the user's CIPHERWAKE_API_KEY secret (30 free Trust Diff calls/mo).
+// Free tier: no API call made by init itself. The generated workflow meters
+// per repo via GitHub OIDC (100 free Trust Diff calls/mo, no API key needed).
 // =============================================================================
 
 const VALID_FAIL_ON = ["any", "low", "medium", "high", "critical"];
 const VALID_BASELINES = ["last-week", "last-month", "last-scan"];
+
+// R89.LOCAL — `pqcheck stats` reads .cipherwake/stats.json + prints
+// per-check stats. ZERO network requests. Privacy-by-design.
+async function runStatsCommand(args) {
+  const { loadStats, formatStatsTable } = await import(new URL("./statsTracker.js", import.meta.url).href);
+  const stats = await loadStats();
+  console.log(formatStatsTable(stats));
+  console.log("");
+  console.log(color("dim", "Stats are local-only. They never leave your machine. Add .cipherwake/ to .gitignore if you don't want to commit them."));
+}
+
+async function runDismissCommand(args) {
+  const id = args[0];
+  if (!id) {
+    console.error(color("red", "error: pqcheck dismiss requires a check id"));
+    console.error(color("dim", "Usage: pqcheck dismiss route:/admin/ideas    OR    pqcheck dismiss header:Strict-Transport-Security"));
+    process.exit(3);
+  }
+  const { markDismissed } = await import(new URL("./statsTracker.js", import.meta.url).href);
+  const path = await markDismissed(id);
+  if (path) {
+    console.log(color("green", `✓ Marked "${id}" as dismissed-intentional in ${path}`));
+  } else {
+    console.error(color("red", `error: could not persist dismissal for "${id}"`));
+    process.exit(1);
+  }
+}
+
+async function runConfirmCommand(args) {
+  const id = args[0];
+  if (!id) {
+    console.error(color("red", "error: pqcheck confirm requires a check id"));
+    console.error(color("dim", "Usage: pqcheck confirm route:/admin/ideas   — marks as a confirmed real catch (a regression was fixed)"));
+    process.exit(3);
+  }
+  const { markConfirmed } = await import(new URL("./statsTracker.js", import.meta.url).href);
+  const path = await markConfirmed(id);
+  if (path) {
+    console.log(color("green", `✓ Marked "${id}" as confirmed-real in ${path}`));
+  } else {
+    console.error(color("red", `error: could not persist confirmation for "${id}"`));
+    process.exit(1);
+  }
+}
+
+// R89.LOCAL — extract per-check entries from a trust-diff response for
+// stats recording. Records ZERO network requests beyond what the probe
+// already made.
+function extractStatsEntries(routeAssertions) {
+  const entries = [];
+  if (!routeAssertions) return entries;
+  // Route assertions
+  for (const r of routeAssertions.results || []) {
+    entries.push({
+      id: `route:${r.path}`,
+      result: r.passed ? "pass" : "fail",
+      status: r.status,
+      severity: r.severity,
+      source: r.source,
+    });
+  }
+  // Header invariants
+  for (const h of routeAssertions.headerResults || []) {
+    entries.push({
+      id: `header:${h.header}`,
+      result: h.passed ? "pass" : "fail",
+      status: null,
+      severity: h.severity,
+      source: "customer",
+    });
+  }
+  // Cookie invariants
+  for (const c of routeAssertions.cookieResults || []) {
+    entries.push({
+      id: `cookie:${c.namePattern}`,
+      result: c.passed ? "pass" : "fail",
+      status: null,
+      severity: c.severity,
+      source: "customer",
+    });
+  }
+  // Secret scanner findings (each finding is its own check)
+  if (routeAssertions.secrets) {
+    if (routeAssertions.secrets.findings.length === 0 && routeAssertions.secrets.scanned) {
+      entries.push({
+        id: "secret:scan",
+        result: "pass",
+        status: null,
+        severity: "info",
+        source: "secret",
+      });
+    } else {
+      for (const f of routeAssertions.secrets.findings) {
+        entries.push({
+          id: `secret:${f.patternId}`,
+          result: "fail",
+          status: null,
+          severity: f.severity,
+          source: "secret",
+        });
+      }
+    }
+  }
+  // Deploy health
+  if (routeAssertions.deployHealth) {
+    const dh = routeAssertions.deployHealth;
+    // R94.3 — waf_blocked/unreachable are advisory, not gate failures;
+    // recording them as critical would pollute the per-check flake stats.
+    const advisory = dh.status === "waf_blocked" || dh.status === "unreachable";
+    entries.push({
+      id: "health:homepage",
+      result: dh.status === "healthy" ? "pass" : "fail",
+      status: dh.httpStatus,
+      severity: dh.status === "healthy" ? "info" : (advisory ? "low" : "critical"),
+      source: "health",
+    });
+  }
+  // R90 — TLS expiry
+  if (routeAssertions.tlsExpiry && routeAssertions.tlsExpiry.checked) {
+    entries.push({
+      id: "tls:expiry",
+      result: routeAssertions.tlsExpiry.passed ? "pass" : "fail",
+      status: routeAssertions.tlsExpiry.daysRemaining,
+      severity: routeAssertions.tlsExpiry.severity,
+      source: "tls",
+    });
+  }
+  return entries;
+}
+
+// R96 feedback #4 — flake context for the AI guard block. When a check is
+// failing NOW, its local history (.cipherwake/stats.json) tells the agent
+// whether this is a first-ever failure (likely a real regression) or a
+// chronic / previously-dismissed one (likely flake or intentional state).
+// Called BEFORE recordResults() persists this run, so counts describe PRIOR
+// runs only. Silent (returns {}) when nothing is failing or the failing
+// check has no recorded history.
+async function buildFlakeContextFields(routeAssertions) {
+  try {
+    if (!routeAssertions) return {};
+    const failing = [];
+    for (const r of routeAssertions.results || []) {
+      if (!r.passed) failing.push({ id: `route:${r.path}`, path: r.path });
+    }
+    for (const h of routeAssertions.headerResults || []) {
+      if (!h.passed) failing.push({ id: `header:${h.header}` });
+    }
+    for (const c of routeAssertions.cookieResults || []) {
+      if (!c.passed) failing.push({ id: `cookie:${c.namePattern}` });
+    }
+    for (const f of routeAssertions.secrets?.findings || []) {
+      failing.push({ id: `secret:${f.patternId}` });
+    }
+    if (routeAssertions.deployHealth && routeAssertions.deployHealth.status !== "healthy") {
+      failing.push({ id: "health:homepage" });
+    }
+    if (routeAssertions.tlsExpiry?.checked && !routeAssertions.tlsExpiry.passed) {
+      failing.push({ id: "tls:expiry" });
+    }
+    if (failing.length === 0) return {};
+    // Prefer the check behind the top critical failure so these fields
+    // describe the same issue as assertion_top_failure.
+    const topCriticalPath = routeAssertions.criticalFailures?.[0]?.path;
+    const top = (topCriticalPath && failing.find((f) => f.path === topCriticalPath)) || failing[0];
+    const { loadStats } = await import(new URL("./statsTracker.js", import.meta.url).href);
+    const stats = await loadStats();
+    const s = stats.checks?.[top.id];
+    if (!s || !s.runs) return {};
+    let hint;
+    if (s.dismissedIntentional > 0) hint = "previously_dismissed";
+    else if (s.failed === 0) hint = "first_failure";
+    else if (s.runs >= 3 && s.failed / s.runs >= 0.5) hint = "frequently_failing";
+    else hint = "recurring";
+    const parts = [`failed ${s.failed} of ${s.runs} prior runs`];
+    if (s.dismissedIntentional > 0) parts.push(`dismissed as intentional ${s.dismissedIntentional}x`);
+    if (s.confirmedReal > 0) parts.push(`confirmed real ${s.confirmedReal}x`);
+    return {
+      top_failure_id: top.id,
+      top_failure_history: parts.join("; "),
+      flake_hint: hint,
+    };
+  } catch {
+    // never block the gate on stats issues
+    return {};
+  }
+}
 
 async function runInitCommand(args) {
   const fs = await import("node:fs/promises");
@@ -4527,6 +5625,20 @@ async function runInitCommand(args) {
   const flagDomain = readFlagValue(args, "--domain");
   const flagFailOn = readFlagValue(args, "--fail-on");
   const flagBaseline = readFlagValue(args, "--baseline");
+  // R94.3 (2026-06-08) — stable-track default flipped to opt-in.
+  // `push:main` is back-compat-safe for every platform (including
+  // custom CD scripts + manual rollouts). `deployment-status` is the
+  // smart Vercel/Netlify trigger (recommended, R93) but only fires
+  // when a real `deployment_status` event arrives, which means
+  // someone on a non-deployment-event platform gets ZERO runs.
+  // Default is now `push` so initial install never silently does
+  // nothing; explicit `--trigger=deployment-status` for Vercel/Netlify.
+  const flagTrigger = readFlagValue(args, "--trigger") || "push";
+  if (!["push", "deployment-status", "deployment_status"].includes(flagTrigger)) {
+    console.error(color("red", `error: --trigger must be 'push' (default) or 'deployment-status'`));
+    process.exit(1);
+  }
+  const triggerMode = flagTrigger === "deployment_status" ? "deployment-status" : flagTrigger;
 
   console.log("");
   console.log(`  ${color("bold", "pqcheck init")} ${color("dim", "— scaffold a Cipherwake GitHub Action workflow")}`);
@@ -4566,7 +5678,7 @@ async function runInitCommand(args) {
     process.exit(1);
   }
 
-  const workflow = renderTrustDiffWorkflow({ domain, failOn, baseline });
+  const workflow = renderTrustDiffWorkflow({ domain, failOn, baseline, triggerMode });
 
   if (stdout) {
     console.log(workflow);
@@ -4614,20 +5726,33 @@ async function runInitCommand(args) {
   const relPath = path.relative(cwd, workflowPath);
   console.log("");
   console.log(color("green", `  ✓ Wrote ${relPath}`));
+
+  // R96 (dogfood feedback #2) — persist the domain so deploy-check/guard
+  // can default to it on subsequent runs without a domain argument.
+  try {
+    const cfgResult = await writeDomainToCipherwakeConfig(domain);
+    if (cfgResult.status === "created") {
+      console.log(color("green", `  ✓ Wrote .cipherwake.json (domain: ${domain} — deploy-check/guard can now omit the domain argument)`));
+    } else if (cfgResult.status === "merged") {
+      console.log(color("green", `  ✓ Added "domain": "${domain}" to .cipherwake.json`));
+    } else if (cfgResult.status === "updated") {
+      console.log(color("green", `  ✓ Updated .cipherwake.json domain: ${cfgResult.prior} → ${domain}`));
+    } else if (cfgResult.status === "skipped-malformed" || cfgResult.status === "skipped-unexpected-shape") {
+      console.log(color("yellow", `  ⚠ .cipherwake.json could not be updated (${cfgResult.status === "skipped-malformed" ? "malformed JSON" : "not a JSON object"}) — add "domain": "${domain}" by hand`));
+    }
+  } catch (err) {
+    console.log(color("yellow", `  ⚠ .cipherwake.json domain write failed: ${err.message} (non-fatal)`));
+  }
   console.log("");
   console.log(`  ${color("bold", "Next steps:")}`);
   console.log("");
-  console.log(`  ${color("dim", "1.")} Generate a Cipherwake API key at ${color("violet", "https://cipherwake.io/account#api-keys")}`);
-  console.log(`     ${color("dim", "Free tier: 100 Trust Diff calls/month per repo")}`);
-  console.log("");
-  console.log(`  ${color("dim", "2.")} Add it as a repo secret:`);
-  console.log(`     ${color("dim", "Settings → Secrets and variables → Actions → New repository secret")}`);
-  console.log(`     ${color("dim", "Name: CIPHERWAKE_API_KEY")}`);
-  console.log("");
-  console.log(`  ${color("dim", "3.")} Commit + push:`);
+  console.log(`  ${color("dim", "1.")} Commit + push — no API key or repo secret needed:`);
+  console.log(`     ${color("dim", "The workflow meters per repo via GitHub OIDC (Free: 100 Trust Diff calls/month).")}`);
   console.log(`     ${color("dim", "$")} git add ${relPath}`);
   console.log(`     ${color("dim", "$")} git commit -m "ci: add Cipherwake Trust Diff gate"`);
   console.log(`     ${color("dim", "$")} git push`);
+  console.log("");
+  console.log(`  ${color("dim", "2.")} ${color("dim", "Optional — higher limits:")} add a key from ${color("violet", "https://cipherwake.io/account#api-keys")} as the CIPHERWAKE_API_KEY repo secret.`);
   console.log("");
   console.log(`  Open a PR to see the gate run.`);
   console.log("");
@@ -4635,6 +5760,13 @@ async function runInitCommand(args) {
 }
 
 function readFlagValue(args, name) {
+  // `--flag=value` form first (documented syntax for `init --trigger=...`),
+  // then the space-separated `--flag value` form.
+  for (const tok of args) {
+    if (typeof tok === "string" && tok.startsWith(`${name}=`)) {
+      return tok.slice(name.length + 1) || null;
+    }
+  }
   const idx = args.indexOf(name);
   if (idx === -1) return null;
   const v = args[idx + 1];
@@ -4647,12 +5779,59 @@ function isValidBaseline(value) {
   return /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?(\.\d+)?Z?)?$/.test(value);
 }
 
-function renderTrustDiffWorkflow({ domain, failOn, baseline }) {
+function renderTrustDiffWorkflow({ domain, failOn, baseline, triggerMode = "push" }) {
+  const isDeploymentStatus = triggerMode === "deployment-status";
+
+  // The trigger YAML block + job-level `if:` guard differ between modes.
+  // push (default, back-compat): fires on every push to main. Safe for any
+  //   platform but can race git-integrated deploys (Vercel/Netlify).
+  // deployment-status (--trigger=deployment-status): fires AFTER a successful
+  //   Production deploy. Race-safe for Vercel/Netlify/Render/Railway. Does
+  //   nothing on platforms that don't emit the event (custom CD scripts).
+  const triggerBlock = isDeploymentStatus
+    ? `on:
+  pull_request:
+    branches: [main]
+  deployment_status:`
+    : `on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]`;
+
+  const jobGuard = isDeploymentStatus
+    ? `    # Run on PRs OR on successful Production deployments.
+    if: |
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'deployment_status' &&
+       github.event.deployment_status.state == 'success' &&
+       (github.event.deployment.environment == 'production' ||
+        github.event.deployment.environment == 'Production'))`
+    : `    # Runs on PRs (advisory) and pushes to main (gate).`;
+
+  const triggerNote = isDeploymentStatus
+    ? `# Trigger: deployment_status (--trigger=deployment-status). The job fires
+# AFTER a successful Production deployment, so trust-diff sees the surface
+# that actually shipped — not the stale prior production. Recommended for
+# Vercel / Netlify / Render / Railway and other git-integrated platforms.
+# Switch to 'push' if your platform does NOT emit deployment_status events
+# (custom CD scripts, S3-sync deploys, manual rollouts).`
+    : `# Trigger: push to main (default). Back-compat-safe on every platform.
+# If you're on Vercel / Netlify / Render / Railway, switch to
+# \`--trigger=deployment-status\` — the post-deploy gate is more accurate
+# because the push:main trigger can race git-integrated deploys, diffing
+# the previous production surface before the new one is live.`;
+
   return `# Cipherwake — Trust Diff gate
 # Generated by \`pqcheck init\` (v${VERSION}).
-# Runs on every PR and pushes to main: fails the build if your public trust
-# posture regresses vs the baseline (cert / SPKI / vendor scripts / HSTS / CSP /
-# DMARC / HNDL).
+# Runs:
+#   - on every PR (advisory diff against the production baseline)
+#   - on every push to main / successful Production deployment (gate)
+# Fails the build if your public trust posture regresses vs the baseline
+# (cert / SPKI / vendor scripts / HSTS / CSP / DMARC / HNDL / declared
+# route assertions).
+#
+${triggerNote}
 #
 # Free tier: 100 Trust Diff calls/month per repo (OIDC-metered).
 # Methodology: https://cipherwake.io/methodology/
@@ -4660,11 +5839,7 @@ function renderTrustDiffWorkflow({ domain, failOn, baseline }) {
 
 name: Cipherwake Trust Diff
 
-on:
-  pull_request:
-    branches: [main]
-  push:
-    branches: [main]
+${triggerBlock}
 
 permissions:
   contents: read
@@ -4675,6 +5850,7 @@ permissions:
 jobs:
   trust-diff:
     runs-on: ubuntu-latest
+${jobGuard}
     steps:
       - name: Run Cipherwake Trust Diff
         uses: cipherwakelabs/pqcheck@v4
@@ -4720,14 +5896,25 @@ async function prompt(question) {
 
 async function runDeployCheckCommand(args) {
   const positional = args.filter((a) => !a.startsWith("-"));
+  let forwarded = [...args];
   if (positional.length === 0) {
-    console.error(color("red", "error: pqcheck deploy-check requires a domain"));
-    console.error(color("dim", "Usage: npx pqcheck deploy-check <domain> [--baseline last-scan|last-week|<ISO>] [--fail-on high|medium|low|any]"));
-    process.exit(1);
+    // R96 (dogfood feedback #2) — no domain argument: fall back to the
+    // `domain` field in .cipherwake.json (written by `pqcheck setup`/`init`)
+    // so AI coders can run `npx pqcheck deploy-check --ai` without guessing
+    // which domain this repo deploys to.
+    const cfgDomain = await readCipherwakeConfigDomain();
+    if (cfgDomain) {
+      console.error(color("dim", `  ℹ no domain argument — using "${cfgDomain}" from .cipherwake.json`));
+      forwarded = [cfgDomain, ...forwarded];
+    } else {
+      console.error(color("red", "error: pqcheck deploy-check requires a domain"));
+      console.error(color("dim", "Usage: npx pqcheck deploy-check <domain> [--baseline last-scan|last-week|<ISO>] [--fail-on high|medium|low|any]"));
+      console.error(color("dim", `Tip: run \`npx pqcheck setup --auto --domain <domain>\` once and the domain is saved to .cipherwake.json — after that, plain \`npx pqcheck deploy-check --ai\` works.`));
+      process.exit(1);
+    }
   }
 
   // Forward to trust-diff with deploy-tuned defaults if the user didn't specify.
-  const forwarded = [...args];
   if (!args.includes("--baseline")) forwarded.push("--baseline", "last-scan");
   if (!args.includes("--fail-on")) forwarded.push("--fail-on", "high");
 
@@ -4741,7 +5928,296 @@ async function runDeployCheckCommand(args) {
     console.log("");
   }
 
-  return runTrustDiffCommand(forwarded);
+  return runTrustDiffCommand(forwarded, { deployCheck: true });
+}
+
+// =============================================================================
+// `pqcheck last` — reuse the most recent gate result instead of re-scanning
+// =============================================================================
+// R96 (dogfood feedback #3). After CI already ran the deploy gate, an AI
+// coder following the protocol shouldn't burn a duplicate Trust Diff quota
+// call just to learn "the gate already passed." Two sources:
+//
+//   pqcheck last [domain]   — local state files written by every scan /
+//                             deploy-check: .cipherwake/last-status.json
+//                             (repo-local) else ~/.config/cipherwake/last-scan.json
+//   pqcheck last --remote   — the latest GitHub Actions run of the
+//                             cipherwake.yml workflow for this repo (the CI
+//                             gate installed by `pqcheck init`/`setup`).
+//                             Public GitHub API; GITHUB_TOKEN/GH_TOKEN used
+//                             when set. ZERO Trust Diff quota consumed.
+//
+// Honesty guards — a cached result can only bless an announce when it is
+// genuinely equivalent to running the check now:
+//   • older than --max-age (default 60 min) → NOT reusable
+//   • CI run for a different commit than local HEAD → NOT reusable
+//   • CI still running / cancelled → NOT reusable
+// A failed CI run IS surfaced as review (conservative direction is safe).
+//
+// Exit codes (agent routing contract):
+//   0 = reusable result, gate passed — safe to skip the duplicate deploy-check
+//   1 = last result was review · 2 = block (fresh enough to trust as signal)
+//   3 = no reusable signal — run `npx pqcheck deploy-check --ai` instead
+// =============================================================================
+
+async function runLastCommand(args) {
+  const aiMode = parseAiMode(args);
+  const remote = args.includes("--remote");
+  const maxAgeRaw = parseFlag(args, "--max-age");
+  const maxAgeMin = maxAgeRaw === null || maxAgeRaw === undefined ? 60 : Number(maxAgeRaw);
+  if (!Number.isFinite(maxAgeMin) || maxAgeMin <= 0) {
+    console.error(color("red", "error: --max-age requires a positive number of minutes"));
+    process.exit(3);
+  }
+  const positional = args.filter((a) => !a.startsWith("-") && !isFlagValue(args, a));
+  const domainFilter = positional[0] ? normalizeDomain(positional[0]) : await readCipherwakeConfigDomain();
+
+  // Shared emitter: human lines + optional AI block + routing exit code.
+  // exitCode 3 = "no reusable signal" — the block still says ship_decision=
+  // review (fail-safe: agent must run the real check, never assume pass).
+  const finish = ({ shipDecision, exitCode, fields, humanLines }) => {
+    console.log("");
+    for (const l of humanLines) console.log(l);
+    if (aiMode) {
+      console.log(formatAiFooterBlock({
+        status: shipDecision,
+        kind: "last",
+        ...fields,
+        ship_decision: shipDecision,
+        reusable: exitCode === 3 ? "false" : "true",
+        max_age_minutes: maxAgeMin,
+        advisory_only: "true",
+        note: exitCode === 3
+          ? "No reusable result. Run: npx pqcheck deploy-check --ai"
+          : "Cached gate result. Exit 0 = CI/last check passed and covers the current state; re-run deploy-check after any new deploy.",
+        checked_at: new Date().toISOString(),
+      }));
+    }
+    console.log("");
+    process.exit(exitCode);
+  };
+
+  // ---------------------------------------------------------------------------
+  // --remote: latest cipherwake.yml GitHub Actions run for this repo
+  // ---------------------------------------------------------------------------
+  if (remote) {
+    const { execFile } = await import("node:child_process");
+    const git = (gitArgs) => new Promise((resolve) => {
+      execFile("git", gitArgs, { timeout: 5000 }, (err, stdout) => resolve(err ? null : String(stdout).trim()));
+    });
+    const originUrl = await git(["remote", "get-url", "origin"]);
+    if (!originUrl) {
+      return finish({
+        shipDecision: "review", exitCode: 3,
+        fields: { source: "github_actions", top_issue: "no_git_origin" },
+        humanLines: [color("red", "  ✗ pqcheck last --remote needs a git repo with an `origin` remote"), color("dim", "    Run inside the repo whose CI gate you want to read.")],
+      });
+    }
+    const m = originUrl.match(/github\.com[:/]([^/\s]+)\/([^/\s]+?)(?:\.git)?$/);
+    if (!m) {
+      return finish({
+        shipDecision: "review", exitCode: 3,
+        fields: { source: "github_actions", top_issue: "origin_not_github" },
+        humanLines: [color("red", `  ✗ --remote currently reads GitHub Actions only (origin: ${originUrl})`)],
+      });
+    }
+    const owner = m[1];
+    const repo = m[2];
+    const branch = await git(["rev-parse", "--abbrev-ref", "HEAD"]);
+    const localSha = await git(["rev-parse", "HEAD"]);
+
+    const branchParam = branch && branch !== "HEAD" ? `&branch=${encodeURIComponent(branch)}` : "";
+    const apiUrl = `https://api.github.com/repos/${owner}/${repo}/actions/workflows/cipherwake.yml/runs?per_page=1${branchParam}`;
+    const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || "";
+    let resp;
+    try {
+      const ctrl = new AbortController();
+      const tmr = setTimeout(() => ctrl.abort(), 10000);
+      resp = await fetch(apiUrl, {
+        headers: {
+          accept: "application/vnd.github+json",
+          "user-agent": `pqcheck/${VERSION}`,
+          ...(token ? { authorization: `Bearer ${token}` } : {}),
+        },
+        signal: ctrl.signal,
+      });
+      clearTimeout(tmr);
+    } catch (err) {
+      return finish({
+        shipDecision: "review", exitCode: 3,
+        fields: { source: "github_actions", top_issue: "github_api_unreachable" },
+        humanLines: [color("red", `  ✗ GitHub API unreachable: ${err?.message || err}`)],
+      });
+    }
+    if (resp.status === 404) {
+      return finish({
+        shipDecision: "review", exitCode: 3,
+        fields: { source: "github_actions", top_issue: "no_cipherwake_workflow", repo: `${owner}/${repo}` },
+        humanLines: [
+          color("yellow", `  ⊝ ${owner}/${repo} has no cipherwake.yml workflow on GitHub`),
+          color("dim", "    Install the CI gate: npx pqcheck init --domain <domain>  (then commit + push)"),
+        ],
+      });
+    }
+    if (!resp.ok) {
+      return finish({
+        shipDecision: "review", exitCode: 3,
+        fields: { source: "github_actions", top_issue: `github_api_http_${resp.status}` },
+        humanLines: [
+          color("red", `  ✗ GitHub API returned HTTP ${resp.status}`),
+          ...(resp.status === 403 && !token ? [color("dim", "    Likely the anonymous rate limit (60/hr per IP) or a private repo — set GITHUB_TOKEN and retry.")] : []),
+        ],
+      });
+    }
+    const data = await resp.json().catch(() => null);
+    const run = data?.workflow_runs?.[0];
+    if (!run) {
+      return finish({
+        shipDecision: "review", exitCode: 3,
+        fields: { source: "github_actions", top_issue: "no_workflow_runs", repo: `${owner}/${repo}` },
+        humanLines: [color("yellow", `  ⊝ cipherwake.yml exists but has no runs${branchParam ? ` on branch ${branch}` : ""} yet — push to trigger one`)],
+      });
+    }
+
+    const ranAt = Date.parse(run.updated_at || run.run_started_at || "");
+    const ageMin = Number.isFinite(ranAt) ? Math.round((Date.now() - ranAt) / 60000) : null;
+    const stale = ageMin === null || ageMin > maxAgeMin;
+    const shaMatch = !!(localSha && run.head_sha && run.head_sha === localSha);
+    const shortSha = String(run.head_sha || "").slice(0, 7);
+    const baseFields = {
+      source: "github_actions",
+      ...(domainFilter ? { domain: domainFilter } : {}),
+      repo: `${owner}/${repo}`,
+      ci_status: run.status,
+      ci_conclusion: run.conclusion || "",
+      head_sha: run.head_sha || "",
+      head_sha_match: shaMatch ? "true" : "false",
+      age_minutes: ageMin ?? "unknown",
+      stale: stale ? "true" : "false",
+      run_url: run.html_url || "",
+    };
+    const headerLines = [
+      `  ${color("bold", "◆ Cipherwake — last CI gate result")} ${color("dim", `(${owner}/${repo} · cipherwake.yml)`)}`,
+      `  ${color("dim", `Run: ${run.status}${run.conclusion ? ` / ${run.conclusion}` : ""} · commit ${shortSha}${shaMatch ? " (matches local HEAD)" : localSha ? ` (local HEAD is ${localSha.slice(0, 7)} — DIFFERENT)` : ""} · ${ageMin ?? "?"}m ago`)}`,
+      `  ${color("dim", `URL: ${run.html_url || "?"}`)}`,
+    ];
+
+    if (run.status !== "completed") {
+      return finish({
+        shipDecision: "review", exitCode: 3,
+        fields: { ...baseFields, top_issue: "ci_run_in_progress" },
+        humanLines: [...headerLines, color("yellow", "  ⚠ CI run still in progress — wait for it, or run deploy-check directly")],
+      });
+    }
+    if (run.conclusion === "failure") {
+      // Conservative direction: a failed gate is a trustworthy "do not
+      // announce" signal even when stale or for a different commit.
+      return finish({
+        shipDecision: "review", exitCode: 1,
+        fields: { ...baseFields, top_issue: "ci_gate_failed" },
+        humanLines: [...headerLines, color("yellow", "  ⚠ REVIEW — the CI deploy gate FAILED on its last run. Inspect the run before announcing anything.")],
+      });
+    }
+    if (run.conclusion !== "success") {
+      return finish({
+        shipDecision: "review", exitCode: 3,
+        fields: { ...baseFields, top_issue: `ci_run_${run.conclusion || "unknown"}` },
+        humanLines: [...headerLines, color("yellow", `  ⊝ CI run ended "${run.conclusion}" — no reusable verdict`)],
+      });
+    }
+    if (stale) {
+      return finish({
+        shipDecision: "review", exitCode: 3,
+        fields: { ...baseFields, top_issue: "ci_result_stale" },
+        humanLines: [...headerLines, color("yellow", `  ⊝ CI gate passed but ${ageMin ?? "?"}m ago exceeds --max-age ${maxAgeMin}m — run a fresh deploy-check`)],
+      });
+    }
+    if (!shaMatch) {
+      return finish({
+        shipDecision: "review", exitCode: 3,
+        fields: { ...baseFields, top_issue: "ci_result_for_different_commit" },
+        humanLines: [...headerLines, color("yellow", "  ⊝ CI gate passed, but for a different commit than your local HEAD — its verdict doesn't cover your changes")],
+      });
+    }
+    return finish({
+      shipDecision: "pass", exitCode: 0,
+      fields: { ...baseFields, top_issue: "none" },
+      humanLines: [...headerLines, color("green", "  ✓ PASS — CI deploy gate passed on this exact commit within the freshness window. Safe to reuse; no duplicate deploy-check needed.")],
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Local: state files written by every scan / deploy-check
+  // ---------------------------------------------------------------------------
+  const fs = await import("node:fs/promises");
+  const path = await import("node:path");
+  const os = await import("node:os");
+  const candidates = [
+    { source: "repo_state", file: path.join(process.cwd(), ".cipherwake", "last-status.json") },
+    { source: "user_state", file: path.join(os.homedir(), ".config", "cipherwake", "last-scan.json") },
+  ];
+  let state = null;
+  let source = null;
+  let stateFile = null;
+  for (const c of candidates) {
+    try {
+      const parsed = JSON.parse(await fs.readFile(c.file, "utf8"));
+      if (domainFilter && normalizeDomain(String(parsed?.domain || "")) !== domainFilter) continue;
+      state = parsed;
+      source = c.source;
+      stateFile = c.file;
+      break;
+    } catch { /* missing or malformed — try next source */ }
+  }
+
+  if (!state) {
+    return finish({
+      shipDecision: "review", exitCode: 3,
+      fields: { source: "local_state", ...(domainFilter ? { domain: domainFilter } : {}), top_issue: "no_recent_result" },
+      humanLines: [
+        `  ${color("bold", "◆ Cipherwake — last result")}`,
+        color("yellow", `  ⊝ no local result found${domainFilter ? ` for ${domainFilter}` : ""}`),
+        color("dim", "    Run: npx pqcheck deploy-check --ai   (or `pqcheck last --remote` to read the CI gate)"),
+      ],
+    });
+  }
+
+  const writtenAt = Date.parse(state.written_at || "");
+  const ageMin = Number.isFinite(writtenAt) ? Math.round((Date.now() - writtenAt) / 60000) : null;
+  const stale = ageMin === null || ageMin > maxAgeMin;
+  const storedShip = ["pass", "review", "block"].includes(state.ship_decision) ? state.ship_decision : "review";
+  const fields = {
+    source,
+    domain: state.domain || domainFilter || "",
+    last_kind: state.kind || "",
+    last_ship_decision: storedShip,
+    ...(typeof state.score === "number" ? { dbr: state.score.toFixed(1) } : {}),
+    ...(state.grade ? { grade: state.grade } : {}),
+    ...(state.top_issue ? { last_top_issue: state.top_issue } : {}),
+    age_minutes: ageMin ?? "unknown",
+    stale: stale ? "true" : "false",
+    state_file: stateFile,
+  };
+  const headerLines = [
+    `  ${color("bold", "◆ Cipherwake — last result")} ${color("dim", `(${source === "repo_state" ? ".cipherwake/last-status.json" : "~/.config/cipherwake/last-scan.json"})`)}`,
+    `  ${color("dim", `Domain: ${state.domain || "?"} · kind: ${state.kind || "?"} · ship_decision: ${storedShip} · ${ageMin ?? "?"}m ago`)}`,
+  ];
+  if (stale) {
+    return finish({
+      shipDecision: "review", exitCode: 3,
+      fields: { ...fields, top_issue: "stale_result" },
+      humanLines: [...headerLines, color("yellow", `  ⊝ result is ${ageMin ?? "?"}m old — exceeds --max-age ${maxAgeMin}m. Run a fresh deploy-check.`)],
+    });
+  }
+  const marker = storedShip === "pass" ? color("green", "  ✓ PASS — last check passed within the freshness window.")
+    : storedShip === "review" ? color("yellow", "  ⚠ REVIEW — last check flagged a change. Surface it to the user before announcing.")
+    : color("red", "  ✗ BLOCK — last check returned block. Do not announce.");
+  return finish({
+    shipDecision: storedShip,
+    exitCode: shipDecisionExitCode(storedShip),
+    fields: { ...fields, top_issue: state.top_issue || "none" },
+    humanLines: [...headerLines, marker],
+  });
 }
 
 // =============================================================================
@@ -5279,7 +6755,7 @@ async function runOnboardCommand(args) {
   console.log(`     ${color("dim", "$")} git push`);
   console.log("");
   console.log(`  ${color("dim", "2.")} ${color("bold", "Open a PR")}`);
-  console.log(`     ${color("dim", "Cipherwake will comment inline within ~60s of the workflow firing. The action uses GitHub OIDC to meter usage per repo (Free = 30 calls/mo).")}`);
+  console.log(`     ${color("dim", "Cipherwake will comment inline within ~60s of the workflow firing. The action uses GitHub OIDC to meter usage per repo (Free = 100 calls/mo).")}`);
   console.log("");
   // R48 (post-R47 review MAJOR #6): the /account → "Linked repos" UI is
   // not yet shipped (out of R47 scope). Pointing users to a nonexistent
@@ -5311,48 +6787,6 @@ function buildReleaseChecklistMarkdown(domain) {
   return renderReleaseChecklist(domain, { generator: "onboard" });
 }
 
-// Cross-platform browser launcher. Returns true if a launcher binary
-// dispatched successfully; false if no launcher is available (e.g. headless
-// server, sandboxed CI, broken xdg-open config).
-//
-// R41 fix #2 (locked 2026-05-16): use exit-event detection + longer timeout
-// so we don't falsely claim "(opened in your browser)" when xdg-open is
-// installed but the launcher exits non-zero (no graphical session, no
-// MIME handler). Previously a flat 200ms timeout resolved true even when
-// the launcher exited 3 because no display was available.
-async function tryOpenBrowser(url) {
-  if (process.env.CI || process.env.CIPHERWAKE_NO_BROWSER) return false;
-  const { spawn } = await import("node:child_process");
-  const platform = process.platform;
-  let cmd, cmdArgs;
-  if (platform === "darwin") {
-    cmd = "open"; cmdArgs = [url];
-  } else if (platform === "win32") {
-    cmd = "cmd"; cmdArgs = ["/c", "start", "", url];
-  } else {
-    cmd = "xdg-open"; cmdArgs = [url];
-  }
-  return await new Promise((resolve) => {
-    let settled = false;
-    let p;
-    try {
-      p = spawn(cmd, cmdArgs, { stdio: "ignore", detached: true });
-    } catch {
-      resolve(false);
-      return;
-    }
-    p.on("error", () => { if (!settled) { settled = true; resolve(false); } });
-    p.on("exit", (code) => { if (!settled) { settled = true; resolve(code === 0); } });
-    p.unref();
-    // Belt-and-suspenders: if the launcher takes >1s to exit AND no error
-    // event has fired, assume it dispatched and went detached (open on
-    // macOS does this — returns after AppleScript-asking Finder/Safari).
-    setTimeout(() => {
-      if (!settled) { settled = true; resolve(true); }
-    }, 1000);
-  });
-}
-
 // =============================================================================
 // `pqcheck guard --domain X -- <deploy command>` — wrapper command
 // =============================================================================
@@ -5378,15 +6812,24 @@ async function runGuardCommand(args) {
   const ourArgs = sepIdx >= 0 ? args.slice(0, sepIdx) : args;
   const deployCmd = sepIdx >= 0 ? args.slice(sepIdx + 1) : [];
 
-  const domain = parseFlag(ourArgs, "--domain");
+  let domain = parseFlag(ourArgs, "--domain");
   const gateMode = parseFlag(ourArgs, "--gate-mode") || "balanced";
   const bypassReason = parseFlag(ourArgs, "--bypass");
   const noPostCheck = ourArgs.includes("--no-post-check");
 
   if (!domain) {
+    // R96 (dogfood feedback #2) — fall back to the `domain` field in
+    // .cipherwake.json (written by `pqcheck setup`/`init`).
+    domain = await readCipherwakeConfigDomain();
+    if (domain) {
+      console.error(color("dim", `  ℹ no --domain flag — using "${domain}" from .cipherwake.json`));
+    }
+  }
+  if (!domain) {
     console.error(color("red", "error: pqcheck guard requires --domain"));
     console.error(color("dim", "Usage: npx pqcheck guard --domain example.com -- <deploy command>"));
     console.error(color("dim", "Example: npx pqcheck guard --domain example.com -- vercel deploy --prod"));
+    console.error(color("dim", "Tip: run `npx pqcheck setup --auto --domain <domain>` once and the domain is saved to .cipherwake.json — after that, `npx pqcheck guard -- <deploy-cmd>` works without the flag."));
     process.exit(3);
   }
   if (deployCmd.length === 0) {
@@ -5463,7 +6906,15 @@ async function runGuardCommand(args) {
   console.log(color("bold", `  Pre-deploy check returned: ship_decision=${shipDecision}`));
 
   // Decide what to do.
-  if (shipDecision === "pass") {
+  if (gateMode === "advisory" && shipDecision !== "pass") {
+    // R96 — advisory mode promises "deploy never blocked", but --fail-on
+    // none only downgrades FINDINGS-driven decisions; an assertion-driven
+    // block (deploy unreachable, WAF) still arrived here as block/review
+    // and hit process.exit below. Advisory means advisory: warn + proceed.
+    console.log(color("yellow", `  ⚠ Advisory mode: ship_decision=${shipDecision} noted — proceeding with deploy anyway.`));
+    console.log(color("dim", "  Review the findings above. Advisory mode never blocks the deploy."));
+    console.log("");
+  } else if (shipDecision === "pass") {
     console.log(color("green", "  ✓ Posture stable — running deploy command."));
     console.log("");
   } else if (shipDecision === "review") {
@@ -5586,6 +7037,15 @@ Cipherwake deploy check and route on the result.
 Reference: https://cipherwake.io/methodology/ai-coder-protocol
 `;
 
+// R96 (dogfood feedback #2) — fill the <your-domain> placeholders with the
+// real monitored domain when known. A protocol block reading `deploy-check
+// cipherwake.io --ai` is directly executable by the AI coder; the literal
+// `<your-domain>` placeholder forced every AI session to guess or ask.
+function renderProtocolText(domain) {
+  if (!domain) return AI_CODER_PROTOCOL_TEXT;
+  return AI_CODER_PROTOCOL_TEXT.replaceAll("<your-domain>", domain);
+}
+
 async function runProtocolCommand(args) {
   const sub = args[0];
   if (sub !== "install") {
@@ -5632,6 +7092,21 @@ async function runProtocolCommand(args) {
     process.exit(3);
   }
 
+  // R96 — resolve the monitored domain (--domain flag, else .cipherwake.json)
+  // so the installed protocol text carries the real domain instead of the
+  // <your-domain> placeholder.
+  let protocolDomain = null;
+  const domainFlag = parseFlag(args, "--domain");
+  if (domainFlag) {
+    const d = normalizeDomain(domainFlag);
+    if (isValidDomain(d)) {
+      protocolDomain = d;
+    } else {
+      console.error(color("yellow", `⚠ --domain "${domainFlag}" is not a valid hostname — protocol will keep the <your-domain> placeholder`));
+    }
+  }
+  if (!protocolDomain) protocolDomain = await readCipherwakeConfigDomain();
+
   // Detect candidate files across major AI coders that:
   //   (a) read an instructions file at session start, AND
   //   (b) can run shell commands (so they can actually invoke pqcheck).
@@ -5669,6 +7144,10 @@ async function runProtocolCommand(args) {
     if (consentPhrase) console.log(color("dim", `Consent phrase: "${consentPhrase}"`));
     console.log("");
   }
+  if (protocolDomain) {
+    console.log(color("dim", `Domain: ${protocolDomain} — the protocol's <your-domain> placeholders will be filled in.`));
+    console.log("");
+  }
   console.log("Here's what would be added:");
   console.log("");
   if (detected.length === 0) {
@@ -5690,7 +7169,17 @@ async function runProtocolCommand(args) {
     }
     detected.push({ label: useGlobal ? "Claude Code (will create global)" : "Claude Code (will create project)", path: fallbackPath });
   }
+  // R96 — Claude Code reads BOTH ~/.claude/CLAUDE.md and ./CLAUDE.md, so
+  // installing to both duplicates ~40 lines in every session's context.
+  // When the global file is a target, the project CLAUDE.md is skipped.
+  const globalClaudeMdPath = path.join(os.homedir(), ".claude", "CLAUDE.md");
+  const projectClaudeMdPath = path.join(process.cwd(), "CLAUDE.md");
+  const globalClaudeMdDetected = detected.some((d) => d.path === globalClaudeMdPath);
   for (const d of detected) {
+    if (globalClaudeMdDetected && d.path === projectClaudeMdPath) {
+      console.log(`  • ${color("dim", `Skip ${d.path} — covered by the global Claude Code install (Claude Code reads both files; one copy is enough)`)}`);
+      continue;
+    }
     console.log(`  • Append a ~30-line "## Pre-deploy verification with Cipherwake" section to ${color("bold", d.path)}`);
     console.log(`    ${color("dim", `(${d.label} — existing content preserved)`)}`);
   }
@@ -5699,7 +7188,7 @@ async function runProtocolCommand(args) {
   // --manual → print only, no install
   if (manualFlag) {
     console.log(color("bold", "── Cipherwake AI Coder Protocol — paste this into your AI coder's instructions ──"));
-    console.log(AI_CODER_PROTOCOL_TEXT);
+    console.log(renderProtocolText(protocolDomain));
     console.log(color("bold", "── End of protocol ──"));
     console.log("");
     console.log(color("dim", `For target files, see: ${detected.map(d => d.path).join(", ")}`));
@@ -5714,6 +7203,7 @@ async function runProtocolCommand(args) {
       mode: "auto-flag",
       consent_phrase: consentPhrase,
       invoked_by: invokedBy,
+      domain: protocolDomain,
       fs, path, os,
     });
   }
@@ -5752,7 +7242,7 @@ async function runProtocolCommand(args) {
   if (choice === "m" || choice === "manual") {
     console.log("");
     console.log(color("bold", "── Cipherwake AI Coder Protocol — paste this into your AI coder's instructions ──"));
-    console.log(AI_CODER_PROTOCOL_TEXT);
+    console.log(renderProtocolText(protocolDomain));
     console.log(color("bold", "── End of protocol ──"));
     console.log("");
     console.log(color("dim", `For target files, see: ${detected.map(d => d.path).join(", ")}`));
@@ -5764,6 +7254,7 @@ async function runProtocolCommand(args) {
       mode: "interactive",
       consent_phrase: "user typed [a] at the install prompt",
       invoked_by: "human-at-terminal",
+      domain: protocolDomain,
       fs, path, os,
     });
   }
@@ -5776,8 +7267,22 @@ async function runProtocolCommand(args) {
 // Writes the protocol to each detected file and records the audit trail.
 async function performAutoInstall(detected, opts) {
   const { fs, path, os } = opts;
+  const protocolText = renderProtocolText(opts.domain || null);
   const results = [];
+  // R96 — cross-file dedupe: Claude Code reads BOTH ~/.claude/CLAUDE.md and
+  // ./CLAUDE.md. Once the global file carries the protocol (pre-existing or
+  // installed earlier in this loop — global is first in the candidates
+  // order), the project CLAUDE.md is skipped instead of duplicating ~40
+  // lines into every session's context.
+  const globalClaudeMdPath = path.join(os.homedir(), ".claude", "CLAUDE.md");
+  const projectClaudeMdPath = path.join(process.cwd(), "CLAUDE.md");
+  let globalClaudeMdCovered = false;
   for (const d of detected) {
+    if (d.path === projectClaudeMdPath && globalClaudeMdCovered) {
+      console.log(color("dim", `  ⊝ ${d.path} — covered by the global Claude Code install (~/.claude/CLAUDE.md), skipping.`));
+      results.push({ path: d.path, label: d.label, status: "skipped-covered-by-global" });
+      continue;
+    }
     try {
       await fs.mkdir(path.dirname(d.path), { recursive: true });
       let existing = "";
@@ -5785,12 +7290,14 @@ async function performAutoInstall(detected, opts) {
       if (existing.includes("## Pre-deploy verification with Cipherwake")) {
         console.log(color("dim", `  ⊝ ${d.path} — already contains the protocol, skipping.`));
         results.push({ path: d.path, label: d.label, status: "skipped-already-present" });
+        if (d.path === globalClaudeMdPath) globalClaudeMdCovered = true;
         continue;
       }
-      const newContent = existing + "\n" + AI_CODER_PROTOCOL_TEXT + "\n";
+      const newContent = existing + "\n" + protocolText + "\n";
       await fs.writeFile(d.path, newContent, "utf8");
-      console.log(color("green", `  ✓ ${d.path} — protocol appended (${AI_CODER_PROTOCOL_TEXT.split("\n").length} lines)`));
+      console.log(color("green", `  ✓ ${d.path} — protocol appended (${protocolText.split("\n").length} lines)`));
       results.push({ path: d.path, label: d.label, status: "installed" });
+      if (d.path === globalClaudeMdPath) globalClaudeMdCovered = true;
     } catch (err) {
       console.log(color("red", `  ✗ ${d.path} — failed: ${err.message}`));
       results.push({ path: d.path, label: d.label, status: "failed", error: String(err?.message || err) });
@@ -6042,6 +7549,12 @@ async function runSetupCommand(args) {
     console.log("");
     console.log(color("bold", "Files this install would touch:"));
     const planEntries = [];
+    {
+      const cfgPath = path.join(process.cwd(), ".cipherwake.json");
+      let cfgExists = false;
+      try { await fs.access(cfgPath); cfgExists = true; } catch { /* */ }
+      planEntries.push({ what: `.cipherwake.json domain default (${domain})`, to: cfgPath, op: cfgExists ? "merge domain field" : "create" });
+    }
     if (!skipWorkflow) planEntries.push({ what: "GitHub Action workflow", to: path.join(process.cwd(), ".github", "workflows", "cipherwake.yml"), op: "create" });
     if (!skipProtocol) {
       const candidates = [
@@ -6052,10 +7565,15 @@ async function runSetupCommand(args) {
         { label: "Aider", path: path.join(process.cwd(), ".aider.conf.yml") },
         { label: "AGENTS.md", path: path.join(process.cwd(), "AGENTS.md") },
       ];
+      let globalClaudeMdExists = false;
+      try { await fs.access(path.join(os.homedir(), ".claude", "CLAUDE.md")); globalClaudeMdExists = true; } catch { /* */ }
       for (const c of candidates) {
         let exists = false;
         try { await fs.access(c.path); exists = true; } catch { /* */ }
-        planEntries.push({ what: `AI Coder Protocol — ${c.label}`, to: c.path, op: exists ? "append-markered" : "skip (file not present)" });
+        let op = exists ? "append-markered" : "skip (file not present)";
+        // R96 — Claude Code reads both global + project CLAUDE.md; one copy is enough.
+        if (c.label === "Claude Code (project)" && globalClaudeMdExists) op = "skip (covered by global CLAUDE.md)";
+        planEntries.push({ what: `AI Coder Protocol — ${c.label}`, to: c.path, op });
       }
     }
     if (!skipHook) planEntries.push({ what: "git pre-push hook", to: path.join(process.cwd(), ".git", "hooks", "pre-push"), op: "create (if git repo)" });
@@ -6146,6 +7664,40 @@ async function runSetupCommand(args) {
   const installSummary = [];
 
   // -------------------------------------------------------------------------
+  // Component 0: persist the domain to ./.cipherwake.json (R96, feedback #2)
+  // -------------------------------------------------------------------------
+  // Once the domain lives in the config, `pqcheck deploy-check --ai` and
+  // `pqcheck guard -- <cmd>` work without a domain argument — the AI coder
+  // never has to guess which domain this repo deploys to.
+  try {
+    const cfgResult = await writeDomainToCipherwakeConfig(domain);
+    switch (cfgResult.status) {
+      case "created":
+        console.log(color("green", `  ✓ wrote .cipherwake.json (domain: ${domain} — deploy-check/guard can now omit the domain argument)`));
+        break;
+      case "merged":
+        console.log(color("green", `  ✓ added "domain": "${domain}" to .cipherwake.json`));
+        break;
+      case "updated":
+        console.log(color("green", `  ✓ updated .cipherwake.json domain: ${cfgResult.prior} → ${domain}`));
+        break;
+      case "already-set":
+        console.log(color("dim", `  ⊝ .cipherwake.json already sets domain ${domain} — skipping`));
+        break;
+      case "skipped-malformed":
+        console.log(color("yellow", `  ⚠ .cipherwake.json has malformed JSON — not writing domain (fix the file, then re-run, or add "domain": "${domain}" by hand)`));
+        break;
+      case "skipped-unexpected-shape":
+        console.log(color("yellow", `  ⚠ .cipherwake.json is not a JSON object — not writing domain`));
+        break;
+    }
+    installSummary.push({ component: ".cipherwake.json domain", path: cfgResult.path, status: cfgResult.status });
+  } catch (err) {
+    console.log(color("red", `  ✗ .cipherwake.json domain write failed: ${err.message}`));
+    installSummary.push({ component: ".cipherwake.json domain", status: "failed", error: String(err?.message || err) });
+  }
+
+  // -------------------------------------------------------------------------
   // Component 1: GitHub Action workflow (.github/workflows/cipherwake.yml)
   // -------------------------------------------------------------------------
   if (!skipWorkflow) {
@@ -6156,7 +7708,10 @@ async function runSetupCommand(args) {
         console.log(color("dim", `  ⊝ workflow at .github/workflows/cipherwake.yml already exists — skipping`));
         installSummary.push({ component: "GitHub Action workflow", path: workflowPath, status: "skipped-already-present" });
       } catch {
-        const workflowYaml = renderTrustDiffWorkflow({ domain, failOn, baseline });
+        // R94.3 — setup-time workflow inherits the same opt-in default
+        // (push). Customers on Vercel/Netlify can re-run `pqcheck init
+        // --trigger=deployment-status` to swap in the post-deploy variant.
+        const workflowYaml = renderTrustDiffWorkflow({ domain, failOn, baseline, triggerMode: "push" });
         await fs.mkdir(path.dirname(workflowPath), { recursive: true });
         await fs.writeFile(workflowPath, workflowYaml, "utf8");
         console.log(color("green", `  ✓ wrote .github/workflows/cipherwake.yml (CI hard-gate layer)`));
@@ -6204,7 +7759,22 @@ async function runSetupCommand(args) {
     // user has written outside the markers.
     const START_MARKER = "<!-- CIPHERWAKE_AI_CODER_PROTOCOL_START — managed by pqcheck setup; safe to delete this section between markers but do not edit by hand -->";
     const END_MARKER = "<!-- CIPHERWAKE_AI_CODER_PROTOCOL_END -->";
+    // R96 — setup always has --domain; render it into the protocol so the
+    // installed text is directly executable (no <your-domain> placeholder).
+    const protocolText = renderProtocolText(domain);
+    // R96 — cross-file dedupe: Claude Code reads BOTH ~/.claude/CLAUDE.md and
+    // ./CLAUDE.md. Global is first in the candidates order; once it carries
+    // the protocol, skip the project CLAUDE.md instead of duplicating ~40
+    // lines into every session's context.
+    const globalClaudeMdPath = path.join(os.homedir(), ".claude", "CLAUDE.md");
+    const projectClaudeMdPath = path.join(process.cwd(), "CLAUDE.md");
+    let globalClaudeMdCovered = false;
     for (const t of protocolTargets) {
+      if (t.path === projectClaudeMdPath && globalClaudeMdCovered) {
+        console.log(color("dim", `  ⊝ ${path.basename(t.path)} (${t.label}) — covered by the global Claude Code install (~/.claude/CLAUDE.md)`));
+        installSummary.push({ component: "AI Coder Protocol", path: t.path, label: t.label, status: "skipped-covered-by-global" });
+        continue;
+      }
       try {
         await fs.mkdir(path.dirname(t.path), { recursive: true });
         let existing = "";
@@ -6219,10 +7789,11 @@ async function runSetupCommand(args) {
           const endIdx = existing.indexOf(END_MARKER) + END_MARKER.length;
           const before = existing.slice(0, startIdx);
           const after = existing.slice(endIdx);
-          const next = `${before.replace(/\n+$/, "")}\n\n${START_MARKER}\n${AI_CODER_PROTOCOL_TEXT}\n${END_MARKER}\n${after.replace(/^\n+/, "")}`;
+          const next = `${before.replace(/\n+$/, "")}\n\n${START_MARKER}\n${protocolText}\n${END_MARKER}\n${after.replace(/^\n+/, "")}`;
           if (next === existing) {
             console.log(color("dim", `  ⊝ ${path.basename(t.path)} (${t.label}) — protocol already current`));
             installSummary.push({ component: "AI Coder Protocol", path: t.path, label: t.label, status: "skipped-already-present" });
+            if (t.path === globalClaudeMdPath) globalClaudeMdCovered = true;
             continue;
           }
           await fs.writeFile(t.path, next, "utf8");
@@ -6236,10 +7807,11 @@ async function runSetupCommand(args) {
         } else {
           // Fresh install — append with fenced markers.
           const sep = existing.length > 0 ? "\n\n" : "";
-          await fs.writeFile(t.path, `${existing}${sep}${START_MARKER}\n${AI_CODER_PROTOCOL_TEXT}\n${END_MARKER}\n`, "utf8");
+          await fs.writeFile(t.path, `${existing}${sep}${START_MARKER}\n${protocolText}\n${END_MARKER}\n`, "utf8");
           console.log(color("green", `  ✓ appended protocol (markered) → ${path.basename(t.path)} (${t.label})`));
           installSummary.push({ component: "AI Coder Protocol", path: t.path, label: t.label, status: "installed" });
         }
+        if (t.path === globalClaudeMdPath) globalClaudeMdCovered = true;
       } catch (err) {
         console.log(color("red", `  ✗ ${t.path} — failed: ${err.message}`));
         installSummary.push({ component: "AI Coder Protocol", path: t.path, status: "failed", error: String(err?.message || err) });
@@ -6622,14 +8194,15 @@ async function runSetupCommand(args) {
   console.log(color("bold", "◆ Setup complete — summary:"));
   console.log("");
   for (const s of installSummary) {
-    const icon = s.status === "installed" || s.status === "installed-created" || s.status === "installed-updated"
+    const okStatuses = ["installed", "installed-created", "installed-updated", "created", "merged", "updated"];
+    const icon = okStatuses.includes(s.status)
       ? color("green", "✓")
-      : s.status?.startsWith("skipped")
+      : s.status?.startsWith("skipped") || s.status === "already-set"
         ? color("dim", "⊝")
         : color("red", "✗");
     const label = s.component;
-    const detail = s.status === "installed" || s.status === "installed-created" || s.status === "installed-updated"
-      ? color("dim", `installed${s.path ? " → " + s.path.replace(os.homedir(), "~") : ""}`)
+    const detail = okStatuses.includes(s.status)
+      ? color("dim", `${s.status.startsWith("installed") ? "installed" : s.status}${s.path ? " → " + s.path.replace(os.homedir(), "~") : ""}`)
       : color("dim", s.status?.replace(/-/g, " "));
     console.log(`  ${icon} ${label.padEnd(34, " ")} ${detail}`);
   }
@@ -6642,5 +8215,27 @@ async function runSetupCommand(args) {
 
 main().catch((err) => {
   console.error(color("red", `fatal: ${err.message}`));
-  process.exit(2);
+  // R96 — exit 3 (error), NOT 2. Exit 2 means "block" in the AI contract,
+  // so an internal CLI crash used to masquerade as a security block (and
+  // the pre-push hook refused the push). In AI mode, also emit a guard
+  // block so the agent gets ship_decision=review instead of "no signal".
+  try {
+    const argv = process.argv.slice(2);
+    if (parseAiMode(argv)) {
+      console.log(formatAiFooterBlock({
+        status: "review",
+        kind: "error",
+        verdict: "review",
+        ship_decision: "review",
+        top_issue: "cli_internal_error",
+        top_issue_title: "pqcheck crashed before producing a result",
+        scanned_at: new Date().toISOString(),
+        advisory_only: "true",
+        error: String(err?.message || err).slice(0, 200),
+      }));
+    }
+  } catch {
+    // never let the crash handler crash
+  }
+  process.exit(3);
 });

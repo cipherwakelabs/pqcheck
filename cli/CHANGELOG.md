@@ -4,6 +4,833 @@ All notable changes to `pqcheck` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] — 2026-06-10
+
+### Stable promotion of 0.17.0-beta.2 (R95 + R96)
+
+Identical code to `0.17.0-beta.2`, promoted to `@latest` after the release gate passed: TypeScript clean, 1142/1142 tests, CLI smoke, and a live `deploy-check` against cipherwake.io. Highlights across the 0.17.0 cycle (full detail in the beta entries below):
+
+- **New `pqcheck last [domain] [--remote]`** — reuse a recent gate verdict (local state or your GitHub Actions CI run) instead of re-scanning.
+- **Domain memory** — `setup`/`init` persist your domain into `.cipherwake.json`; `deploy-check`/`guard`/`last` run with no arguments inside a set-up repo.
+- **Flake context in the AI guard block** — `top_failure_id`, `top_failure_history`, `flake_hint=first_failure|recurring|frequently_failing|previously_dismissed` from local check history.
+- **Hardened exit-code contract** — internal CLI errors exit `3` (error/no-signal) and never masquerade as a security block; first-deploy fallback exits `2` for block per the contract.
+- **24 review fixes** from two adversarial sweeps (R95: 9, R96: 15) across CLI + backend, each with positive + negative regression tests.
+
+## [0.17.0-beta.2] — 2026-06-10
+
+### R96 — second code-review sweep (15 fixes) + 3 dogfood-feedback features
+
+Follow-up adversarial pass over the beta.1 candidate plus the three features requested by external dogfood feedback. Every fix ships with positive + negative regression tests (`tests/lib/r96-bugfixes.test.ts`, 57 tests; full suite 1142/1142).
+
+#### Added — `pqcheck last`: reuse a recent gate verdict (dogfood feedback #3)
+
+`npx pqcheck last [domain]` answers "did a recent check already pass?" without re-scanning. Reads the local state files (`.cipherwake/last-status.json`, `~/.config/cipherwake/last-scan.json`); `--remote` reads your repo's latest `cipherwake.yml` GitHub Actions run instead. Honesty guards: a result older than `--max-age` (default 60 min) is never reusable, a remote pass requires the CI run to match your local HEAD commit exactly, and in-progress/cancelled runs return "no signal". Exit contract for agents: `0` = reuse it (skip the duplicate deploy-check), `1`/`2` = trust the review/block, `3` = no reusable signal → run `npx pqcheck deploy-check --ai`. A CI **failure** surfaces as review even when stale — the conservative direction is always safe. Advisory-only; never writes state.
+
+#### Added — monitored domain remembered in `.cipherwake.json` (dogfood feedback #2)
+
+- `pqcheck setup` / `pqcheck init` persist `{"domain": "<D>"}` into `.cipherwake.json` (merging with existing route assertions, never clobbering malformed files).
+- `pqcheck deploy-check`, `guard`, and `last` fall back to that domain when no argument is given — `npx pqcheck deploy-check --ai` now just works inside a set-up repo.
+- `pqcheck protocol install --domain <D>` (or the config fallback) fills every `<your-domain>` placeholder in the installed protocol text, so AI coders get copy-pasteable commands instead of placeholders.
+- Cross-file dedupe: Claude Code reads both `~/.claude/CLAUDE.md` and `./CLAUDE.md`, so installing the protocol to both wasted ~40 lines of context per prompt. Project `CLAUDE.md` is now skipped when the global copy covers it (status `skipped-covered-by-global`; other rules-file targets unaffected).
+
+#### Added — flake context in the AI guard block (dogfood feedback #4)
+
+When a check fails, the `CIPHERWAKE_AI_GUARD_RESULT` block now carries `top_failure_id`, `top_failure_history` (e.g. `failed 6 of 9 prior runs; dismissed as intentional 2x`), and `flake_hint=first_failure|recurring|frequently_failing|previously_dismissed`, sourced from the local `.cipherwake/stats.json` history. A first-ever failure reads as "likely real"; a chronically-dismissed one reads as "likely intentional — ask the user". Silent when nothing fails or there's no history. Local-only; zero network requests.
+
+#### Fixed — CLI
+
+- **Internal crash exited 2 ("block").** An unhandled CLI error masqueraded as a security block, so the pre-push hook refused pushes on our bugs. Crashes now exit 3 and (in `--ai` mode) emit a guard block with `top_issue=cli_internal_error` / `ship_decision=review` instead of leaving the agent with no signal.
+- **First-deploy fallback exited 1 for block.** The scan-based first-deploy path exited 1 even for `ship_decision=block`, so the pre-push hook (which refuses only on exit 2) let blocked pushes through. Now 0/1/2 per the contract.
+- **`guard --gate-mode advisory` could still block.** Advisory mode downgraded findings-driven decisions but an assertion-driven block (unreachable, WAF) still stopped the deploy. Advisory now means advisory: warn + proceed, always.
+- **`CIPHERWAKE_AI_GUARD_RESULT` block was ANSI-colored on TTYs.** `color("dim", ...)` wrapped the END marker in escape codes, breaking strict line-match parsers in pty-based agents. The machine block is now never colorized.
+- **Flag values parsed as domains.** `pqcheck trust-diff acme.com --baseline last-week` mislabeled `last-week` as the domain in error paths; `--baseline`/`--fail-on`/`--max-age` values are now excluded from positional parsing everywhere.
+- **`--csv` / `--markdown` / `--sarif` were silent no-ops.** Whitelisted in `KNOWN_FLAGS` but parsed by nothing. Wired as aliases of `--format <x>`.
+- **Core API calls could hang CI forever.** `/api/scan`, `/api/trust-diff`, `/api/preview-diff` fetches now carry a 90s AbortController timeout with a clear error message.
+- **First-deploy 404 fallback only fired with `--ai`.** README documents it unconditionally for deploy-check; a non-AI first run errored instead. Now any `deploy-check` invocation falls through to the scan-based check.
+- **State file recorded a different decision than the gate.** Under `--strict-posture` the statusline/prompt-hook read the pre-posture drift decision while the exit code used the combined one. Both now record the same `effectiveShip`.
+- **Scan-path `top_issue` had a `findings.` prefix the deploy-check path didn't.** Unified on bare ids.
+- **Removed dead `tryOpenBrowser` code.** Nothing has opened a browser since onboard's pre-v0.13 redesign; the function (and the `CIPHERWAKE_NO_BROWSER` env var it honored) was unreachable.
+
+#### Fixed — backend (live on cipherwake.io, no CLI update needed)
+
+- **Force-fresh rate cap keyed on spoofable client IP.** The 20/hr force-fresh cap used the leftmost `X-Forwarded-For` value, which the caller controls. Now keyed on a SHA-256 hash of the validated API key.
+- **Rate-limit infra outage reported as "you hit your cap".** When the rate-limit store was down, customers were told to wait out a cap window that didn't exist. Now resolves to `fresh_status=unavailable` ("re-run to retry").
+- **Fabricated quota numbers.** `used_this_month` was hardcoded to 0 on every response. Now derived from the real quota decision (OIDC path) or honestly `null` (api-key path, where headroom lives in `X-Cipherwake-Quota-*` headers).
+- **Report-Only CSP graded as enforced.** A `Content-Security-Policy-Report-Only`-only site cleared the critical `csp_missing` deduction despite the browser blocking nothing. New `csp.report_only` critical finding with the rename-the-header fix.
+- **CSP scheme-wildcard false positives.** The check now evaluates the directive that actually governs scripts per CSP3 fallback rules (`script-src`, else `default-src`) and honors `'strict-dynamic'` in whichever governs.
+- **Homepage 404 came back "healthy".** Custom 404 pages (non-Next.js) slid through deploy-health. A 404 root is now `error_4xx`, full stop; WAF-mitigated 403s remain advisory.
+- **scan-stream.ts hadn't type-checked since R86.9.** A dangling identifier was masked by a `grep -v` in the release gate; both fixed (the gate no longer has per-file exclusions).
+- **Analytics integrity:** usage-snapshot cron now uses shared ordered pagination (no skipped/duplicated rows mid-walk); week-over-week pct is `null` (not `Infinity`) with no prior baseline; the backfill script fails loud on count errors instead of writing all-zero snapshots and never overwrites rows the daily cron wrote; sibling founder apexes no longer inflate external-adoption metrics.
+
+#### Added
+
+- `tests/lib/r96-bugfixes.test.ts` — 57 regression tests (positive + negative per fix, per the R88/R89 discipline), including extracted-function behavior tests for `isFlagValue`, `renderProtocolText`, flake-context hints, and `postgrestPaginate` maxRows.
+
+## [0.17.0-beta.1] — 2026-06-10
+
+### R95 — code-review bug sweep (9 fixes, all customer-facing)
+
+A three-agent adversarial pass over the recently shipped surfaces. Every fix ships with positive + negative regression tests (`tests/lib/r95-bugfixes.test.ts`, 22 tests; full suite 1084/1084).
+
+#### Fixed — CLI
+
+- **`--flag=value` form silently ignored.** `parseFlag`/`readFlagValue` only supported space-separated values, so the documented `pqcheck init --trigger=deployment-status` silently generated the default push-trigger workflow. Both parsers now handle the equals form; space-separated still works.
+- **Documented preview-diff flags rejected with exit 3.** `--protected-path` and `--first-party-host` were missing from the R86.7 `KNOWN_FLAGS` whitelist, so using them as documented hard-failed the command. Whitelisted.
+- **`waf_blocked` still blocked the gate.** The R94.3 fix made WAF mitigation advisory in the response field but `shipDecisionFromAssertions` still flipped `ship_decision=block` on it. The gate now excludes `waf_blocked` from deploy-broken (genuinely broken statuses — `error_4xx`/`error_5xx`/`blank_page` — still block). Stats entries record it as `low`, not `critical`, keeping flake stats honest.
+- **preview-diff `--ai` error paths were fail-silent.** Network failure, auth error, 429, and server-error paths exited without a `CIPHERWAKE_AI_GUARD_RESULT` block — an agent saw "no signal" instead of "review". All four paths now emit a guard block with `ship_decision=review` + an `error` field (same fail-loud contract as deploy-check since v0.16.13).
+- **Quota copy contradiction (30 vs 100 calls/month).** Generated workflow header said 100, step comments and `init`/`onboard` output said 30. Truth is 100; all customer-facing copy now says 100 Trust Diff calls/month per repo. `init` next-steps rewritten: no API key needed for the free tier (GitHub OIDC metering), optional `CIPHERWAKE_API_KEY` secret only for higher limits.
+
+#### Fixed — backend (live on cipherwake.io, no CLI update needed)
+
+- **trust-diff lost baselines for CI-heavy domains.** The baseline row was scanned in JS from a `limit(200)` window — domains with >200 scans since the baseline date silently fell back to "no baseline". Now a targeted `lte(recorded_at, baseline)` query.
+- **trust-diff `fresh:true` labeled stale data as fresh.** The fresh scan ran *after* deltas/verdict were computed from the cached row, so the response mixed a fresh `fresh_status=applied` with stale numbers. Fresh scan now resolves first and `currentScan` is rebuilt from it; first-run path forwards the real `fresh_status` instead of hardcoding `not_requested`; `maxDuration` raised 15→60s to cover the full scan.
+- **CSP `raw` truncated at 400 chars.** Real-world policies routinely exceed 400 chars, so late-declared `object-src`/`base-uri` were cut from the stored raw and the R93 quality checks mis-graded. Cap raised to 4096 with directive-boundary truncation (never cuts mid-URL, which could fabricate a scheme-wildcard finding).
+- **Missing migration for R94.2 columns.** The 8 external-vs-own `usage_snapshots` columns were added manually in Studio but never captured as a migration — a fresh environment replay would break every snapshot upsert. `supabase/migrations/20260610_usage_snapshots_external_columns.sql` restores schema-as-code truth (idempotent `ADD COLUMN IF NOT EXISTS`).
+
+#### Added
+
+- `tests/lib/r95-bugfixes.test.ts` — 22 regression tests (positive + negative per fix, per the R88/R89 discipline).
+
+## [0.17.0-beta.0] — 2026-06-08
+
+### First candidate for deliberate stable cut (R94.3)
+
+`@beta` only — `@latest` unchanged at 0.16.32 while we soak-test. After ~few days of clean local + CI runs of `scripts/release-gate.sh` against the current code, promote this version to `@latest` as the first deliberately-cut stable.
+
+### Changed — deployment_status default flipped to opt-in (back-compat-safe)
+
+R93's `deployment_status` trigger was always the right answer for Vercel/Netlify, but defaulting to it on `pqcheck init` meant non-deployment-event platforms (custom CD scripts, S3-sync deploys, manual rollouts) silently got zero trust-diff runs. The default is now `push: branches: [main]` (safe everywhere), with `--trigger=deployment-status` as the recommended opt-in for git-integrated platforms.
+
+```bash
+# Default (safe everywhere)
+npx pqcheck init --domain yourdomain.com
+
+# Vercel / Netlify / Render / Railway (recommended, opt-in)
+npx pqcheck init --domain yourdomain.com --trigger=deployment-status
+```
+
+### Added — `lib/postgrestPaginate.ts` + regression test (R94.3)
+
+PostgREST silently caps response size at ~1000 rows regardless of `?limit=`. This morning's analytics read returned "1000 events / 30 unique IPs" — the real numbers were 23,415 / 123 (23× and 4× higher). To prevent recurrence, every paginated read now goes through `fetchAllRows()`, which uses `count: exact` + Range headers to walk past the cap. Comes with 10 regression tests covering positive (2500-row table → 3 page reads, all rows returned) and negative (single-page fast path, empty result, error → throws not silently truncates).
+
+### Fixed — deployHealth false-positive on WAF mitigation (R94.3)
+
+The release gate caught this in pre-publish dogfood: Vercel's WAF returned 403 + `x-vercel-mitigated` to Cipherwake's own scanner UA on cipherwake.io, which the deploy health check classified as `error_4xx` → `ship_decision=block`. Same class as R90.1 (the route-assertions WAF false-positive). New status `waf_blocked` is advisory not blocking; surfaces in the response so the customer sees "WAF mitigated, deploy likely healthy" rather than "deploy broken."
+
+### Fixed — `tests/lib/deployHealth-r89.test.ts` real-network flake
+
+The R89 test suite hit `example.com` and `expired.badssl.com` for live behavior verification. When those domains were slow/down, the gate failed for the wrong reason. All 10 tests now use mocked `safeHttpsFetch` — the suite runs offline, the gate is stable. (A separate `tests/e2e/probe-correctness.smoke.spec.ts` still exists for explicit real-network verification.)
+
+### Added — `scripts/release-gate.sh`
+
+Single command that must return 0 before promoting `pqcheck@<beta>` to `@latest`. Four stages: tsc clean, vitest pass (1062/1062), CLI smoke executes, live deploy-check returns `pass` or `review` (block is hard-fail). The first time it ran (today), it caught two real Cipherwake bugs: the WAF false-positive above + a missing TS union update in `lib/routeAssertions.ts`. Both fixed before this version published.
+
+### Discipline
+
+This release is the soft start of a stable-vs-development channel split:
+- `@beta` — current 0.16.x velocity continues here. Patch versions like `0.17.0-beta.N` ship freely.
+- `@latest` — frozen at 0.16.32 until a `0.17.0-beta.N` survives soak-testing + gate runs and gets promoted. From that point on, `@latest` only advances on deliberate, gated promotions.
+
+Customers installing via `npm install pqcheck` (default `@latest`) continue to get 0.16.32 — unaffected by this release. Customers explicitly trying the new candidate: `npm install pqcheck@beta`.
+
+## [0.16.33] — 2026-06-08
+
+### Added — CSP quality grading (R93 Feature 1)
+
+Real-dogfood feedback from a Next.js 15 / Vercel deploy session: customer added a CSP after seeing `missing.csp` cleared, but the CSP they added was permissive (`script-src 'self' 'unsafe-inline' 'unsafe-eval'`). Existing R86 grading already deducted for `unsafe-inline`/`unsafe-eval`/bare-`*` wildcard (graded the customer's CSP correctly as C, not A). R93 closes the remaining quality gaps:
+
+- **`csp.scheme_wildcard_script`** (−1.0) — `script-src 'self' https:` or `default-src https:` lets any HTTPS origin load scripts. Almost as broad as `*` but the existing wildcard check missed it. Suppressed when `'strict-dynamic'` is present (CSP3 explicitly disables scheme matching). Scoped to `script-src`/`default-src` only — image/font/style scheme wildcards don't execute and aren't flagged.
+- **`csp.no_object_src`** (−0.5) — Missing `object-src 'none'` (with no `default-src 'none'` fallback) leaves the `<object>`/`<embed>`/`<applet>` injection vector open. Common modern CSP miss.
+- **`csp.no_base_uri`** (−0.5) — Missing or permissive `base-uri` lets an injected `<base href>` re-target every relative URL on the page. `base-uri 'self'` or `'none'` is required to pass.
+
+### Added — HSTS includeSubDomains grading (R93)
+
+- **`hsts.no_includesubdomains`** (−0.5) — HSTS without `includeSubDomains` protects only the apex; api., admin., status., cdn. remain vulnerable to first-visit HTTP downgrade. Fires only when HSTS is present-but-incomplete (silent when HSTS is missing entirely, since the broader `missing.hsts` finding already covers that cliff).
+
+### Changed — generated workflow uses `deployment_status` not `push:main` (R93 Feature 2)
+
+Customer feedback: on a Vercel/Netlify/Render git-integrated repo, the previous `pqcheck init` generated `on: push: branches: [main]` — which RACES the platform's deploy. Cipherwake's trust-diff job ran from the same push event as the deploy, but completed BEFORE the new deploy was live, diffing the stale prior production surface and missing whatever the customer just shipped.
+
+The new template uses `on: deployment_status` filtered to `state == 'success' && environment == 'production'`, so trust-diff fires AFTER the deploy lands. `pull_request` trigger is preserved for advisory PR diffs.
+
+Falls back to `push: branches: [main]` for repos on platforms that don't emit `deployment_status` events (custom CD scripts, S3-sync deploys, manual rollouts) — documented in a comment inside the generated template.
+
+### Tests
+
+26 new tests in `tests/lib/postureGrade-r93.test.ts` + `tests/lib/workflowTemplate-r93.test.ts`. Per `feedback_test_positive_and_negative.md`: every new check has a positive (catches the weakness it should) AND a negative (silent on the strong case). Customer's exact CSP from the bug report is covered as a calibration fixture — grades C, not A.
+
+## [0.16.32] — 2026-06-07
+
+### Changed — clean re-publish, identical CLI surface to 0.16.31
+
+No CLI behavior change. Re-publish to ensure the npm tarball matches the final post-R92 codebase state (0.16.31 was published earlier than expected, before the post-fix refactor that extracted `lib/freshStatusResolver.ts` helpers + 27 added tests). The CLI binary at `cli/bin/pqcheck.js` is byte-identical to 0.16.31. Server-side R92 fixes (api-key auth backend fix in PostgREST schema + `/api/trust-diff` fresh/verbose handling) are independent of this CLI release and remain live on cipherwake.io.
+
+Customers running 0.16.31 do not need to upgrade. 0.16.32 exists for clean release-history alignment.
+
+## [0.16.31] — 2026-06-07
+
+### Fixed — `--fresh` actually refreshes posture (R92)
+
+External dogfood bug 2026-06-06: a customer deployed CSP / HSTS / X-Frame-Options / X-Content-Type-Options / Referrer-Policy / Permissions-Policy via Next.js `next.config.mjs` `headers()`, with `poweredByHeader: false`. Verified on the wire (curl + cache-buster + non-browser UA): `x-vercel-cache: MISS`, `age: 0`, all six headers present, `x-powered-by` gone. Cipherwake `pqcheck deploy-check <D> --ai` AND `--ai --fresh` continued to return `posture_grade=D`, `posture_score=29`, `posture_leaks=x-powered-by: Next.js`. The two directly contradicted on the same domain at the same second.
+
+**Root cause:** `pqcheck deploy-check` posts to `/api/trust-diff`, but the CLI never sent the `--fresh` flag in the request body. The server then read posture directly from `scan_cache` (which held the pre-fix snapshot). Customers who applied the recommended fix and re-ran with `--fresh` saw the same broken grade — exactly the moment when distrust into the posture grade calcifies.
+
+**Fix:**
+
+- **CLI:** `--fresh` and `--verbose` are now plumbed through to `/api/trust-diff` body
+- **Server:** `/api/trust-diff` accepts `fresh: true`. When the caller is API-key-authenticated and the per-IP cap (20/hr, same as `/api/scan` force=1) allows, runs a full fresh scan via `runFullScanForDomain`, writes through to `scan_cache` so subsequent reads also see the new state, and uses the in-memory fresh report for this response's posture grade
+- **`fresh_status` field on every trust-diff response.** Communicates what actually happened:
+  - `applied` — fresh ran, the posture in this response IS current
+  - `rate_limited` — per-IP cap reached; cached posture served, retry after window
+  - `unauthenticated` — no API-key path; set `CIPHERWAKE_API_KEY` to force fresh
+  - `unavailable` — fresh path crashed mid-run; cached served, retry
+  - `not_requested` — caller didn't ask for fresh; cached is by design (default)
+- **CLI warning when `--fresh` was requested but NOT applied.** Yellow stderr notice before the verdict so customers don't mistake a cached read for a fresh measurement
+- **`--verbose` emits `CIPHERWAKE_SCANNER_OBSERVED` block** with the actual response headers, final URL, and status code Cipherwake's posture grade was computed from. Customers can diff "what Cipherwake saw" vs `curl -I` and catch a stale or wrong-target read instantly
+
+**Acceptance criteria (from the bug report) — both verified:**
+
+- After deploying a header fix, `deploy-check --fresh` reflects it on the next run (posture rises, `posture_leaks` clears)
+- `--fresh` that can't actually refresh announces it instead of silently returning a stale grade
+
+**Test discipline kept:** `lib/freshStatusResolver.ts` extracts the truth table as a pure helper. 13 unit tests cover the full positive/negative matrix (applied / rate_limited / unauthenticated / unavailable / not_requested) plus failure-mode priority ordering. Per `feedback_test_positive_and_negative.md`: every transition the customer can observe has a defined outcome.
+
+### Added — `_observation` field on `httpHeaders` result
+
+`lib/httpHeaders.ts` `HttpHeadersResult` now carries an `_observation` field with the actual response headers, final URL, and status code the parsed result was derived from. Used by `/api/trust-diff` to emit `scanner_observed` when caller sets `verbose: true`. Internal; no API contract changes for existing consumers (field is optional and additive).
+
+## [0.16.30] — 2026-06-06
+
+### Added — Three asks from external dogfood feedback (R91)
+
+External testing agent shipped a draft-route resolver bug to prod: customer added 15 ideas, 9 were draft "stubs" that a resolver bug left publicly resolvable, so 9 new `/preview/*` routes went from non-existent to serving full live landing pages between baseline and now. Cipherwake returned `pass / delta_count=0` — the new routes weren't part of any model we were checking.
+
+The customer's framing was the right shape: **default quiet, escalate explicitly.** Three targeted additions:
+
+**Ask 1: Broader route discovery for surface-diff (info-only).** New `lib/routeDiscovery.ts` adds two discovery sources alongside the existing common-public probe:
+
+- `/sitemap.xml` (and `/sitemap_index.xml`) — parses `<loc>` entries, follows nested sitemap-index references up to 5 deep
+- Homepage HTML — extracts same-origin `<a href>` values
+
+Discovered routes are deduped, capped at 300, and surfaced via `report.routeAssertions.discoveredRoutes`. The CLI's `CIPHERWAKE_SURFACE_DIFF` block now diffs against the prior snapshot's broader set:
+
+```
+CIPHERWAKE_SURFACE_DIFF
+NEW_PUBLIC_ROUTE: /preview/seatcheck  — was not publicly reachable in last deploy. Review intent.
+NEW_PUBLIC_ROUTE: /preview/findmypre  — was not publicly reachable in last deploy. Review intent.
+…
+END_CIPHERWAKE_SURFACE_DIFF
+```
+
+**Info-only by design** — never gates `ship_decision`. Most new routes are intentional launches. Customers see the change without being asked to triage it. To make a class gate, declare a glob assertion (Ask 2).
+
+**Ask 2: Pattern + negative route assertions (glob support).** `.cipherwake.json` `assertions[].path` now accepts glob patterns:
+
+```json
+{
+  "routeAssertions": {
+    "assertions": [
+      { "path": "/preview/*", "expect": "missing", "why": "Drafts must not serve content" },
+      { "path": "/admin/**",  "expect": "protected", "why": "Admin surface deep gate" }
+    ]
+  }
+}
+```
+
+Glob semantics (no fancy regex):
+- `*` matches any non-slash chars (one path segment)
+- `**` matches any chars including slashes (deep matching)
+
+The evaluator expands a glob against the discovered-route set into per-path assertions. A `/preview/*: expect: missing` with `/preview/seatcheck` serving 200 fails the assertion at the assertion's declared severity. Customer-declared globs follow the same severity tier as literal assertions (critical for `protected → exposed`, configurable per-assertion). When a glob matches NOTHING, an advisory PASS result is emitted with `why: "no current matches"` — distinct from "no assertion was declared at all."
+
+**Ask 3: Scope honesty in the `scope_note` field.** The CLI's `--ai` block scope_note now explicitly states:
+
+> `pass` means: trust/crypto posture stable + declared assertions hold + homepage healthy + no leaked secrets found + declared sensitive paths still gated. `pass` does NOT mean: every public-route inventory is current, nor that no content/authorization leak exists outside the assertion set. Surface-diff additions (new routes / scripts) emit at info severity for human review — they never gate. To make a route class gate, declare a glob assertion (e.g. `/preview/* expect:missing`).
+
+The framing matches the customer's discipline: low-noise is the asset; coverage gaps are opt-in to close.
+
+### Tests (positive + negative for each ask)
+
+22 new tests in `tests/lib/routeDiscovery-r91.test.ts` covering:
+
+- Sitemap parsing: urlset, sitemap-index nested follow, cross-origin skip, query-string strip, www. variant, malformed XML resilience
+- Homepage anchor parsing: same-origin only, skip javascript/mailto/tel/hash, relative path resolution
+- Glob semantics: `*` (one segment), `**` (deep), regex-special escape, literal-path equality
+- Glob assertion expansion end-to-end: catches /preview/seatcheck at 200, passes on 404/401/3xx (R90.1 semantic preserved), zero-match advisory
+- Scope honesty audits: undeclared routes don't accidentally PASS; glob-no-match emits advisory not silence
+
+**951/951 total project tests passing.**
+
+## [0.16.29] — 2026-06-05
+
+### Fixed — WAF/platform 403 false positive on `/wp-admin` (and any `expect: missing` default) (R90.1)
+
+**External testing agent caught this dogfooding 0.16.28 on a Next.js/Vercel app**: `socialideagen.vercel.app/wp-admin` returns 403 with `x-vercel-mitigated: deny` (Vercel's WAF blocking known-attack paths). Cipherwake classified 403 → `protected` and the `/wp-admin` default (`expect: missing`) FAILED [medium] with "WordPress endpoint on a non-WP app suggests dropped config / staging leak." This fired on essentially every Vercel/Cloudflare-hosted non-WP app — the exact platforms our users run.
+
+**Why it was wrong:** the heuristic treated 403 ≠ 404 as "the endpoint exists → WP leak." But a 403 (especially WAF-mitigated) is the OPPOSITE of evidence — it means the path is blocked, which is the desired state.
+
+**Two fixes:**
+
+**(1) WAF/platform-mitigation detection.** When a 403 response includes `x-vercel-mitigated: deny` (Vercel), `cf-mitigated` (Cloudflare), or `server: cloudflare` with 403 status, the probe now classifies the path as `blocked` (not `protected`). The CLI output now shows the right cause:
+
+```
+Before: FAIL [medium] default:/wp-admin expected=missing actual=protected status=403
+After:  PASS [info]   default:/wp-admin expected=missing actual=blocked   status=403
+```
+
+**(2) Semantic-correct `expect: missing` pass conditions.** The original strict-equality check (`actual === "missing"`) required exactly a 404. Semantically, `expect: missing` means "this route is NOT reachable to anonymous users" — which is satisfied by 404 (missing), 401/403 (protected), 3xx-to-login (protected), 405 (blocked), WAF-mitigated (blocked), and probe-error. The ONLY failure mode is `actual: exposed` (200 serving content — the real leak case).
+
+Same relaxation applies to `expect: protected`: a `blocked` classification (WAF defense in depth) now satisfies "auth boundary held."
+
+**What still fires correctly:**
+
+- A real WordPress site serving `/wp-admin` content at 200 → still flagged
+- A real `.env` leak at 200 with credentials in the body → still flagged critical
+- An `/api/admin` returning 200 without auth → still flagged critical (the catastrophic case)
+
+The fix only removes false positives — every catastrophic-event catch is preserved. Verified with 23 new tests (`tests/lib/wafFalsePositive-r90.test.ts`) covering all 8 classification × 2 expectation combinations.
+
+## [0.16.28] — 2026-06-05
+
+### Added — Wave 3: surface-diff (B/C) + TLS expiry invariant (R90)
+
+The remaining items from the "make Cipherwake pay-worthy" build prompt.
+
+**B + C — Surface diff via local snapshot (no schema change).** Every `pqcheck deploy-check` now snapshots the public surface (publicly-reachable routes + third-party script hosts) into `.cipherwake/stats.json` and diffs against the prior snapshot. Differences surface as a new parseable block AFTER the AI block:
+
+```
+CIPHERWAKE_SURFACE_DIFF
+prev_snapshot_at=2026-06-04T22:00:00.000Z
+NEW_PUBLIC_ROUTE: /pricing  — was not publicly reachable in last deploy. Review intent.
+NEW_THIRD_PARTY_SCRIPT: cdn.suspicious.com  — supply-chain alert: a new third-party script appeared on your homepage since last deploy. Verify intent (vendor add) or investigate (injection / compromise).
+END_CIPHERWAKE_SURFACE_DIFF
+```
+
+- **B (new-exposed-route)**: a route that wasn't returning 200 last deploy and now is. Catches an AI accidentally shipping `/api/internal`, `/debug`, or making a private route public.
+- **C (new-script supply-chain)**: a third-party script host that wasn't on your homepage last deploy and now is. The supply-chain painkiller — only an independent public-surface watcher catches injected/compromised dependencies.
+
+Privacy: snapshots live in `.cipherwake/stats.json` (local). NO transmission. The diff is computed entirely client-side.
+
+**R90 — TLS cert expiry as hard invariant.** Always runs (defaults to 14-day critical threshold) when cert data is observed. Customer can declare:
+
+```json
+{
+  "routeAssertions": {
+    "tlsAssertion": {
+      "minDaysToExpiry": 30,
+      "severity": "critical"
+    }
+  }
+}
+```
+
+Folds into `ship_decision` — critical-severity violation blocks the deploy. Surfaces in the `--- TLS EXPIRY ---` section and `tls_days_remaining` / `ship_decision_tls` fields in the AI guard block.
+
+### Pay-worthy test: "Would the user be scared to turn it off?"
+
+With drift + route assertions (with body assertions + 307 fix + dismissals) + deploy-not-broken + secret scanner (with FP discrimination) + cookie invariants + header invariants + sensitive-file defaults + TLS expiry + new-route detection + new-script detection + blocks-before-announce — **yes**. Each of these is a frequent failure mode in AI-built code, catastrophic in production, embarrassing to ship, and only an independent provider-neutral no-credentials gate catches it.
+
+## [0.16.27] — 2026-06-05
+
+### Added — Local-only check stats (R89.LOCAL) — privacy-by-design
+
+`pqcheck` now records per-check stats locally in `.cipherwake/stats.json` at the repo root. ZERO network requests added — purely persisting locally what the `CIPHERWAKE_*` blocks already print to stdout, so customers can see (via `pqcheck stats`) which checks actually catch real things vs. sit silent or false-flag, all computed on their machine.
+
+```bash
+# After running deploy-check a few times:
+pqcheck stats
+
+# Output:
+# CHECK                                    RUNS  PASS  FAIL  CONFIRMED  DISMISSED  LAST  SEVERITY
+# route:/api/admin/users                     12    11     1          1          0  pass  critical
+# route:/admin                               12     8     4          0          4  fail  high
+# header:Strict-Transport-Security           12    12     0          0          0  pass  high
+# secret:scan                                12    12     0          0          0  pass  info
+# health:homepage                            12    11     1          1          0  pass  critical
+# ...
+# Confirmed-catch rate: 67% of failures were confirmed real (a fix landed afterward).
+```
+
+Two ways `confirmedReal` gets incremented:
+
+- **Inferred**: a previously-failing check that passes on the next deploy → confirmedReal++ (you fixed the regression Cipherwake flagged).
+- **Explicit**: `pqcheck confirm <check-id>` — for catches you want to record manually (e.g. you fixed it offline).
+
+And `pqcheck dismiss <check-id>` increments dismissedIntentional — for false positives you've reviewed and decided are intentional.
+
+**Privacy guarantees (lean into them — same posture as our no-credentials stance):**
+
+- `.cipherwake/stats.json` is local. Recommend gitignoring it by default.
+- No telemetry, no analytics, no cross-repo aggregation, no transmission of your results anywhere.
+- Hosted analytics is a SEPARATE opt-in feature (future paid tier) that would require explicit account configuration and upload only check-class counts + pass/fail/confirmed flags — never page contents, never the target's responses, never code. Not enabled by default. Not in this release.
+
+**Methodology page** updated to surface "no credentials, no data exhaust either" — same trust feature as never crawling behind your login.
+
+### Added — Wave 2: Deploy Health Check (R89) + Secret Scanner + Cookie Invariants
+
+Three more high-frequency, high-severity invariants that fire on every deploy. All in-lane (public surface, no credentials). All fold into `ship_decision` — critical failures auto-block.
+
+**R89 — Deploy Health Check (the headline).** The most embarrassing AI-coder deploy failure: build succeeded, production runtime crashed. Cipherwake probes the homepage on every scan and checks:
+
+- HTTP 5xx → `error_5xx` → BLOCK
+- HTTP 4xx (not 404) → `error_4xx` → BLOCK
+- 200 status with framework error markers (Next.js "Application error", Vercel "FUNCTION_INVOCATION_FAILED", Cloudflare 521, Netlify "Site not found", etc.) → `framework_error` → BLOCK
+- 200 status with < 500 bytes body → `blank` (white-screen) → BLOCK
+- Customer-declared landmark text missing → `landmark_missing` → BLOCK
+- Probe unreachable → `unreachable` → review
+
+The framework-error catalog is curated to be unambiguous (e.g. "FUNCTION_INVOCATION_FAILED" only appears on Vercel's actual error pages, never in normal content). Markers are paired with body-size discriminators for ambiguous cases.
+
+Customer config:
+
+```json
+{
+  "routeAssertions": {
+    "deployHealth": {
+      "landmarks": ["Sign up free", "Trusted by 10,000+ teams"],
+      "treatBlankAsFailure": true
+    }
+  }
+}
+```
+
+Surfaces in the `--- DEPLOY HEALTH ---` section + `deploy_status` / `deploy_summary` / `ship_decision_health` fields in the AI guard block.
+
+**Secret scanner.** Scans the homepage's `<script src>` bundles (up to 8, 512 KB each) for leaked credentials. Pattern catalog includes AWS access keys, GitHub PATs/OAuth/App tokens, Stripe `sk_live_`/`sk_test_`, OpenAI / Anthropic keys, Supabase service-role JWTs.
+
+**Critical FP-avoidance discriminator** for Supabase JWTs: every JWT match is decoded (base64 payload), and `role: "anon"` / `role: "authenticated"` JWTs are IGNORED. Only `role: "service_role"` triggers a finding. This prevents the catastrophic false-positive where Cipherwake flags the legitimate Supabase anon key every customer ships in their bundle. Stripe `pk_*` and `NEXT_PUBLIC_*` patterns are not scanned (intentionally public). Findings include `redactedSample` (first 4 + last 4 chars only) — Cipherwake never logs or transmits full secret values.
+
+Surfaces in the `--- SECRET SCAN ---` section + `secrets_scanned` / `secrets_critical_count` / `ship_decision_secrets` fields.
+
+**Cookie flag invariants.** Customer declares session-cookie flag requirements:
+
+```json
+{
+  "routeAssertions": {
+    "cookieAssertions": [
+      { "namePattern": "session", "require": ["HttpOnly", "Secure"], "sameSiteMinimum": "Lax" }
+    ]
+  }
+}
+```
+
+Reuses the existing cookie probe (runs on every scan). Failures fold into `ship_decision` — critical severity auto-blocks. Surfaces in the `--- COOKIE INVARIANTS ---` section + `cookie_failed` / `cookie_critical_failures` / `ship_decision_cookies` fields.
+
+### Wave 2 still coming
+
+- New-exposed-route detection (B in the final build prompt) — diff route surface deploy-over-deploy
+- New external script/domain detection (C) — supply-chain painkiller
+- Verbose-error / stack-trace leakage detector (F)
+- Trust-diff narrative one-liner (G)
+- AI Coder Protocol positioning hardening (H)
+- TLS cert expiry as a hard invariant
+
+## [0.16.26] — 2026-06-05
+
+### Added — Invariant battery wave 1: sensitive-file defaults + dismissals + header invariants (R88)
+
+The strategic direction the external testing agent surfaced: Cipherwake's value shifts from "drift detection (rarely fires)" to "declared invariants (fires on every deploy, high-severity)." Route Assertions was the first step; this release extends the invariant battery in three ways.
+
+**1. Sensitive-file default assertions.** Every customer now gets these for free without configuration:
+
+- `/.env`, `/.env.local`, `/.env.production` — expect: missing, severity: critical
+- `/.git/config`, `/.git/HEAD` — expect: missing, severity: critical
+- `/api/debug` — expect: missing, severity: high
+- `/_next/data` — expect: missing, severity: medium
+- `/wp-admin` — expect: missing, severity: medium (a non-WordPress app serving `/wp-admin` usually means staging config leaked or dev hot-reload exposed)
+
+If any of these returns 200, the assertion fires with the declared severity. The default+missing-actual-exposed case correctly bypasses the "default+missing-actual-protected" silent-drop rule (those are now `expect: missing`, not `expect: protected`).
+
+**2. Dismissals — "review once, dismiss, never re-fires."** New optional field in `.cipherwake.json`:
+
+```json
+{
+  "routeAssertions": {
+    "assertions": [...],
+    "dismissals": ["/account", "/_next/static"]
+  }
+}
+```
+
+Paths in `dismissals` are silently dropped from results (counted under `sources_dismissed=N`). Customer-declared assertions are NEVER dismissed (they're the contract). This handles the "FP fatigue kills it faster than misses" concern the testing agent raised — customer reviews a default fail once, decides it's intentional, dismisses it permanently in one line.
+
+**3. Header invariants.** Customer-declared HTTP header contracts that fire on every deploy. Different from posture grading (advisory) — these are hard PASS/FAIL invariants that gate `ship_decision`.
+
+```json
+{
+  "routeAssertions": {
+    "assertions": [...],
+    "headerAssertions": [
+      { "header": "Strict-Transport-Security", "expect": "present" },
+      { "header": "Content-Security-Policy", "expect": "contains", "value": "default-src 'self'" },
+      { "header": "X-Frame-Options", "expect": "equals", "value": "DENY" },
+      { "header": "Server", "expect": "absent", "why": "Server version disclosure" }
+    ]
+  }
+}
+```
+
+Four match modes: `present`, `absent`, `contains`, `equals` (case-insensitive). Default severity is `high` for present/contains/equals violations, `medium` for absent violations. Customer can override per-assertion.
+
+Each result surfaces in a new `--- HEADER INVARIANTS ---` block within `CIPHERWAKE_ROUTE_ASSERTIONS`:
+
+```
+--- HEADER INVARIANTS ---
+header_total=4
+header_passed=3
+header_failed=1
+header_critical_failures=0
+PASS [info] header:Strict-Transport-Security expect=present, got "max-age=31536000; includeSubDomains; preload"
+FAIL [high] header:Content-Security-Policy expect=contains="default-src 'self'", got "<absent>" — Required header
+PASS [info] header:X-Frame-Options expect=equals="DENY", got "DENY"
+PASS [info] header:Server expect=absent, got <absent>
+```
+
+Header failures fold into `ship_decision` the same way route assertions do — critical header failures auto-block; high/medium promote to review.
+
+### Coming next (wave 2)
+
+- Cookie flag invariants (HttpOnly / Secure / SameSite)
+- Secret scanner — JS bundle scanning with publishable-vs-secret-key discrimination (NEXT_PUBLIC_, pk_test/live, anon-JWT vs service-role-JWT)
+- TLS cert expiry as a hard invariant
+
+## [0.16.25] — 2026-06-05
+
+### Fixed — 307/308 redirects misclassified as `missing` (R87.7)
+
+**High-footprint bug.** The previous classify() only treated a 3xx redirect as `protected` when the `Location` header matched `/login|sign-?in|auth/i`. Next.js App Router's `redirect()` API defaults to **307** and the destination may go to `/`, `/welcome`, or any custom path — not matching that regex. So every Next.js app that gated an admin route via `redirect()` got mis-scored: `actual=missing` instead of `actual=protected`, FAIL [medium] instead of PASS.
+
+The documented behavior — "3xx is the data we want — `/admin → /login` = protected" — implied all 3xx classify as protected. The code now matches the docs.
+
+After fix: **any 3xx status** (301, 302, 303, 307, 308, etc.) classifies as `protected`. The destination is the customer's choice (login page, marketing welcome, apex redirect) — what matters is that the probe did NOT receive the protected content directly. Body assertions (`bodyContains` / `bodyAbsent`, also new in this release) provide finer-grained checks when needed.
+
+Repro that's now fixed:
+```bash
+# Before R87.7: FAIL [medium] customer:/admin/ideas expected=protected actual=missing status=307
+# After R87.7:  PASS [info]   customer:/admin/ideas expected=protected actual=protected status=307
+```
+
+Surfaced by external testing agent dogfooding socialideagen.vercel.app. Thanks to the reporter.
+
+### Added — Body assertions (R87.6): close the "200 placeholder + server-gated mutation" false-positive class
+
+The default App Router pattern in Next.js (and similar in Remix, SvelteKit) renders a 200 placeholder even on protected routes and gates the dangerous surface server-side. Pure status-code classification read this as `exposed` — a false positive that customers would have silenced by declaring `expected: exposed`, defeating the feature.
+
+New optional fields on a route assertion: `bodyContains` (string or array — MUST appear in response body) and `bodyAbsent` (string or array — MUST NOT appear). When set on `expect: protected`, Cipherwake fetches up to 16 KB of body bytes and treats "200 with login markers present + sensitive markers absent" as **protected** (soft-gate detected). "200 with sensitive markers leaked" still fails the assertion as the real catastrophic case.
+
+```json
+{
+  "path": "/admin",
+  "expect": "protected",
+  "bodyContains": "Sign in to continue",
+  "bodyAbsent": ["data-admin-action=", "<email>"],
+  "why": "Soft-gated — server returns 200 with login placeholder; mutations are server-gated."
+}
+```
+
+Each result now includes a `bodyCheck` field surfaced in the `CIPHERWAKE_ROUTE_ASSERTIONS` block:
+
+- `soft_gate_detected` — passed via body markers (200 status, but content is safe)
+- `sensitive_content_served` — failed via body markers (200 status + leaked content)
+- `body_check_skipped` — assertion has no body check OR status already determined the result
+- `no_body_captured` — probe couldn't get a body sample (HEAD-only or fetch error)
+
+Body fetches only run for assertions that declare body checks. Default assertions are status-only (no performance cost). The CLI's config validator warns when `bodyContains`/`bodyAbsent` are set on non-`protected` assertions or are not strings/arrays.
+
+### Plumbing
+
+- `lib/protectedPathsProbe.ts` — `probeProtectedPaths(domain, paths, { withBody })` accepts a set of paths to GET-with-body instead of HEAD-only. `bodySample` field added to `PathProbeResult`.
+- `lib/routeAssertions.ts` — `RouteAssertion` extended with `bodyContains` / `bodyAbsent`. `RouteAssertionResult` extended with `bodyCheck`. `applyRouteAssertionsToReport` re-probes paths that need a body sample even if cached.
+- `cli/bin/pqcheck.js` — config validator warns on invalid `bodyContains` / `bodyAbsent` types and on body checks declared on non-`protected` assertions.
+
+### Methodology page
+
+`/methodology/route-assertions` updated with a new section 3 documenting body assertions, the decision logic, and the performance characteristics. Sample config + soft-gate worked example.
+
+## [0.16.24] — 2026-06-05
+
+### Added — Route Assertions (R87): customer-declared, auto-detected, and default route gating contracts
+
+Closes the strategic gap that left Cipherwake silent on backend/admin-heavy deploys. Trust-diff only sees the public landing page, so an app whose landing page doesn't change ships `pass` on every deploy — useless for buyers whose deploys are mostly admin/API work. Route assertions verify declared private routes are still gated, fires on every deploy that touches routing.
+
+**The catastrophic event class caught:** a middleware change that flips `/api/admin/*` from 401 to 200. Low-frequency, reputation-ending. Detectable from outside without credentials. Customers pay for the gate because the one catch is catastrophic.
+
+**Three sources merge into one assertion list:**
+
+1. **Customer config** — `.cipherwake.json` at the repo root. CLI reads it and forwards via the trust-diff request body. App-specific routes (e.g. `/api/admin/users`, `/api/internal/healthcheck`) declared here.
+2. **Defaults** — Cipherwake ships a list of nearly-universal protected paths: `/admin`, `/admin/`, `/account`, `/dashboard`, `/api/admin`, `/api/account`, `/api/me`, `/internal`. Always evaluated unless explicitly overridden.
+3. **Auto-detected** — `robots.txt` Disallow rules + homepage anchor links to `/login`/`/dashboard`/etc. become candidate assertions tagged `source: auto`. Bounded to 20 paths max; no enumeration or fuzzing.
+
+Customer config wins on path collision; defaults win against auto.
+
+**Example `.cipherwake.json`:**
+
+```json
+{
+  "routeAssertions": {
+    "assertions": [
+      { "path": "/api/admin/users", "expect": "protected", "why": "User mgmt API" },
+      { "path": "/api/admin/exports", "expect": "protected", "why": "Bulk export" },
+      { "path": "/api/public/version", "expect": "exposed", "why": "Public version endpoint" },
+      { "path": "/legacy/v1/admin", "expect": "missing", "severity": "critical", "why": "Deprecated; should 404 forever" }
+    ]
+  }
+}
+```
+
+**How it surfaces in `--ai`:**
+
+```
+ship_decision=block
+ship_decision_drift=pass
+ship_decision_assertions=block
+ship_decision_posture=block
+assertions_total=12
+assertions_passed=11
+assertions_failed=1
+assertions_critical_failures=1
+assertions_sources=customer=5,default=8,auto=2
+assertion_top_failure=/api/admin/users: expected protected, got exposed
+```
+
+And a separate parseable block after the guard block:
+
+```
+CIPHERWAKE_ROUTE_ASSERTIONS
+total=12
+passed=11
+failed=1
+critical_failures=1
+sources_customer=5
+sources_default=8
+sources_auto=2
+PASS [info] customer:/api/admin/users expected=protected actual=protected status=401
+FAIL [critical] customer:/api/admin/exports expected=protected actual=exposed status=200
+...
+END_CIPHERWAKE_ROUTE_ASSERTIONS
+```
+
+**Fold into `ship_decision`:** any critical assertion failure (declared `protected`, actually `exposed`) blocks the deploy unconditionally — this is the catastrophic "admin became public" case and does NOT require `--strict-posture` or any opt-in. High/medium failures promote to `review`. The headline `ship_decision` is now `worst-of(drift, route_assertions, optional posture)`.
+
+### Added — `/methodology/route-assertions` + `/methodology/why-not-authenticated-crawling`
+
+Two new methodology pages. The first documents the route-assertions feature: rubric, sources, schema, limitations, "what we don't claim." The second is a public-facing design-decision artifact explaining why Cipherwake will **never** crawl behind your login — credential storage liability inverts the trust model, OAuth/MFA/CSRF/session matrix is operational complexity we won't run reliably, and the catastrophic events are catchable from outside anyway. Authenticated-surface monitoring is on the permanent "will not build" list; we route customers to Pingdom Synthetic / Checkly / custom Playwright instead.
+
+### Plumbing
+
+- `lib/routeAssertions.ts` (NEW) — schema + merge + evaluate + report-applier
+- `lib/routeAssertionsAuto.ts` (NEW) — robots.txt + homepage auto-detection
+- `lib/runFullScan.ts` — evaluates assertions every scan; supplementary probe for paths beyond the default list
+- `lib/protectedPathsProbe.ts` — already accepts custom paths (no change needed; reused)
+- `api/scan.ts` — accepts `routeAssertionsConfig` in POST body
+- `api/trust-diff.ts` — accepts `routeAssertionsConfig`; evaluates against cached report with supplementary probes
+- `cli/bin/pqcheck.js` — reads `.cipherwake.json` walking up to 5 dirs from cwd; forwards in trust-diff request body; folds critical assertion failures into `ship_decision` (no opt-in flag)
+
+## [0.16.23] — 2026-06-04
+
+### Fixed — `--strict` alias + unknown-flag rejection close the silent-no-op class (R86.6 + R86.7)
+
+Audit caught a real footgun in v0.16.22: a customer typed `--strict` (natural short guess) instead of the full `--strict-posture`, got `ship_decision=pass` silently, and concluded "Cipherwake's posture gate is broken." It wasn't broken — the flag was unknown and silently ignored, so the customer ran with the default drift-only gate while believing they had the hard posture gate on. **That's the worst possible failure mode for a security tool: looks like it's doing something, silently isn't.** Same family as false-green pins and over-blocking — all variations of "false sense of security."
+
+This release closes the whole class, not just the case.
+
+**R86.6 — `--strict` aliases `--strict-posture` in scan / deploy-check / trust-diff.** The natural short guess works now. The `onboard` subcommand keeps its own `--strict` semantic (gate exit code on step failure) unchanged — the alias is scoped to the scan family.
+
+```bash
+# Both work identically in scan / deploy-check / trust-diff:
+npx pqcheck deploy-check yourdomain.com --ai --strict
+npx pqcheck deploy-check yourdomain.com --ai --strict-posture
+```
+
+**R86.7 — unknown flags now reject loudly with closest-match suggestion + non-zero exit.** A typo'd flag like `--stict-posture` (missing 'r') used to silently no-op; now it errors out:
+
+```
+$ npx pqcheck deploy-check yourdomain.com --ai --stict-posture
+error: unknown flag --stict-posture for pqcheck trust-diff
+       did you mean --strict-posture?
+$ echo $?
+3
+```
+
+Wired into `pqcheck <domain>` (bare scan), `pqcheck trust-diff`, `pqcheck deploy-check` (forwards to trust-diff), and `pqcheck preview-diff`. Other subcommands (onboard, setup, protocol, guards) are out of scope for this release — they have their own argument-shapes and false-acceptance failure modes are not the same category of "silent gate weakening."
+
+Closest-match suggestion uses Levenshtein distance with a 3-edit-or-half-length cap to avoid noisy "did you mean --foo?" prompts for genuinely-unrelated typos. The structured AI guard block still emits `ship_decision_mode=strict_posture` regardless of which spelling was used, so consumers reading the block can route on mode unambiguously.
+
+### Why this is a release blocker, not a polish item
+
+For a security tool specifically, "unknown flag → silently proceed with weaker behaviour" can never happen. A customer who pasted the AI Coder Protocol into their `CLAUDE.md` and added `--strict` (expecting the hard gate) was running with `ship_decision=pass` in production for any deploy where drift was clean — including a D-posture deploy that should have been blocked. That's the exact false-sense-of-security failure mode Cipherwake exists to prevent customers from having with *other* tools. Self-applying the principle.
+
+## [0.16.22] — 2026-06-03
+
+### Changed — Drift gates, posture advises: `--strict-posture` is the post-fix opt-in (R86.4 + R86.5)
+
+Hot-fix to v0.16.21's default behaviour. v0.16.21 made `ship_decision = worst-of(drift, absolute posture)` the default — meaning any site whose posture wasn't A+ or A would have started emitting `review` or `block` on every deploy with zero drift. Most AI-coded sites grade B/C/D out of the box, so the new default would have made the AI Coder Protocol stop + ask the user on every PR for stable sites that didn't get worse. Cry-wolf gating trains customers to pipe Cipherwake to /dev/null — strictly worse for security than a quiet gate.
+
+The principle this version settles on:
+
+> **A per-deploy gate should fire on "did this deploy make it worse" (drift/regression) — that's actionable per deploy. Absolute posture is a standing property; gating every deploy on a standing property is cry-wolf by construction.**
+
+So the right shape:
+
+1. **Default**: drift gate, for everyone including new installs. Quiet, only flags actual regressions.
+2. **Posture**: advisory, not a gate. Always show `posture_grade` + a one-line remediation nudge. The value (you know your posture + how to fix it) lands without blocking every deploy.
+3. **`--strict-posture`**: conditional opt-in, recommended only after a site reaches A/B posture — as a "lock it in, prevent backsliding" gate. That's who actually benefits from a hard posture gate: teams who've already fixed it and want to stay fixed, or regulated / high-stakes deploys. Not fresh prototypes.
+
+### Behaviour
+
+Default (drift-only — unchanged from pre-0.16.21):
+
+```bash
+npx pqcheck deploy-check yourdomain.com --ai
+# → ship_decision=pass on a D-posture site with no drift
+# → posture advisory line printed above the AI block:
+#     ● Posture: D (score 29) — advisory, not gating. 5 ready-to-paste fixes in CIPHERWAKE_POSTURE_FIXES.
+```
+
+Post-fix opt-in (worst-of-both):
+
+```bash
+npx pqcheck deploy-check yourdomain.com --ai --strict-posture
+# → ship_decision=block on a D-posture site even with no drift
+# → posture advisory line suppressed (already gated)
+```
+
+### Surfaced fields
+
+`CIPHERWAKE_AI_GUARD_RESULT` now includes:
+
+```
+ship_decision=pass|review|block       # ← drift-only default, OR worst-of-both with --strict-posture
+ship_decision_drift=pass|review|block # ← always the drift-only signal (regression gate)
+ship_decision_posture=pass|review|block  # ← always the posture signal (standing property)
+ship_decision_mode=drift_only|strict_posture
+posture_grade=A+|A|B|C|D|F
+posture_score=0..100
+posture_decision=pass|review|block
+posture_missing=...
+posture_leaks=...
+posture_findings_count=N
+posture_fixes_count=N
+scope_note=<describes the active mode>
+```
+
+The advisory line + `CIPHERWAKE_POSTURE_FIXES` block ensure D/F posture is never silently blessed even under the drift-only default.
+
+### AI Coder Protocol page
+
+`/methodology/ai-coder-protocol` is unchanged in its core routing (still routes on `ship_decision`) — but adds a step 5 that surfaces posture as advisory once per session, and explains when to opt into `--strict-posture` after the site reaches A/B.
+
+`/methodology/posture-grading` is updated to v1.2 with the new principle documented inline (drift gates, posture advises, strict-posture for post-fix lock-in).
+
+## [0.16.21] — 2026-06-03
+
+### Fixed — Three posture-grading audit findings (R86.1 / R86.2 / R86.3)
+
+First-day audit caught three real bugs in the v0.16.20 posture grade. All three fixed in this release.
+
+**1. Calibration bug — F/score=0 with valid HSTS preload (R86.1)**
+
+Before: a site serving `Strict-Transport-Security: max-age=63072000; includeSubDomains; preload` (the strongest HSTS form) but missing CSP / X-Frame-Options / X-Content-Type-Options / Referrer-Policy / Permissions-Policy was graded `F` with `posture_score=0`. The 0 score gave zero credit for the HSTS work that WAS done correctly — not credible.
+
+After:
+
+- **Score denominator widened from 6 → 8.5** (the actual sum of every deduction that can fire). The same site now scores ≈ 29, not 0. The leftover credit reflects the real posture work.
+- **Threshold ladder widened** at the C/D and D/F boundaries: C is now ≤3.5 (was ≤3.0), D is now ≤6.5 (was ≤5.0), F is now >6.5 (was >5.0). The same site grades `D`, not `F`. `F` is reserved for "essentially nothing right" — both CSP and HSTS missing AND most other headers missing AND info-leaks present.
+
+**2. ship_decision footgun — pass alongside posture_decision=block (R86.2)**
+
+Before: `ship_decision` was drift-only. A site with no drift since last scan but F-grade absolute posture emitted `ship_decision=pass` and `posture_decision=block` side-by-side. An AI coder following the original protocol ("`ship_decision=pass` → safe to announce") would ship the F-posture site.
+
+After: `ship_decision` is now `worst-of(ship_decision_drift, ship_decision_posture)`. The two inputs are still emitted separately (`ship_decision_drift=...` and `ship_decision_posture=...`) so customers writing custom protocols can see exactly which signal triggered the decision. The original "pass → announce" protocol now correctly gates F-posture deploys.
+
+```
+ship_decision=block            # ← the headline routing decision (worst-of-both)
+ship_decision_drift=pass       # ← unchanged drift-based signal
+ship_decision_posture=block    # ← absolute posture decision (folded into above)
+```
+
+Exit codes (process exit status) now reflect the combined `ship_decision`, not just the drift one.
+
+**3. Empty `grade=` field + fix snippets unavailable in --ai output (R86.3)**
+
+Before: the legacy DBR `grade=` field came back empty alongside the populated `posture_grade=` for trust-diff scans (DBR grade only available for bare scans). And the `--ai` block emitted only `posture_fixes_count=N` — an AI agent could see "5 fixes exist" but couldn't read them from the terminal output without round-tripping to the JSON response.
+
+After:
+
+- **Empty `grade=` field dropped** when not populated. (Same for empty `dbr=`, `top_issue_title=`, `quota_used=`, `quota_limit=`.) Cleaner block.
+- **Fix snippets now ship in a separate parseable block** after the guard block:
+
+```
+CIPHERWAKE_POSTURE_FIXES
+--- FIX 1 ---
+finding_id=missing.csp
+title=Add Content-Security-Policy via next.config.js headers()
+framework=next.js
+file_target=next.config.js
+snippet:
+const securityHeaders = [
+  { key: "Content-Security-Policy", value: "default-src 'self'; ..." },
+  { key: "Strict-Transport-Security", value: "max-age=63072000; includeSubDomains; preload" },
+  ...
+];
+module.exports = { async headers() { return [{ source: "/(.*)", headers: securityHeaders }]; } };
+--- FIX 2 ---
+...
+END_CIPHERWAKE_POSTURE_FIXES
+```
+
+Agents read the full snippet text end-to-end from the terminal — no JSON round-trip required.
+
+### scope_note rewritten
+
+The `scope_note` field now describes the worst-of-both combination and explicitly names the two inputs:
+
+> `ship_decision = worst-of(drift, absolute posture). pass means BOTH no drift AND posture grade A+/A. ship_decision_drift and ship_decision_posture expose the two inputs separately. Cipherwake does NOT verify app functionality — pair with Playwright e2e for full deploy safety.`
+
+### Methodology
+
+`/methodology/posture-grading` updated to v1.1 with the new rubric + worst-of-both `ship_decision` documentation.
+
+## [0.16.20] — 2026-06-03
+
+### Added — Absolute posture grade + ready-to-paste fix snippets in `--ai` output
+
+Before: `pqcheck deploy-check --ai` returned `ship_decision=pass` whenever the *trust diff* between baseline and current showed no drift. That correctly catches regressions ("you removed HSTS") but is silent on absolute posture ("you never had HSTS to begin with"). An AI coder reading the guard block on a fresh site with no security headers got `ship_decision=pass` and announced the deploy as safe — accurate for drift, misleading for posture.
+
+Now: every scan also runs an **absolute posture grade** (`lib/postureGrade.ts`) using a strict SSL-Labs-style rubric on HTTP security headers. The grade ranges A+ → F across CSP, HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy, and info-leak headers (`x-powered-by`, `server` version strings). The `CIPHERWAKE_AI_GUARD_RESULT` block now includes:
+
+```
+posture_grade=F
+posture_score=5.5
+posture_decision=block
+posture_missing=csp,hsts,x_frame_options,x_content_type_options,referrer_policy
+posture_leaks=x_powered_by
+posture_findings_count=6
+posture_fixes_count=1
+scope_note=ship_decision=pass means public trust surface stable. Does NOT verify app functionality.
+```
+
+When the grade is B/C, posture_decision is `review`. When D/F, it's `block`. AI coders that route on `ship_decision` continue to do so; those that ALSO route on `posture_decision` get a stricter posture-aware gate.
+
+The same scan attaches a list of **ready-to-paste fix snippets** (Next.js consolidated `headers()` block, `vercel.json` variant, Express + helmet, CSP nonce migration, x-powered-by disable, server-version strip). Customers asking their AI coder "fix the posture findings" can paste the snippet directly. `posture_fixes_count` in the guard block tells the AI how many distinct remediations are available; full snippets live in the JSON response under `report.posture.fixes`.
+
+### Added — Scope-honesty disclaimer in `--ai` output (`scope_note`)
+
+The guard block now always includes a `scope_note` line clarifying what `ship_decision=pass` does and does NOT mean. Cipherwake catches public trust surface drift + posture; it does not run your test suite, exercise application functionality, or verify the build artifact's behavior. The disclaimer keeps AI coders from over-interpreting pass as a full deploy sign-off.
+
+### Added — Public-routes surfacing in scan response (`report.publicRoutes`)
+
+`lib/publicRoutesProbe.ts` probes a bounded set of common public-page paths (/privacy, /terms, /about, /pricing, /sitemap.xml, /robots.txt, /.well-known/security.txt, etc.) and reports which exist. Trust Diff uses the delta to flag "you just deployed a new public page" (e.g., a `/privacy` that wasn't there last scan). Helps catch AI-coded additions that shipped a public-facing page the developer didn't realize would be public.
+
+### Added — Continuous monitoring alerts: `posture_regression` + `cert_expiring`
+
+For watched-domain monitoring (Tier 2+): the server-side monitor cron now fires:
+
+- `posture_regression` — when posture grade drops vs baseline, OR new missing headers appear, OR new info-leaks appear. Critical severity if dropped to D/F, else warn. Catches the "header drift outside a deploy" case the trust diff couldn't see.
+- `cert_expiring` — tiered alerts at 30, 14, and 7 days to TLS cert expiry (daily re-alert at ≤7 days bypasses the standard 24h dedup window).
+
+No CLI changes for these alerts — they fire via the existing alert delivery pipeline (email + webhook). Documented here because they close the brief's "continuous monitoring" gap that the deploy-check `--ai` flag previously couldn't cover on its own.
+
 ## [0.16.19] — 2026-06-02
 
 ### Changed — `pqcheck setup` now COMPOSES with existing statusLine instead of skipping

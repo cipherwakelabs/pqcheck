@@ -8,7 +8,9 @@
 [![npm downloads](https://img.shields.io/npm/dm/pqcheck.svg?style=flat-square&color=06b6d4)](https://www.npmjs.com/package/pqcheck)
 [![license](https://img.shields.io/npm/l/pqcheck.svg?style=flat-square&color=06b6d4)](./LICENSE)
 
-> **Latest: v0.16.19** — `pqcheck setup` now COMPOSES with an existing Claude Code `statusLine.command` (e.g., PinnedAI's) via a new `--prepend=<cmd>` flag on `cipherwake-statusline`. Both tools' badges render in the single statusLine slot. Previously, Cipherwake politely skipped if any prior statusLine existed — which meant you'd only ever see one tool's badge. Now: composed wrap with 5s timeout + graceful degradation on prepend failure + idempotent re-runs. [Full changelog →](./CHANGELOG.md)
+> **Latest: v0.17.0** — Two adversarial review sweeps (24 fixes) + 3 dogfood features: new **`pqcheck last`** reuses a recent gate verdict (local state or your GitHub Actions CI run) instead of re-scanning; `setup`/`init` remember your domain in `.cipherwake.json` so `deploy-check`/`guard` work with no arguments; the AI guard block gains **flake context** (`flake_hint=first_failure|previously_dismissed|…`) from local check history; internal crashes exit 3 instead of masquerading as a security block. First release on the gated stable track: promoted to `@latest` only after `scripts/release-gate.sh` passed (typecheck + full test suite + CLI smoke + live deploy-check). [Full changelog →](./CHANGELOG.md)
+>
+> **Release channels:** candidates ship to `npm install pqcheck@beta` first and are promoted to `@latest` after the release gate is green. Right now `@beta` and `@latest` carry the same code.
 
 ## Two ways to use it
 
@@ -93,8 +95,9 @@ Grouped by intent: **deploy gate** (the flagship wedge) → **drift comparison**
 | Command | What it gives you |
 |---|---|
 | **Deploy gate — the flagship wedge** | |
-| `npx pqcheck deploy-check <domain> --ai` | **The flagship.** Scans the domain, compares against the previous scan (first run sets the baseline), and emits a `ship_decision=pass\|review\|block` field your AI coding agent parses to decide whether to announce the deploy, ask you, or stop. Works anonymously — no signup needed. |
-| **`npx pqcheck guard --domain <D> -- <cmd>`** | **Deploy guard wrapper.** Wraps any deploy command. Runs `deploy-check` first; conditionally runs `<cmd>` based on `ship_decision`. Modes: `--gate-mode balanced` (default) / `advisory` / `strict`. ONE command instead of two — the strongest single artifact for AI-coder workflows because the AI never has to remember to chain check + deploy. |
+| `npx pqcheck deploy-check <domain> --ai` | **The flagship.** Scans the domain, compares against the previous scan (first run sets the baseline), and emits a `ship_decision=pass\|review\|block` field your AI coding agent parses to decide whether to announce the deploy, ask you, or stop. Works anonymously — no signup needed. In a repo set up with `pqcheck setup`/`init`, `<domain>` is optional — it defaults to the `domain` field in `.cipherwake.json`. |
+| **`npx pqcheck guard --domain <D> -- <cmd>`** | **Deploy guard wrapper.** Wraps any deploy command. Runs `deploy-check` first; conditionally runs `<cmd>` based on `ship_decision`. Modes: `--gate-mode balanced` (default) / `advisory` / `strict`. ONE command instead of two — the strongest single artifact for AI-coder workflows because the AI never has to remember to chain check + deploy. `--domain` is optional in a set-up repo (defaults from `.cipherwake.json`). |
+| **`npx pqcheck last [domain]`** | **Reuse a recent verdict instead of re-scanning.** Reads the local state files; `--remote` reads your repo's latest `cipherwake.yml` GitHub Actions run. Honesty guards: results older than `--max-age` (default 60 min) are never reusable, and a remote pass requires the CI run to match your local HEAD commit exactly. Exit `0` = reuse (skip the duplicate deploy-check), `1`/`2` = trust the review/block, `3` = no reusable signal → run `deploy-check --ai`. Advisory-only. Set `GITHUB_TOKEN` for private repos / higher API limits. |
 | **`--ai` flag** (any of the above) | **AI Coder Mode.** Three-layer output (banner / body / structured `CIPHERWAKE_AI_GUARD_RESULT` block) tuned for Claude Code / Cursor / Aider / Zed. Includes a `ship_decision=pass\|review\|block` field your AI coworker parses to decide whether to announce the deploy, ask you, or revert. See [/methodology/ai-coder-mode](https://cipherwake.io/methodology/ai-coder-mode). |
 | **Drift comparison — what the gate runs on** | |
 | `npx pqcheck trust-diff <domain>` | Compare today's HTTPS surface against a saved baseline (last week / last month / a saved CI baseline). For CI gates and release checklists. |
@@ -160,7 +163,7 @@ advisory_only=true
 END_CIPHERWAKE_AI_GUARD_RESULT
 ```
 
-The structured block is what your AI coworker (Claude / Cursor / Aider / Zed) parses to decide whether to announce the deploy, ask you, or revert. Exit code in `--ai` mode reflects `ship_decision`: `0` pass · `1` review · `2` block.
+The structured block is what your AI coworker (Claude / Cursor / Aider / Zed) parses to decide whether to announce the deploy, ask you, or revert. Exit code in `--ai` mode reflects `ship_decision`: `0` pass · `1` review · `2` block · `3` error / no signal (the check itself failed — never treated as a security block; the block carries a `top_issue` code like `cli_internal_error` so the agent routes to "rerun or verify manually" instead of silently shipping).
 
 ---
 
@@ -351,7 +354,30 @@ npx pqcheck --file domains.txt                Bulk scan from a newline-separated
 - `--days <N>` — History window (default 90)
 - `--json` — Raw JSON output
 
+**`pqcheck last`:**
+- `--remote` — Read your repo's latest `cipherwake.yml` GitHub Actions run instead of local state
+- `--max-age <minutes>` — Freshness window; older results are never reusable (default 60)
+
+### Environment variables
+
+| Variable | Purpose |
+|---|---|
+| `CIPHERWAKE_API_KEY` | Authenticate as your account: higher quotas, `--fresh` forced scans, `watch`, `vendors sync`. Free tier works without it. |
+| `GITHUB_TOKEN` / `GH_TOKEN` | Used by `pqcheck last --remote` for private repos and higher GitHub API limits. Optional for public repos. |
+| `PQCHECK_API_BASE` | Override the API base URL (default `https://cipherwake.io`). For corporate proxies that re-route egress, or testing against a staging deployment. |
+
 ### Exit codes
+
+**Deploy gate** (`deploy-check` / `guard` / `last` in `--ai` mode):
+
+| Code | Meaning |
+|---|---|
+| `0` | `ship_decision=pass` — safe to announce |
+| `1` | `ship_decision=review` — surface to the user before announcing |
+| `2` | `ship_decision=block` — do not announce; investigate |
+| `3` | Error / no signal — the check itself failed (network, crash, no reusable result). Never treated as a security verdict: rerun or verify manually. |
+
+**Bare scan + artifact commands:**
 
 | Code | Meaning |
 |---|---|
@@ -359,7 +385,7 @@ npx pqcheck --file domains.txt                Bulk scan from a newline-separated
 | `1` | Usage / network / scan error |
 | `2` | Score met or exceeded `--threshold`, or `diff` detected regression |
 | `3` | Allowlist violation (`pqcheck deps --allowlist`) |
-| `4` | Supply-chain change detected — new host(s) since baseline (`pqcheck deps --fail-on-new`) |
+| `4` | Supply-chain change detected — new host(s) since baseline (`pqcheck deps --fail-on-new`), or new origin (`vendors check`) |
 
 ## Examples
 
